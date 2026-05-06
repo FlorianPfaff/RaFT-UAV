@@ -81,6 +81,18 @@ def main(argv: list[str] | None = None) -> int:
         default=0.99,
         help="chi-square gate probability for 3D radar updates when gating is enabled",
     )
+    baseline_parser.add_argument(
+        "--rf-inflation-alpha",
+        type=float,
+        default=1.0,
+        help="RF exponent for --robust-update nis-inflate covariance scaling",
+    )
+    baseline_parser.add_argument(
+        "--radar-inflation-alpha",
+        type=float,
+        default=1.0,
+        help="radar exponent for --robust-update nis-inflate covariance scaling",
+    )
 
     args = parser.parse_args(argv)
     if args.command == "inspect":
@@ -100,6 +112,8 @@ def main(argv: list[str] | None = None) -> int:
             args.robust_update,
             args.rf_gate_prob,
             args.radar_gate_prob,
+            args.rf_inflation_alpha,
+            args.radar_inflation_alpha,
         )
     raise ValueError(args.command)
 
@@ -135,9 +149,13 @@ def _run_baseline(
     robust_update: str,
     rf_gate_prob: float,
     radar_gate_prob: float,
+    rf_inflation_alpha: float,
+    radar_inflation_alpha: float,
 ) -> int:
     if enable_gating and robust_update != "none":
         raise ValueError("--enable-gating and --robust-update are mutually exclusive")
+    if rf_inflation_alpha <= 0.0 or radar_inflation_alpha <= 0.0:
+        raise ValueError("inflation alphas must be positive")
     flight = select_flight(dataset_root, flight_name)
     if flight.truth_txt is None:
         raise FileNotFoundError(f"{flight.name} has no truth telemetry file")
@@ -173,16 +191,19 @@ def _run_baseline(
 
     gate_probabilities = None
     robust_updates = None
+    inflation_alphas = None
     if enable_gating or robust_update != "none":
         gate_probabilities = {"rf": rf_gate_prob, "radar": radar_gate_prob}
     if robust_update != "none":
         robust_updates = {"rf": robust_update, "radar": robust_update}
+        inflation_alphas = {"rf": rf_inflation_alpha, "radar": radar_inflation_alpha}
 
     records = run_async_cv_baseline(
         measurements,
         acceleration_std_mps2=acceleration_std,
         gate_probabilities_by_source=gate_probabilities,
         robust_update_by_source=robust_updates,
+        inflation_alpha_by_source=inflation_alphas,
     )
     if not records:
         raise RuntimeError(f"{flight.name} produced no baseline posterior records")
@@ -197,6 +218,7 @@ def _run_baseline(
         "nis",
         "gate_threshold",
         "covariance_scale",
+        "inflation_alpha",
         "residual_norm_m",
     ]
     diagnostics_frame = estimate_frame[diagnostics_columns].copy()
@@ -229,6 +251,8 @@ def _run_baseline(
         robust_update=robust_update,
         rf_gate_prob=rf_gate_prob,
         radar_gate_prob=radar_gate_prob,
+        rf_inflation_alpha=rf_inflation_alpha,
+        radar_inflation_alpha=radar_inflation_alpha,
     )
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     _write_trajectory_plot(plot_path, truth, rf, selected_radar, estimate_frame, flight.name)
@@ -266,6 +290,7 @@ def _records_to_frame(records: list[dict[str, object]]) -> pd.DataFrame:
                 "nis": _optional_float(record.get("nis")),
                 "gate_threshold": _optional_float(record.get("gate_threshold")),
                 "covariance_scale": _optional_float(record.get("covariance_scale")),
+                "inflation_alpha": _optional_float(record.get("inflation_alpha")),
                 "residual_norm_m": _optional_float(record.get("residual_norm_m")),
                 "east_m": state[0],
                 "north_m": state[1],
@@ -297,6 +322,8 @@ def _baseline_metrics(
     robust_update: str,
     rf_gate_prob: float,
     radar_gate_prob: float,
+    rf_inflation_alpha: float,
+    radar_inflation_alpha: float,
 ) -> dict[str, Any]:
     truth_times = truth["time_s"].to_numpy(dtype=float)
     truth_positions = truth[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
@@ -364,6 +391,12 @@ def _baseline_metrics(
             else None,
             "rf_gate_probability": float(rf_gate_prob) if robust_update != "none" else None,
             "radar_gate_probability": float(radar_gate_prob)
+            if robust_update != "none"
+            else None,
+            "rf_inflation_alpha": float(rf_inflation_alpha)
+            if robust_update != "none"
+            else None,
+            "radar_inflation_alpha": float(radar_inflation_alpha)
             if robust_update != "none"
             else None,
         },

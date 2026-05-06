@@ -58,6 +58,18 @@ Run the soft NIS covariance-inflation baseline on one flight:
 python -m raft_uav.cli run-baseline data/raw/AADM2025Dryad --flight Opt2 --robust-update nis-inflate --rf-gate-prob 0.99 --radar-gate-prob 0.99
 ```
 
+Tune source-specific inflation strength:
+
+```bash
+python -m raft_uav.cli run-baseline data/raw/AADM2025Dryad --flight Opt2 --robust-update nis-inflate --rf-inflation-alpha 1.5 --radar-inflation-alpha 0.5
+```
+
+Run the Opt1-Opt3 source-specific inflation grid:
+
+```bash
+python scripts/run_source_specific_inflation_grid.py data/raw/AADM2025Dryad
+```
+
 The first baseline is deliberately conservative. It is meant to reproduce the
 published constant-velocity Kalman fusion setup before adding robust gating,
 learned sensor uncertainties, maneuvering models, and smoothing.

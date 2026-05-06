@@ -70,6 +70,10 @@ def _row(method: str, metrics_path: Path, metrics: dict[str, Any]) -> dict[str, 
         "robust_update": _empty_if_none(robust_update.get("method")),
         "rf_gate_probability": _empty_if_none(rf_gate_probability),
         "radar_gate_probability": _empty_if_none(radar_gate_probability),
+        "rf_inflation_alpha": _empty_if_none(robust_update.get("rf_inflation_alpha")),
+        "radar_inflation_alpha": _empty_if_none(
+            robust_update.get("radar_inflation_alpha")
+        ),
         "posterior_records": posterior_records,
         "accepted_measurements": accepted,
         "rejected_measurements": rejected,

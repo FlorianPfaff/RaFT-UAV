@@ -75,3 +75,28 @@ def test_nis_inflation_keeps_large_outlier_but_downweights_it():
         rejected[-1]["state"][:2]
     )
     assert np.linalg.norm(inflated[-1]["state"][:2]) < 10_000.0
+
+
+def test_nis_inflation_alpha_controls_outlier_pull():
+    measurements = [
+        _measurement(0.0, 0.0, 0.0),
+        _measurement(1.0, 1.0, 0.0),
+        _measurement(2.0, 10_000.0, 10_000.0),
+    ]
+    mild = run_async_cv_baseline(
+        measurements,
+        gate_thresholds_by_source={"rf": 5.0},
+        robust_update_by_source={"rf": "nis-inflate"},
+        inflation_alpha_by_source={"rf": 0.5},
+    )
+    strong = run_async_cv_baseline(
+        measurements,
+        gate_thresholds_by_source={"rf": 5.0},
+        robust_update_by_source={"rf": "nis-inflate"},
+        inflation_alpha_by_source={"rf": 2.0},
+    )
+
+    assert mild[-1]["update_action"] == "inflated"
+    assert strong[-1]["update_action"] == "inflated"
+    assert strong[-1]["covariance_scale"] > mild[-1]["covariance_scale"]
+    assert np.linalg.norm(strong[-1]["state"][:2]) < np.linalg.norm(mild[-1]["state"][:2])

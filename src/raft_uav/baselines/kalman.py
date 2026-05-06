@@ -52,6 +52,7 @@ class TrackingUpdateDiagnostics:
     nis: float
     gate_threshold: float | None
     covariance_scale: float
+    inflation_alpha: float | None
     residual_norm_m: float
 
     def to_record(self) -> dict[str, object]:
@@ -211,17 +212,21 @@ class AsyncConstantVelocityKalmanTracker:
         measurement: TrackingMeasurement,
         gate_threshold: float | None = None,
         robust_update: str | None = None,
+        inflation_alpha: float = 1.0,
     ) -> TrackingUpdateDiagnostics:
         """Predict to and conditionally update from one RF or radar measurement.
 
         If ``gate_threshold`` is provided and ``robust_update`` is ``None``, the
         update is skipped when the normalized innovation squared exceeds that
         threshold. If ``robust_update="nis-inflate"``, the update is kept but
-        its measurement covariance is inflated by ``nis / gate_threshold`` when
-        the threshold is exceeded.
+        its measurement covariance is inflated by ``(nis / gate_threshold) **
+        inflation_alpha`` when the threshold is exceeded.
         """
 
         self.predict_to(measurement.time_s)
+        inflation_alpha = float(inflation_alpha)
+        if inflation_alpha <= 0.0:
+            raise ValueError("inflation_alpha must be positive")
         vector = np.asarray(measurement.vector, dtype=float).reshape(-1)
         covariance = np.asarray(measurement.covariance, dtype=float)
         observation = measurement_matrix(vector.size)
@@ -236,7 +241,7 @@ class AsyncConstantVelocityKalmanTracker:
 
         if threshold is not None and nis > threshold:
             if robust_update == "nis-inflate":
-                covariance_scale = max(1.0, float(nis / threshold))
+                covariance_scale = max(1.0, float((nis / threshold) ** inflation_alpha))
                 covariance = covariance * covariance_scale
                 innovation_covariance = observation @ self.covariance @ observation.T + covariance
                 update_action = "inflated"
@@ -258,6 +263,7 @@ class AsyncConstantVelocityKalmanTracker:
             nis=float(nis),
             gate_threshold=threshold,
             covariance_scale=float(covariance_scale),
+            inflation_alpha=inflation_alpha if robust_update == "nis-inflate" else None,
             residual_norm_m=float(np.linalg.norm(residual)),
         )
 
@@ -297,6 +303,7 @@ def run_async_cv_baseline(
     gate_probabilities_by_source: Mapping[str, float | None] | None = None,
     gate_thresholds_by_source: Mapping[str, float | None] | None = None,
     robust_update_by_source: Mapping[str, str | None] | None = None,
+    inflation_alpha_by_source: Mapping[str, float] | None = None,
 ) -> list[dict[str, object]]:
     """Run the asynchronous CV Kalman baseline and return posterior records.
 
@@ -306,7 +313,8 @@ def run_async_cv_baseline(
     deterministic tests or manually tuned thresholds and takes precedence over
     probabilities. ``robust_update_by_source={"rf": "nis-inflate"}`` keeps
     high-NIS updates and inflates their measurement covariance instead of
-    rejecting them.
+    rejecting them. ``inflation_alpha_by_source`` controls the source-specific
+    exponent used by ``nis-inflate``.
     """
 
     ordered = sorted(measurements, key=lambda item: item.time_s)
@@ -330,10 +338,15 @@ def run_async_cv_baseline(
             measurement,
             robust_update_by_source=robust_update_by_source,
         )
+        inflation_alpha = _inflation_alpha_for_measurement(
+            measurement,
+            inflation_alpha_by_source=inflation_alpha_by_source,
+        )
         diagnostics = tracker.update(
             measurement,
             gate_threshold=gate_threshold,
             robust_update=robust_update,
+            inflation_alpha=inflation_alpha,
         )
         records.append(
             {
@@ -372,6 +385,16 @@ def _robust_update_for_measurement(
     if robust_update_by_source and measurement.source in robust_update_by_source:
         return robust_update_by_source[measurement.source]
     return None
+
+
+def _inflation_alpha_for_measurement(
+    measurement: TrackingMeasurement,
+    *,
+    inflation_alpha_by_source: Mapping[str, float] | None,
+) -> float:
+    if inflation_alpha_by_source and measurement.source in inflation_alpha_by_source:
+        return float(inflation_alpha_by_source[measurement.source])
+    return 1.0
 
 
 def _symmetrized(matrix: np.ndarray) -> np.ndarray:

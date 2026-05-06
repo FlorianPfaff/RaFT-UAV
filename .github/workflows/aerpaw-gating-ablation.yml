@@ -174,7 +174,9 @@ jobs:
               --output-dir outputs/baseline_cv_nis_inflated \
               --robust-update nis-inflate \
               --rf-gate-prob 0.99 \
-              --radar-gate-prob 0.99
+              --radar-gate-prob 0.99 \
+              --rf-inflation-alpha 1.0 \
+              --radar-inflation-alpha 1.0
             echo "::endgroup::"
           done
 
