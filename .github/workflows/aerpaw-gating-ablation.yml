@@ -8,7 +8,7 @@ on:
         required: false
         type: string
       dataset_url:
-        description: "Optional URL to the AADM2025Dryad ZIP archive. If empty, secret AADM2025DRYAD_URL is used."
+        description: "Optional URL to the AADM2025Dryad ZIP archive. Used only if local/cache/WebDAV sources are unavailable."
         required: false
         type: string
       flights:
@@ -16,30 +16,48 @@ on:
         required: false
         default: "Opt1 Opt2 Opt3"
         type: string
-      cache_key_suffix:
-        description: "Bump this to force a fresh dataset cache."
+      force_redownload:
+        description: "Delete and repopulate $HOME/.cache/datasets/AADM2025Dryad before running."
         required: false
-        default: "v1"
-        type: string
+        type: boolean
+        default: false
 
 permissions:
   contents: read
+
+defaults:
+  run:
+    shell: bash
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
   PYTHONUNBUFFERED: "1"
   DATASET_ROOT: data/raw/AADM2025Dryad
   DATASET_ZIP: data/raw/AADM2025Dryad.zip
+  PERSISTENT_DATASET_CACHE: ${{ github.workspace }}/.unused
 
 jobs:
   opt-flight-ablation:
     name: Opt-flight CV vs NIS-gated CV ablation
     runs-on: [self-hosted, Linux]
     timeout-minutes: 720
+    env:
+      INPUT_DATASET_ROOT: ${{ inputs.dataset_root }}
+      INPUT_DATASET_URL: ${{ inputs.dataset_url }}
+      FORCE_REDOWNLOAD: ${{ inputs.force_redownload }}
+      AADM2025DRYAD_DATA_WEBDAV_URL: ${{ secrets.AADM2025DRYAD_DATA_WEBDAV_URL }}
+      AADM2025DRYAD_DATA_KEY: ${{ secrets.AADM2025DRYAD_DATA_KEY }}
+      AADM2025DRYAD_DATA_PASSWORD: ${{ secrets.AADM2025DRYAD_DATA_PASSWORD }}
+      SECRET_DATASET_URL: ${{ secrets.AADM2025DRYAD_URL }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Set persistent dataset cache path
+        run: |
+          set -euo pipefail
+          echo "PERSISTENT_DATASET_CACHE=$HOME/.cache/datasets/AADM2025Dryad" >> "$GITHUB_ENV"
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -47,46 +65,112 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Restore AERPAW dataset cache
-        id: cache-aerpaw
-        uses: actions/cache@v4
-        with:
-          path: |
-            data/raw/AADM2025Dryad
-            data/raw/AADM2025Dryad.zip
-          key: aerpaw-aadm2025dryad-${{ inputs.cache_key_suffix }}
+      - name: Install rclone without sudo
+        run: |
+          set -euo pipefail
+          if ! command -v rclone >/dev/null 2>&1; then
+            mkdir -p "$RUNNER_TEMP/rclone-bin" "$RUNNER_TEMP/rclone-download"
+            curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip \
+              -o "$RUNNER_TEMP/rclone-download/rclone.zip"
+            python - <<'PY'
+            import os
+            import shutil
+            import zipfile
+            from pathlib import Path
+
+            temp = Path(os.environ["RUNNER_TEMP"])
+            zip_path = temp / "rclone-download" / "rclone.zip"
+            extract_dir = temp / "rclone-download" / "extract"
+            bin_dir = temp / "rclone-bin"
+            zipfile.ZipFile(zip_path).extractall(extract_dir)
+            matches = list(extract_dir.glob("rclone-*/rclone"))
+            if not matches:
+                raise SystemExit("Downloaded rclone archive did not contain rclone binary")
+            target = bin_dir / "rclone"
+            shutil.copy2(matches[0], target)
+            target.chmod(0o755)
+            PY
+            echo "$RUNNER_TEMP/rclone-bin" >> "$GITHUB_PATH"
+            export PATH="$RUNNER_TEMP/rclone-bin:$PATH"
+          fi
+          rclone version
 
       - name: Prepare dataset
-        shell: bash
-        env:
-          INPUT_DATASET_ROOT: ${{ inputs.dataset_root }}
-          INPUT_DATASET_URL: ${{ inputs.dataset_url }}
-          SECRET_DATASET_URL: ${{ secrets.AADM2025DRYAD_URL }}
         run: |
           set -euo pipefail
           mkdir -p data/raw
 
-          if [ -n "$INPUT_DATASET_ROOT" ]; then
-            echo "Using local dataset path from workflow input."
-            if [ ! -d "$INPUT_DATASET_ROOT" ]; then
-              echo "dataset_root does not exist on this runner: $INPUT_DATASET_ROOT"
+          link_dataset_root() {
+            local root="$1"
+            if [ ! -d "$root" ]; then
+              echo "Dataset root does not exist: $root" >&2
               exit 1
             fi
-            if ! find "$INPUT_DATASET_ROOT" -type d -name "RF Sensor and Radar" -print -quit | grep -q .; then
-              echo "dataset_root exists but does not contain an RF Sensor and Radar directory: $INPUT_DATASET_ROOT"
-              find "$INPUT_DATASET_ROOT" -maxdepth 3 -type d | sed -n '1,80p'
+            if ! find "$root" -type d -name "RF Sensor and Radar" -print -quit | grep -q .; then
+              echo "Dataset root does not contain an RF Sensor and Radar directory: $root" >&2
+              find "$root" -maxdepth 4 -type d | sed -n '1,120p' >&2 || true
               exit 1
             fi
             rm -rf "$DATASET_ROOT"
             mkdir -p "$(dirname "$DATASET_ROOT")"
-            ln -s "$INPUT_DATASET_ROOT" "$DATASET_ROOT"
-            du -sh "$INPUT_DATASET_ROOT" || true
+            ln -s "$root" "$DATASET_ROOT"
+            echo "Using dataset root: $root"
+            du -sh "$root" || true
+          }
+
+          find_cached_dataset_root() {
+            local cache="$1"
+            local rf_dir
+            rf_dir="$(find "$cache" -type d -name "RF Sensor and Radar" -print -quit 2>/dev/null || true)"
+            if [ -z "$rf_dir" ]; then
+              return 1
+            fi
+            dirname "$rf_dir"
+          }
+
+          if [ -n "$INPUT_DATASET_ROOT" ]; then
+            echo "Using local dataset path from workflow input."
+            link_dataset_root "$INPUT_DATASET_ROOT"
             exit 0
           fi
 
-          if [ -d "$DATASET_ROOT" ] && find "$DATASET_ROOT" -type d -name "RF Sensor and Radar" -print -quit | grep -q .; then
-            echo "Dataset already restored at $DATASET_ROOT"
-            du -sh "$DATASET_ROOT" || true
+          if [ "${FORCE_REDOWNLOAD,,}" = "true" ]; then
+            echo "force_redownload=true, removing persistent dataset cache."
+            rm -rf "$PERSISTENT_DATASET_CACHE"
+          fi
+
+          if [ -d "$PERSISTENT_DATASET_CACHE" ]; then
+            cached_root="$(find_cached_dataset_root "$PERSISTENT_DATASET_CACHE" || true)"
+            if [ -n "${cached_root:-}" ]; then
+              echo "Using persistent cached AADM2025Dryad dataset."
+              link_dataset_root "$cached_root"
+              exit 0
+            fi
+          fi
+
+          if [ -n "$AADM2025DRYAD_DATA_WEBDAV_URL" ] && [ -n "$AADM2025DRYAD_DATA_KEY" ] && [ -n "$AADM2025DRYAD_DATA_PASSWORD" ]; then
+            echo "Populating persistent dataset cache from WebDAV via rclone."
+            rm -rf "$PERSISTENT_DATASET_CACHE"
+            mkdir -p "$PERSISTENT_DATASET_CACHE"
+            echo "::add-mask::$AADM2025DRYAD_DATA_WEBDAV_URL"
+            echo "::add-mask::$AADM2025DRYAD_DATA_KEY"
+            echo "::add-mask::$AADM2025DRYAD_DATA_PASSWORD"
+            obscured_pass="$(rclone obscure "$AADM2025DRYAD_DATA_PASSWORD")"
+            rclone copy ":webdav:" "$PERSISTENT_DATASET_CACHE" \
+              --webdav-url "$AADM2025DRYAD_DATA_WEBDAV_URL" \
+              --webdav-vendor owncloud \
+              --webdav-user "$AADM2025DRYAD_DATA_KEY" \
+              --webdav-pass "$obscured_pass" \
+              --progress \
+              --transfers 8 \
+              --checkers 16
+            cached_root="$(find_cached_dataset_root "$PERSISTENT_DATASET_CACHE" || true)"
+            if [ -z "${cached_root:-}" ]; then
+              echo "WebDAV copy finished, but no RF Sensor and Radar directory was found under $PERSISTENT_DATASET_CACHE" >&2
+              find "$PERSISTENT_DATASET_CACHE" -maxdepth 4 -type d | sed -n '1,160p' >&2 || true
+              exit 1
+            fi
+            link_dataset_root "$cached_root"
             exit 0
           fi
 
@@ -95,53 +179,46 @@ jobs:
             DATASET_URL="$SECRET_DATASET_URL"
           fi
           if [ -z "$DATASET_URL" ]; then
-            echo "No dataset source provided. Re-run with dataset_root, dataset_url, or secret AADM2025DRYAD_URL."
+            echo "No dataset source provided. Set dataset_root, WebDAV secrets, dataset_url, or secret AADM2025DRYAD_URL." >&2
             exit 1
           fi
           echo "::add-mask::$DATASET_URL"
 
-          if [ ! -s "$DATASET_ZIP" ]; then
-            echo "Downloading AERPAW archive to $DATASET_ZIP"
-            curl --fail --location --retry 5 --retry-delay 20 --connect-timeout 60 \
-              --output "$DATASET_ZIP" "$DATASET_URL"
-          else
-            echo "Using cached archive $DATASET_ZIP"
-          fi
-
-          echo "Archive size:"
+          rm -rf "$PERSISTENT_DATASET_CACHE"
+          mkdir -p "$PERSISTENT_DATASET_CACHE"
+          echo "Downloading AERPAW archive to $DATASET_ZIP"
+          curl --fail --location --retry 5 --retry-delay 20 --connect-timeout 60 \
+            --output "$DATASET_ZIP" "$DATASET_URL"
           du -sh "$DATASET_ZIP" || true
 
-          rm -rf "$DATASET_ROOT"
-          mkdir -p "$DATASET_ROOT"
           python - <<'PY'
           from pathlib import Path
           import zipfile
 
           archive = Path("data/raw/AADM2025Dryad.zip")
-          target = Path("data/raw/AADM2025Dryad")
+          target = Path.home() / ".cache" / "datasets" / "AADM2025Dryad"
           if not zipfile.is_zipfile(archive):
               raise SystemExit(f"{archive} is not a ZIP file. Provide a direct ZIP archive URL.")
           with zipfile.ZipFile(archive) as zf:
               zf.extractall(target)
           PY
-
-          echo "Extracted dataset size:"
-          du -sh "$DATASET_ROOT" || true
-          find "$DATASET_ROOT" -maxdepth 4 -type d -name "RF Sensor and Radar" -print
+          cached_root="$(find_cached_dataset_root "$PERSISTENT_DATASET_CACHE" || true)"
+          if [ -z "${cached_root:-}" ]; then
+            echo "Downloaded ZIP did not contain an RF Sensor and Radar directory." >&2
+            exit 1
+          fi
+          link_dataset_root "$cached_root"
 
       - name: Install package
-        shell: bash
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
 
       - name: Run gating unit tests
-        shell: bash
         run: pytest -q tests/test_gating.py
 
       - name: Inspect selected flights
-        shell: bash
         run: |
           set -euo pipefail
           for flight in ${{ inputs.flights }}; do
@@ -149,7 +226,6 @@ jobs:
           done
 
       - name: Run ungated and NIS-gated ablation
-        shell: bash
         run: |
           set -euo pipefail
           for flight in ${{ inputs.flights }}; do
@@ -170,7 +246,6 @@ jobs:
           done
 
       - name: Collect ablation table
-        shell: bash
         run: |
           set -euo pipefail
           python scripts/collect_gating_ablation.py \
@@ -182,7 +257,6 @@ jobs:
 
       - name: Summarize dataset and outputs
         if: always()
-        shell: bash
         run: |
           {
             echo "## AERPAW gating ablation"
@@ -190,7 +264,7 @@ jobs:
             echo "### Dataset size"
             echo '```text'
             du -sh "$DATASET_ROOT" 2>/dev/null || true
-            du -sh "$DATASET_ZIP" 2>/dev/null || true
+            du -sh "$PERSISTENT_DATASET_CACHE" 2>/dev/null || true
             echo '```'
             echo
             echo "### Result table"
