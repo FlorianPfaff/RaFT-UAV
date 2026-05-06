@@ -5,7 +5,7 @@ Radar-RF Fusion Tracking for UAVs.
 This repository contains implementation and evaluation code for tracking UAVs
 with AERPAW Dataset-28 / Dryad DOI `10.5061/dryad.7d7wm3898`. The initial
 baseline is an asynchronous constant-velocity Kalman fusion tracker built on
-[PyRecEst](https://github.com/FlorianPfaff/PyRecEst).
+PyRecEst.
 
 Large datasets and generated bulk artifacts are intentionally not stored in
 this repository.
@@ -46,6 +46,12 @@ Run the initial fusion baseline on one flight:
 python -m raft_uav.cli run-baseline data/raw/AADM2025Dryad --flight Opt2
 ```
 
+Run the normalized-innovation-squared gated baseline on one flight:
+
+```bash
+python -m raft_uav.cli run-baseline data/raw/AADM2025Dryad --flight Opt2 --enable-gating --rf-gate-prob 0.99 --radar-gate-prob 0.99
+```
+
 The first baseline is deliberately conservative. It is meant to reproduce the
 published constant-velocity Kalman fusion setup before adding robust gating,
 learned sensor uncertainties, maneuvering models, and smoothing.
@@ -53,6 +59,7 @@ learned sensor uncertainties, maneuvering models, and smoothing.
 Baseline runs write gitignored per-flight artifacts under `outputs/baseline/`:
 
 - `estimates.csv`
+- `diagnostics.csv`
 - `metrics.json`
 - `trajectory.png`
 
