@@ -8,6 +8,15 @@ from typing import Any, Iterable, Mapping
 import numpy as np
 from scipy.stats import chi2
 
+from raft_uav.baselines.update_logic import (
+    gate_threshold_for_measurement,
+    inflation_alpha_for_measurement,
+    normalized_innovation_squared,
+    plan_linear_measurement_update,
+    robust_update_for_measurement,
+    symmetrized,
+)
+
 try:  # Keep the reproduced baseline on PyRecEst when the dependency is installed.
     from pyrecest.filters import KalmanFilter
 except ImportError:  # pragma: no cover - exercised only in lightweight local smoke tests.
@@ -108,18 +117,6 @@ def measurement_matrix(measurement_dim: int) -> np.ndarray:
     raise ValueError("measurement_dim must be 2, 3, or 6")
 
 
-def normalized_innovation_squared(residual: np.ndarray, innovation_covariance: np.ndarray) -> float:
-    """Return the squared Mahalanobis innovation distance."""
-
-    residual = np.asarray(residual, dtype=float).reshape(-1)
-    covariance = np.asarray(innovation_covariance, dtype=float)
-    try:
-        solved = np.linalg.solve(covariance, residual)
-    except np.linalg.LinAlgError:
-        solved = np.linalg.pinv(covariance) @ residual
-    return float(residual @ solved)
-
-
 def gate_threshold_from_probability(
     probability: float | None, measurement_dim: int
 ) -> float | None:
@@ -214,7 +211,7 @@ class AsyncConstantVelocityKalmanTracker:
             else:
                 self.mean = transition @ self.mean
             self.covariance = transition @ self.covariance @ transition.T + process_noise
-            self.covariance = _symmetrized(self.covariance)
+            self.covariance = symmetrized(self.covariance)
             self.current_time_s = float(time_s)
 
     def update(
@@ -224,57 +221,40 @@ class AsyncConstantVelocityKalmanTracker:
         robust_update: str | None = None,
         inflation_alpha: float = 1.0,
     ) -> TrackingUpdateDiagnostics:
-        """Predict to and conditionally update from one RF or radar measurement.
-
-        If ``gate_threshold`` is provided and ``robust_update`` is ``None``, the
-        update is skipped when the normalized innovation squared exceeds that
-        threshold. If ``robust_update="nis-inflate"``, the update is kept but
-        its measurement covariance is inflated by ``(nis / gate_threshold) **
-        inflation_alpha`` when the threshold is exceeded.
-        """
+        """Predict to and conditionally update from one RF or radar measurement."""
 
         self.predict_to(measurement.time_s)
-        inflation_alpha = float(inflation_alpha)
-        if inflation_alpha <= 0.0:
-            raise ValueError("inflation_alpha must be positive")
-        vector = np.asarray(measurement.vector, dtype=float).reshape(-1)
-        covariance = np.asarray(measurement.covariance, dtype=float)
-        observation = measurement_matrix(vector.size)
+        plan = plan_linear_measurement_update(
+            mean=self.mean,
+            covariance_matrix=self.covariance,
+            measurement_vector=measurement.vector,
+            measurement_covariance=measurement.covariance,
+            observation_matrix=measurement_matrix(measurement.vector.size),
+            gate_threshold=gate_threshold,
+            robust_update=robust_update,
+            inflation_alpha=inflation_alpha,
+        )
 
-        residual = vector - observation @ self.mean
-        innovation_covariance = observation @ self.covariance @ observation.T + covariance
-        nis = normalized_innovation_squared(residual, innovation_covariance)
-        threshold = None if gate_threshold is None else float(gate_threshold)
-        covariance_scale = 1.0
-        update_action = "updated"
-        accepted = True
-
-        if threshold is not None and nis > threshold:
-            if robust_update == "nis-inflate":
-                covariance_scale = max(1.0, float((nis / threshold) ** inflation_alpha))
-                covariance = covariance * covariance_scale
-                innovation_covariance = observation @ self.covariance @ observation.T + covariance
-                update_action = "inflated"
-            elif robust_update is None:
-                accepted = False
-                update_action = "rejected"
-            else:
-                raise ValueError(f"unknown robust update mode {robust_update!r}")
-
-        if accepted:
-            self._linear_update(observation, residual, innovation_covariance, covariance, vector)
+        if plan.accepted:
+            self._linear_update(
+                plan.observation,
+                plan.residual,
+                plan.innovation_covariance,
+                plan.covariance,
+                plan.vector,
+            )
 
         return TrackingUpdateDiagnostics(
             time_s=float(measurement.time_s),
             source=measurement.source,
-            measurement_dim=vector.size,
-            accepted=bool(accepted),
-            update_action=update_action,
-            nis=float(nis),
-            gate_threshold=threshold,
-            covariance_scale=float(covariance_scale),
-            inflation_alpha=inflation_alpha if robust_update == "nis-inflate" else None,
-            residual_norm_m=float(np.linalg.norm(residual)),
+            measurement_dim=plan.vector.size,
+            accepted=plan.accepted,
+            update_action=plan.update_action,
+            nis=plan.nis,
+            gate_threshold=plan.threshold,
+            covariance_scale=plan.covariance_scale,
+            inflation_alpha=plan.inflation_alpha if robust_update == "nis-inflate" else None,
+            residual_norm_m=float(np.linalg.norm(plan.residual)),
         )
 
     def _linear_update(
@@ -304,7 +284,7 @@ class AsyncConstantVelocityKalmanTracker:
             self.mean = np.asarray(self.filter.get_point_estimate(), dtype=float)
         else:
             self.mean = updated_mean
-        self.covariance = _symmetrized(updated_covariance)
+        self.covariance = symmetrized(updated_covariance)
 
 
 def run_async_cv_baseline(
@@ -315,17 +295,7 @@ def run_async_cv_baseline(
     robust_update_by_source: Mapping[str, str | None] | None = None,
     inflation_alpha_by_source: Mapping[str, float] | None = None,
 ) -> list[dict[str, object]]:
-    """Run the asynchronous CV Kalman baseline and return posterior records.
-
-    ``gate_probabilities_by_source`` maps source names such as ``"rf"`` or
-    ``"radar"`` to chi-square gate probabilities. ``None`` or a missing source
-    disables NIS thresholding. ``gate_thresholds_by_source`` can be used for
-    deterministic tests or manually tuned thresholds and takes precedence over
-    probabilities. ``robust_update_by_source={"rf": "nis-inflate"}`` keeps
-    high-NIS updates and inflates their measurement covariance instead of
-    rejecting them. ``inflation_alpha_by_source`` controls the source-specific
-    exponent used by ``nis-inflate``.
-    """
+    """Run the asynchronous CV Kalman baseline and return posterior records."""
 
     ordered = sorted(measurements, key=lambda item: item.time_s)
     if not ordered:
@@ -339,24 +309,22 @@ def run_async_cv_baseline(
 
     records: list[dict[str, object]] = []
     for measurement in ordered:
-        gate_threshold = _gate_threshold_for_measurement(
-            measurement,
-            gate_probabilities_by_source=gate_probabilities_by_source,
-            gate_thresholds_by_source=gate_thresholds_by_source,
-        )
-        robust_update = _robust_update_for_measurement(
-            measurement,
-            robust_update_by_source=robust_update_by_source,
-        )
-        inflation_alpha = _inflation_alpha_for_measurement(
-            measurement,
-            inflation_alpha_by_source=inflation_alpha_by_source,
-        )
         diagnostics = tracker.update(
             measurement,
-            gate_threshold=gate_threshold,
-            robust_update=robust_update,
-            inflation_alpha=inflation_alpha,
+            gate_threshold=gate_threshold_for_measurement(
+                measurement,
+                gate_probabilities_by_source=gate_probabilities_by_source,
+                gate_thresholds_by_source=gate_thresholds_by_source,
+                probability_to_threshold=gate_threshold_from_probability,
+            ),
+            robust_update=robust_update_for_measurement(
+                measurement,
+                robust_update_by_source=robust_update_by_source,
+            ),
+            inflation_alpha=inflation_alpha_for_measurement(
+                measurement,
+                inflation_alpha_by_source=inflation_alpha_by_source,
+            ),
         )
         records.append(
             {
@@ -370,42 +338,4 @@ def run_async_cv_baseline(
     return records
 
 
-def _gate_threshold_for_measurement(
-    measurement: TrackingMeasurement,
-    *,
-    gate_probabilities_by_source: Mapping[str, float | None] | None,
-    gate_thresholds_by_source: Mapping[str, float | None] | None,
-) -> float | None:
-    if gate_thresholds_by_source and measurement.source in gate_thresholds_by_source:
-        threshold = gate_thresholds_by_source[measurement.source]
-        return None if threshold is None else float(threshold)
-    if gate_probabilities_by_source and measurement.source in gate_probabilities_by_source:
-        return gate_threshold_from_probability(
-            gate_probabilities_by_source[measurement.source],
-            measurement.vector.size,
-        )
-    return None
-
-
-def _robust_update_for_measurement(
-    measurement: TrackingMeasurement,
-    *,
-    robust_update_by_source: Mapping[str, str | None] | None,
-) -> str | None:
-    if robust_update_by_source and measurement.source in robust_update_by_source:
-        return robust_update_by_source[measurement.source]
-    return None
-
-
-def _inflation_alpha_for_measurement(
-    measurement: TrackingMeasurement,
-    *,
-    inflation_alpha_by_source: Mapping[str, float] | None,
-) -> float:
-    if inflation_alpha_by_source and measurement.source in inflation_alpha_by_source:
-        return float(inflation_alpha_by_source[measurement.source])
-    return 1.0
-
-
-def _symmetrized(matrix: np.ndarray) -> np.ndarray:
-    return 0.5 * (matrix + matrix.T)
+_symmetrized = symmetrized
