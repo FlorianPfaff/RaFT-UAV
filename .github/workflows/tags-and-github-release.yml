@@ -1,6 +1,7 @@
+---
 name: Create version tag and GitHub release
 
-#checkov:skip=CKV_GHA_7: Manual release inputs only control dry-run behavior and release-note generation; package build inputs remain fixed to the checked-out source.
+# checkov:skip=CKV_GHA_7: Manual release inputs only control dry-run behavior and release-note generation; package build inputs remain fixed to the checked-out source.
 on: # yamllint disable-line rule:truthy
   pull_request:
     types: [closed]
