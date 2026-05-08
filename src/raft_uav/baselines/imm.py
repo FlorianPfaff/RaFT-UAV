@@ -144,11 +144,17 @@ class AsyncInteractingMultipleModelTracker:
         initial_mode_probabilities: Sequence[float] | None = None,
         mode_switch_time_constant_s: float = 20.0,
     ) -> None:
-        position = np.asarray(initial_position, dtype=float).reshape(-1)
-        if position.size == 2:
-            position = np.array([position[0], position[1], 0.0])
-        if position.size != 3:
-            raise ValueError("initial_position must contain 2 or 3 elements")
+        initial = np.asarray(initial_position, dtype=float).reshape(-1)
+        initial_velocity: np.ndarray | None = None
+        if initial.size == 2:
+            position = np.array([initial[0], initial[1], 0.0])
+        elif initial.size == 3:
+            position = initial
+        elif initial.size == 6:
+            position = initial[:3]
+            initial_velocity = initial[3:6]
+        else:
+            raise ValueError("initial_position must contain 2, 3, or 6 elements")
 
         self.modes = tuple(modes or default_imm_modes(acceleration_std_mps2))
         if not self.modes:
@@ -158,6 +164,8 @@ class AsyncInteractingMultipleModelTracker:
 
         self.mean = np.zeros(6)
         self.mean[:3] = position
+        if initial_velocity is not None:
+            self.mean[3:6] = initial_velocity
         self.covariance = np.diag(
             [
                 initial_position_std_m**2,
@@ -210,6 +218,12 @@ class AsyncInteractingMultipleModelTracker:
             name: float(probability)
             for name, probability in zip(self.mode_names, self.mode_probabilities)
         }
+
+    @property
+    def most_likely_mode_name(self) -> str:
+        """Return the name of the currently most probable IMM motion mode."""
+
+        return self.mode_names[int(np.argmax(self.mode_probabilities))]
 
     def predict_to(self, time_s: float) -> None:
         """Predict to an absolute timestamp."""
@@ -342,6 +356,7 @@ def run_async_imm_baseline(
                 "mode_names": tracker.mode_names,
                 "mode_probabilities": tracker.mode_probabilities.copy(),
                 "mode_probability_map": tracker.mode_probability_map,
+                "most_likely_mode": tracker.most_likely_mode_name,
                 **diagnostics.to_record(),
             }
         )
