@@ -11,6 +11,7 @@ from raft_uav.baselines.kalman import (
     constant_velocity_matrix,
     white_acceleration_process_noise,
 )
+from raft_uav.baselines.record_helpers import copy_record, record_arrays, symmetrized
 from raft_uav.baselines.robust_map import RobustMapSmootherConfig, robust_map_smooth_records
 
 SMOOTHER_MODES = ("none", "rts", "fixed-lag", "robust-map", "fixed-lag-map")
@@ -36,7 +37,7 @@ def smooth_tracking_records(
     if method not in SMOOTHER_MODES:
         raise ValueError(f"unknown smoother method {method!r}")
     if method == "none" or not records:
-        return [_copy_record(record) for record in records]
+        return [copy_record(record) for record in records]
     if method in ("fixed-lag", "fixed-lag-map") and (lag_s is None or lag_s < 0.0):
         raise ValueError(f"{method} smoothing requires a nonnegative lag_s")
     if method in ("robust-map", "fixed-lag-map"):
@@ -48,7 +49,7 @@ def smooth_tracking_records(
             lag_s=None if method == "robust-map" else float(lag_s),
         )
 
-    times, filtered_states, filtered_covariances = _record_arrays(records)
+    times, filtered_states, filtered_covariances = record_arrays(records)
     if method == "rts":
         smoothed_states, smoothed_covariances = _rts_smooth(
             times,
@@ -69,7 +70,7 @@ def smooth_tracking_records(
 
     out: list[dict[str, object]] = []
     for idx, record in enumerate(records):
-        item = _copy_record(record)
+        item = copy_record(record)
         item["filtered_state"] = filtered_states[idx].copy()
         item["filtered_covariance"] = filtered_covariances[idx].copy()
         item["state"] = smoothed_states[idx].copy()
@@ -130,7 +131,7 @@ def _rts_smooth(
         smoothed_states[idx] = filtered_states[idx] + gain @ (
             smoothed_states[idx + 1] - predicted_state
         )
-        smoothed_covariances[idx] = _symmetrized(
+        smoothed_covariances[idx] = symmetrized(
             filtered_covariances[idx]
             + gain @ (smoothed_covariances[idx + 1] - predicted_covariance) @ gain.T
         )
@@ -151,7 +152,7 @@ def _predict_from_record(
     transition = constant_velocity_matrix(max(0.0, dt_s))
     process_noise = white_acceleration_process_noise(max(0.0, dt_s), acceleration_std_mps2)
     predicted_state = transition @ filtered_states[index]
-    predicted_covariance = _symmetrized(
+    predicted_covariance = symmetrized(
         transition @ filtered_covariances[index] @ transition.T + process_noise
     )
     return transition, predicted_state, predicted_covariance
@@ -167,25 +168,3 @@ def _smoothing_gain(
         return np.linalg.solve(predicted_covariance.T, right.T).T
     except np.linalg.LinAlgError:
         return right @ np.linalg.pinv(predicted_covariance)
-
-
-def _record_arrays(
-    records: list[dict[str, object]],
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    times = np.asarray([float(record["time_s"]) for record in records], dtype=float)
-    states = np.stack([np.asarray(record["state"], dtype=float).reshape(6) for record in records])
-    covariances = np.stack(
-        [np.asarray(record["covariance"], dtype=float).reshape(6, 6) for record in records]
-    )
-    return times, states, covariances
-
-
-def _copy_record(record: dict[str, object]) -> dict[str, object]:
-    copied: dict[str, object] = {}
-    for key, value in record.items():
-        copied[key] = value.copy() if isinstance(value, np.ndarray) else value
-    return copied
-
-
-def _symmetrized(matrix: np.ndarray) -> np.ndarray:
-    return 0.5 * (matrix + matrix.T)
