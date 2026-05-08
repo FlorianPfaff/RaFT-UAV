@@ -16,3 +16,14 @@ PRINT_ALPACA: false
 SHOW_ELAPSED_TIME: true
 FLAVOR_SUGGESTIONS: false
 PYTHON_RUFF_CONFIG_FILE: pyproject.toml
+
+# actionlint's YAML/workflow checks remain enabled. The embedded shellcheck pass
+# is disabled because the self-hosted data workflow intentionally uses indented
+# multi-line scripts/heredocs that shellcheck parses differently through
+# actionlint than GitHub Actions executes them.
+ACTION_ACTIONLINT_ARGUMENTS: "-shellcheck="
+
+# This repository contains several compact tracker/CLI variants whose shared
+# Kalman-update and argument-parsing boilerplate creates many small false
+# positives. Keep jscpd focused on larger, actionable clones.
+COPYPASTE_JSCPD_ARGUMENTS: "--min-tokens 500"
