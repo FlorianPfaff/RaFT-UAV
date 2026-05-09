@@ -12,6 +12,10 @@ from raft_uav.baselines.learned_radar_association import (
     run_async_cv_baseline_with_learned_radar_association,
 )
 from raft_uav.baselines.smoothing import SMOOTHER_MODES, smooth_tracking_records
+from raft_uav.baselines.stateful_learned_radar_association import (
+    StatefulAssociationConfig,
+    run_async_cv_baseline_with_stateful_learned_radar_association,
+)
 from raft_uav.cli import (
     _baseline_metrics,
     _hypotheses_to_frame,
@@ -44,11 +48,43 @@ def main(argv: list[str] | None = None) -> int:
         required=True,
         help="JSON model produced by raft-uav-train-radar-association",
     )
-    parser.add_argument("--output-dir", type=Path, default=Path("outputs/learned-radar-association"))
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=Path("outputs/learned-radar-association"),
+    )
     parser.add_argument("--acceleration-std", type=float, default=4.0)
     parser.add_argument("--radar-catprob-threshold", type=float, default=0.5)
+    parser.add_argument(
+        "--disable-radar-catprob-threshold",
+        action="store_true",
+        help="keep all radar rows before learned association scoring",
+    )
     parser.add_argument("--radar-xy-std", type=float, default=25.0)
     parser.add_argument("--radar-z-std", type=float, default=35.0)
+    parser.add_argument(
+        "--association-mode",
+        choices=["per-frame", "stateful-beam"],
+        default="per-frame",
+        help="learned radar association policy",
+    )
+    parser.add_argument("--beam-max-hypotheses", type=int, default=16)
+    parser.add_argument("--beam-max-candidates", type=int, default=6)
+    parser.add_argument("--beam-missed-detection-cost", type=float, default=4.0)
+    parser.add_argument("--beam-consecutive-miss-cost", type=float, default=0.5)
+    parser.add_argument("--beam-track-switch-cost", type=float, default=3.0)
+    parser.add_argument("--beam-missing-track-id-cost", type=float, default=1.0)
+    parser.add_argument(
+        "--beam-lag-s",
+        type=float,
+        default=20.0,
+        help="association look-ahead horizon before old decisions are committed",
+    )
+    parser.add_argument(
+        "--disable-beam-missed-detection",
+        action="store_true",
+        help="do not keep miss branches in stateful-beam mode",
+    )
     parser.add_argument("--smoother", choices=SMOOTHER_MODES, default="none")
     parser.add_argument("--smoother-lag-s", type=float, default=20.0)
     parser.add_argument("--max-eval-time-delta-s", type=float, default=2.0)
@@ -94,18 +130,48 @@ def main(argv: list[str] | None = None) -> int:
         robust_updates = {"rf": args.robust_update, "radar": args.robust_update}
         inflation_alphas = {"rf": args.rf_inflation_alpha, "radar": args.radar_inflation_alpha}
 
-    records, selected_radar = run_async_cv_baseline_with_learned_radar_association(
-        rf_measurements=rf_measurements,
-        radar=radar,
-        model=args.model,
-        acceleration_std_mps2=args.acceleration_std,
-        radar_xy_std_m=args.radar_xy_std,
-        radar_z_std_m=args.radar_z_std,
-        gate_probabilities_by_source=gate_probabilities,
-        robust_update_by_source=robust_updates,
-        inflation_alpha_by_source=inflation_alphas,
-        candidate_catprob_threshold=args.radar_catprob_threshold,
+    candidate_catprob_threshold = (
+        None if args.disable_radar_catprob_threshold else args.radar_catprob_threshold
     )
+
+    if args.association_mode == "stateful-beam":
+        association_name = "stateful-learned-likelihood"
+        records, selected_radar = run_async_cv_baseline_with_stateful_learned_radar_association(
+            rf_measurements=rf_measurements,
+            radar=radar,
+            model=args.model,
+            acceleration_std_mps2=args.acceleration_std,
+            radar_xy_std_m=args.radar_xy_std,
+            radar_z_std_m=args.radar_z_std,
+            gate_probabilities_by_source=gate_probabilities,
+            robust_update_by_source=robust_updates,
+            inflation_alpha_by_source=inflation_alphas,
+            candidate_catprob_threshold=candidate_catprob_threshold,
+            config=StatefulAssociationConfig(
+                max_hypotheses=args.beam_max_hypotheses,
+                max_candidates_per_hypothesis=args.beam_max_candidates,
+                missed_detection_cost=args.beam_missed_detection_cost,
+                consecutive_miss_cost=args.beam_consecutive_miss_cost,
+                track_switch_cost=args.beam_track_switch_cost,
+                missing_track_id_cost=args.beam_missing_track_id_cost,
+                allow_missed_detection=not args.disable_beam_missed_detection,
+                lag_s=args.beam_lag_s,
+            ),
+        )
+    else:
+        association_name = "learned-likelihood"
+        records, selected_radar = run_async_cv_baseline_with_learned_radar_association(
+            rf_measurements=rf_measurements,
+            radar=radar,
+            model=args.model,
+            acceleration_std_mps2=args.acceleration_std,
+            radar_xy_std_m=args.radar_xy_std,
+            radar_z_std_m=args.radar_z_std,
+            gate_probabilities_by_source=gate_probabilities,
+            robust_update_by_source=robust_updates,
+            inflation_alpha_by_source=inflation_alphas,
+            candidate_catprob_threshold=candidate_catprob_threshold,
+        )
     if not records:
         raise RuntimeError(f"{flight.name} produced no posterior records")
     records = smooth_tracking_records(
@@ -153,8 +219,10 @@ def main(argv: list[str] | None = None) -> int:
         selected_radar=selected_radar,
         estimate_frame=estimate_frame,
         acceleration_std=args.acceleration_std,
-        radar_association="learned-likelihood",
-        radar_catprob_threshold=args.radar_catprob_threshold,
+        radar_association=association_name,
+        radar_catprob_threshold=(
+            float("nan") if args.disable_radar_catprob_threshold else args.radar_catprob_threshold
+        ),
         truth_gate_m=150.0,
         truth_time_gate_s=1.0,
         track_switch_nis_ratio=0.5,
@@ -164,9 +232,9 @@ def main(argv: list[str] | None = None) -> int:
         geometry_catprob_weight=2.0,
         pda_nis_temperature=1.0,
         pda_catprob_exponent=1.0,
-        track_bank_max_hypotheses=16,
-        track_bank_max_assignments=16,
-        track_bank_max_candidates=16,
+        track_bank_max_hypotheses=args.beam_max_hypotheses,
+        track_bank_max_assignments=args.beam_max_candidates,
+        track_bank_max_candidates=args.beam_max_candidates,
         track_bank_gate_prob=0.9999999,
         track_bank_detection_prob=0.999,
         track_bank_clutter_intensity=1.0e-12,
@@ -182,11 +250,26 @@ def main(argv: list[str] | None = None) -> int:
         radar_inflation_alpha=args.radar_inflation_alpha,
     )
     metrics["learned_radar_association_model"] = str(args.model)
+    metrics["learned_radar_association_mode"] = args.association_mode
+    if args.disable_radar_catprob_threshold:
+        metrics["radar_catprob_threshold"] = None
+    if args.association_mode == "stateful-beam":
+        metrics["stateful_learned_association"] = {
+            "max_hypotheses": int(args.beam_max_hypotheses),
+            "max_candidates_per_hypothesis": int(args.beam_max_candidates),
+            "missed_detection_cost": float(args.beam_missed_detection_cost),
+            "consecutive_miss_cost": float(args.beam_consecutive_miss_cost),
+            "track_switch_cost": float(args.beam_track_switch_cost),
+            "missing_track_id_cost": float(args.beam_missing_track_id_cost),
+            "allow_missed_detection": not args.disable_beam_missed_detection,
+            "lag_s": float(args.beam_lag_s),
+        }
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     _write_trajectory_plot(plot_path, truth, rf, selected_radar, estimate_frame, flight.name)
 
     print(f"flight={flight.name}")
-    print("radar_association=learned-likelihood")
+    print(f"radar_association={association_name}")
+    print(f"learned_radar_association_mode={args.association_mode}")
     print(f"model_json={args.model}")
     print(f"posterior_records={len(records)}")
     print(f"selected_radar_rows={len(selected_radar)}")
