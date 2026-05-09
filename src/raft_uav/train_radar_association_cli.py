@@ -35,7 +35,16 @@ def main(argv: list[str] | None = None) -> int:
         "--flight",
         action="append",
         default=None,
-        help="training flight name/substr; repeat for multiple flights; defaults to all usable flights",
+        help=(
+            "training flight name/substr; repeat for multiple flights; "
+            "defaults to all usable flights"
+        ),
+    )
+    parser.add_argument(
+        "--exclude-flight",
+        action="append",
+        default=[],
+        help="flight name/substr to leave out, e.g. for leave-one-flight-out validation",
     )
     parser.add_argument("--output-model", type=Path, required=True)
     parser.add_argument("--output-examples", type=Path, default=None)
@@ -57,6 +66,9 @@ def main(argv: list[str] | None = None) -> int:
         if args.flight
         else discover_flights(args.dataset_root)
     )
+    if args.exclude_flight:
+        excluded = {select_flight(args.dataset_root, name).name for name in args.exclude_flight}
+        flights = [flight for flight in flights if flight.name not in excluded]
     frames: list[pd.DataFrame] = []
     used_flights: list[str] = []
     for flight in flights:
@@ -72,7 +84,11 @@ def main(argv: list[str] | None = None) -> int:
             )
             rf_measurements = rf_measurements_to_enu(rf)
         radar = _inside_truth_window(
-            normalize_radar(read_radar_tracks_json(flight.radar_json), projector, truth_origin_time),
+            normalize_radar(
+                read_radar_tracks_json(flight.radar_json),
+                projector,
+                truth_origin_time,
+            ),
             truth,
         )
         examples = collect_radar_association_training_frame(
@@ -106,6 +122,7 @@ def main(argv: list[str] | None = None) -> int:
         balance_classes=not args.no_balance_classes,
         metadata={
             "training_flights": used_flights,
+            "excluded_flights": list(args.exclude_flight or []),
             "positive_gate_m": float(args.positive_gate_m),
             "truth_gate_m": float(args.truth_gate_m),
             "truth_time_gate_s": float(args.truth_time_gate_s),
