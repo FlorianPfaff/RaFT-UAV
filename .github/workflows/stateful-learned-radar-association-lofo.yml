@@ -89,7 +89,7 @@ jobs:
     env:
       DATASET_ROOT: ${{ inputs.dataset_root }}
       TEST_FLIGHT: ${{ matrix.flight }}
-      OUT_DIR: outputs/stateful_lofo/${{ matrix.flight }}
+      OUT_DIR: ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}
 
     steps:
       - name: Check out repository
@@ -318,6 +318,11 @@ jobs:
             ${{ env.OUT_DIR }}/run/*/estimates.csv
             ${{ env.OUT_DIR }}/run/*/hypotheses.csv
             ${{ env.OUT_DIR }}/run/*/trajectory.png
+
+      - name: Remove local LOFO output
+        if: always()
+        run: |
+          rm -rf "${{ env.OUT_DIR }}"
 
   aggregate:
     name: Aggregate LOFO metrics
