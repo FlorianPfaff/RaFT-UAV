@@ -110,7 +110,7 @@ def robust_update_covariance_scale(
         return scale, "student_t" if scale > 1.0 else None
     if robust_update == "huber":
         scale = huber_covariance_scale(nis, huber_threshold)
-        return scale, "huber" if scale > 1.0 else None
+        return scale, "huberized" if scale > 1.0 else None
     raise ValueError(f"unknown robust update mode {robust_update!r}")
 
 
