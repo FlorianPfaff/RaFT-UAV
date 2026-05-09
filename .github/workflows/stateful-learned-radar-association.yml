@@ -1,0 +1,232 @@
+---
+name: Stateful learned radar association
+
+"on":
+  pull_request:
+    paths:
+      - ".github/workflows/stateful-learned-radar-association.yml"
+      - "pyproject.toml"
+      - "poetry.lock"
+      - "src/raft_uav/baselines/stateful_learned_radar_association.py"
+      - "src/raft_uav/baselines/learned_radar_association.py"
+      - "src/raft_uav/baselines/learned_radar_likelihood.py"
+      - "src/raft_uav/baselines/radar_likelihood_training.py"
+      - "src/raft_uav/run_learned_radar_association_cli.py"
+      - "src/raft_uav/train_radar_association_cli.py"
+      - "tests/test_stateful_learned_radar_association.py"
+  push:
+    branches:
+      - main
+      - "codex/**"
+      - "feature/**"
+    paths:
+      - ".github/workflows/stateful-learned-radar-association.yml"
+      - "pyproject.toml"
+      - "poetry.lock"
+      - "src/raft_uav/baselines/stateful_learned_radar_association.py"
+      - "src/raft_uav/baselines/learned_radar_association.py"
+      - "src/raft_uav/baselines/learned_radar_likelihood.py"
+      - "src/raft_uav/baselines/radar_likelihood_training.py"
+      - "src/raft_uav/run_learned_radar_association_cli.py"
+      - "src/raft_uav/train_radar_association_cli.py"
+      - "tests/test_stateful_learned_radar_association.py"
+  workflow_dispatch:
+    inputs:
+      run_aerpaw_smoke:
+        description: "Run an optional dataset-backed stateful association smoke test."
+        required: false
+        type: boolean
+        default: false
+      dataset_root:
+        description: "Path on the self-hosted runner to an extracted AADM2025Dryad dataset."
+        required: false
+        type: string
+      test_flight:
+        description: "Held-out flight used for the stateful-beam smoke run."
+        required: false
+        type: string
+        default: "Opt1"
+      beam_max_hypotheses:
+        description: "Maximum stateful association hypotheses retained per radar frame."
+        required: false
+        type: number
+        default: 16
+      beam_max_candidates:
+        description: "Maximum learned candidate branches per hypothesis."
+        required: false
+        type: number
+        default: 6
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  unit:
+    name: Unit checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install package
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Syntax-check stateful association files
+        run: |
+          set -euo pipefail
+          python -m py_compile \
+            src/raft_uav/baselines/stateful_learned_radar_association.py \
+            src/raft_uav/run_learned_radar_association_cli.py \
+            src/raft_uav/train_radar_association_cli.py \
+            tests/test_stateful_learned_radar_association.py
+
+      - name: Exercise learned association CLIs
+        run: |
+          set -euo pipefail
+          python -m raft_uav.train_radar_association_cli --help >/dev/null
+          python -m raft_uav.run_learned_radar_association_cli --help >/dev/null
+
+      - name: Run focused stateful association tests
+        run: pytest -q tests/test_stateful_learned_radar_association.py
+
+  aerpaw-smoke:
+    name: Optional AERPAW stateful-beam smoke
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_aerpaw_smoke }}
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 720
+    env:
+      DATASET_ROOT: ${{ inputs.dataset_root }}
+      TEST_FLIGHT: ${{ inputs.test_flight }}
+      BEAM_MAX_HYPOTHESES: ${{ inputs.beam_max_hypotheses }}
+      BEAM_MAX_CANDIDATES: ${{ inputs.beam_max_candidates }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Validate dataset input
+        run: |
+          set -euo pipefail
+          if [ -z "$DATASET_ROOT" ]; then
+            echo "dataset_root is required when run_aerpaw_smoke=true" >&2
+            exit 1
+          fi
+          if [ ! -d "$DATASET_ROOT" ]; then
+            echo "dataset_root does not exist: $DATASET_ROOT" >&2
+            exit 1
+          fi
+          if ! find "$DATASET_ROOT" -type d -name "RF Sensor and Radar" -print -quit | grep -q .; then
+            echo "dataset_root does not contain an RF Sensor and Radar directory: $DATASET_ROOT" >&2
+            find "$DATASET_ROOT" -maxdepth 4 -type d | sed -n '1,120p' >&2 || true
+            exit 1
+          fi
+          du -sh "$DATASET_ROOT" || true
+
+      - name: Install package
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Train leave-flight-out radar association model
+        run: |
+          set -euo pipefail
+          mkdir -p outputs/stateful_radar_association_smoke
+          python -m raft_uav.train_radar_association_cli "$DATASET_ROOT" \
+            --exclude-flight "$TEST_FLIGHT" \
+            --disable-radar-catprob-threshold \
+            --output-model outputs/stateful_radar_association_smoke/radar_assoc.json \
+            --output-examples outputs/stateful_radar_association_smoke/radar_assoc_examples.csv
+
+      - name: Run stateful-beam learned association smoke
+        run: |
+          set -euo pipefail
+          python -m raft_uav.run_learned_radar_association_cli "$DATASET_ROOT" \
+            --flight "$TEST_FLIGHT" \
+            --model outputs/stateful_radar_association_smoke/radar_assoc.json \
+            --association-mode stateful-beam \
+            --disable-radar-catprob-threshold \
+            --beam-max-hypotheses "$BEAM_MAX_HYPOTHESES" \
+            --beam-max-candidates "$BEAM_MAX_CANDIDATES" \
+            --beam-track-switch-cost 3.0 \
+            --beam-lag-s 20 \
+            --robust-update nis-inflate \
+            --smoother fixed-lag \
+            --smoother-lag-s 20 \
+            --output-dir outputs/stateful_radar_association_smoke/run
+
+      - name: Summarize smoke metrics
+        if: always()
+        run: |
+          set -euo pipefail
+          metrics="outputs/stateful_radar_association_smoke/run/$TEST_FLIGHT/metrics.json"
+          {
+            echo "## Stateful learned radar association smoke"
+            echo
+            echo "test_flight=$TEST_FLIGHT"
+            echo
+            if [ -f "$metrics" ]; then
+              echo "### Metrics"
+              echo '```json'
+              python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          test_flight = os.environ["TEST_FLIGHT"]
+          metrics = Path("outputs/stateful_radar_association_smoke/run") / test_flight / "metrics.json"
+          payload = json.loads(metrics.read_text())
+          summary = {
+              "flight": payload.get("flight"),
+              "radar_association": payload.get("radar_association"),
+              "selected_radar_rows": payload.get("selected_radar_rows"),
+              "rmse_3d_m": payload.get("position_error_3d", {}).get("rmse_m"),
+              "p95_3d_m": payload.get("position_error_3d", {}).get("p95_m"),
+              "stateful_learned_association": payload.get("stateful_learned_association"),
+          }
+          print(json.dumps(summary, indent=2))
+          PY
+              echo '```'
+            else
+              echo "No metrics file was produced."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stateful-learned-radar-association-${{ github.run_id }}
+          retention-days: 14
+          path: |
+            outputs/stateful_radar_association_smoke/radar_assoc.json
+            outputs/stateful_radar_association_smoke/radar_assoc_examples.csv
+            outputs/stateful_radar_association_smoke/run/*/metrics.json
+            outputs/stateful_radar_association_smoke/run/*/diagnostics.csv
+            outputs/stateful_radar_association_smoke/run/*/selected_radar.csv
+            outputs/stateful_radar_association_smoke/run/*/trajectory.png
