@@ -7,6 +7,11 @@ from dataclasses import dataclass
 from typing import Protocol
 
 import numpy as np
+from pyrecest.filters._linear_gaussian import (
+    huber_covariance_scale as _pyrecest_huber_covariance_scale,
+    normalized_innovation_squared as _pyrecest_normalized_innovation_squared,
+    student_t_covariance_scale as _pyrecest_student_t_covariance_scale,
+)
 
 ROBUST_UPDATE_MODES = ("nis-inflate", "student-t", "huber")
 DEFAULT_STUDENT_T_DOF = 4.0
@@ -37,16 +42,21 @@ class LinearUpdatePlan:
     inflation_alpha: float
 
 
-def normalized_innovation_squared(residual: np.ndarray, innovation_covariance: np.ndarray) -> float:
-    """Return the squared Mahalanobis innovation distance."""
+def _backend_scalar_to_float(value) -> float:
+    """Convert a backend scalar to a Python float."""
 
-    residual = np.asarray(residual, dtype=float).reshape(-1)
-    covariance = np.asarray(innovation_covariance, dtype=float)
-    try:
-        solved = np.linalg.solve(covariance, residual)
-    except np.linalg.LinAlgError:
-        solved = np.linalg.pinv(covariance) @ residual
-    return float(residual @ solved)
+    return float(np.asarray(value, dtype=float))
+
+
+def normalized_innovation_squared(
+    residual: np.ndarray,
+    innovation_covariance: np.ndarray,
+) -> float:
+    """Return the squared Mahalanobis innovation distance via PyRecEst."""
+
+    return _backend_scalar_to_float(
+        _pyrecest_normalized_innovation_squared(residual, innovation_covariance)
+    )
 
 
 def student_t_covariance_scale(
@@ -54,39 +64,26 @@ def student_t_covariance_scale(
     measurement_dim: int,
     degrees_of_freedom: float = DEFAULT_STUDENT_T_DOF,
 ) -> float:
-    """Return the Student-t robust covariance inflation factor.
+    """Return the PyRecEst Student-t robust covariance inflation factor."""
 
-    A Student-t measurement model can be represented as a Gaussian scale
-    mixture. Conditioning on the current innovation gives an expected precision
-    multiplier ``(nu + d) / (nu + NIS)``. We apply the reciprocal to the
-    measurement covariance and cap at one so inliers are not made artificially
-    overconfident.
-    """
-
-    dof = float(degrees_of_freedom)
-    if dof <= 0.0:
-        raise ValueError("student_t_dof must be positive")
-    dim = int(measurement_dim)
-    if dim < 1:
-        raise ValueError("measurement_dim must be positive")
-    scale = (dof + max(0.0, float(nis))) / (dof + dim)
-    return float(max(1.0, scale))
+    return _backend_scalar_to_float(
+        _pyrecest_student_t_covariance_scale(
+            nis,
+            measurement_dim,
+            dof=degrees_of_freedom,
+        )
+    )
 
 
-def huber_covariance_scale(nis: float, threshold: float = DEFAULT_HUBER_THRESHOLD) -> float:
-    """Return the multivariate Huber covariance inflation factor.
+def huber_covariance_scale(
+    nis: float,
+    threshold: float = DEFAULT_HUBER_THRESHOLD,
+) -> float:
+    """Return the PyRecEst multivariate Huber covariance inflation factor."""
 
-    The Huber weight is applied to the innovation radius ``sqrt(NIS)``. Above
-    ``threshold`` the covariance is inflated by ``radius / threshold``.
-    """
-
-    threshold = float(threshold)
-    if threshold <= 0.0:
-        raise ValueError("huber_threshold must be positive")
-    radius = float(np.sqrt(max(0.0, float(nis))))
-    if radius <= threshold:
-        return 1.0
-    return float(radius / threshold)
+    return _backend_scalar_to_float(
+        _pyrecest_huber_covariance_scale(nis, huber_threshold=threshold)
+    )
 
 
 def robust_update_covariance_scale(

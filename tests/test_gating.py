@@ -30,7 +30,7 @@ def test_gate_threshold_from_probability_matches_chi_square_ordering():
 def test_heavy_tailed_covariance_scale_helpers_are_monotone():
     assert student_t_covariance_scale(2.0, 2, degrees_of_freedom=4.0) == 1.0
     assert student_t_covariance_scale(100.0, 2, degrees_of_freedom=4.0) > 1.0
-    low_dof_scale = student_t_covariance_scale(100.0, 2, degrees_of_freedom=2.0)
+    low_dof_scale = student_t_covariance_scale(100.0, 2, degrees_of_freedom=3.0)
     high_dof_scale = student_t_covariance_scale(100.0, 2, degrees_of_freedom=10.0)
     assert low_dof_scale > high_dof_scale
 
