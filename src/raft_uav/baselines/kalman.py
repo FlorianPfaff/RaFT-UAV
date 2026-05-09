@@ -10,13 +10,10 @@ from scipy.stats import chi2
 
 from raft_uav.baselines.update_logic import (
     gate_threshold_for_measurement,
-    huber_covariance_scale,
     huber_threshold_for_measurement,
     inflation_alpha_for_measurement,
-    normalized_innovation_squared,
     plan_linear_measurement_update,
     robust_update_for_measurement,
-    student_t_covariance_scale,
     student_t_dof_for_measurement,
     symmetrized,
 )
