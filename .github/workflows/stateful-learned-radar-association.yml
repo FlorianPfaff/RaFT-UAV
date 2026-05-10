@@ -38,9 +38,10 @@ name: Stateful learned radar association
         type: boolean
         default: false
       dataset_root:
-        description: "Path on the self-hosted runner to an extracted AADM2025Dryad dataset."
+        description: "Path on the self-hosted runner to extracted AADM2025Dryad; if unusable, the workflow searches and populates the persistent dataset cache."
         required: false
         type: string
+        default: "/srv/datasets/AADM2025Dryad"
       test_flight:
         description: "Held-out flight used for the stateful-beam smoke run."
         required: false
@@ -121,28 +122,191 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.11"
           cache: "pip"
 
-      - name: Validate dataset input
+      - name: Resolve dataset input
+        env:
+          AADM2025DRYAD_RCLONE_SOURCE: ${{ secrets.AADM2025DRYAD_RCLONE_SOURCE }}
+          RCLONE_CONFIG: ${{ secrets.RCLONE_CONFIG }}
+          RCLONE_CONFIG_B64: ${{ secrets.RCLONE_CONFIG_B64 }}
         run: |
           set -euo pipefail
-          if [ -z "$DATASET_ROOT" ]; then
-            echo "dataset_root is required when run_aerpaw_smoke=true" >&2
-            exit 1
+
+          dataset_cache_root="$HOME/.cache/datasets"
+          dataset_cache_dataset_root="$dataset_cache_root/AADM2025Dryad"
+          mkdir -p "$dataset_cache_root"
+
+          resolved_dataset_root_file="$RUNNER_TEMP/resolved_dataset_root.txt"
+
+          find_dataset() {
+            python - "$resolved_dataset_root_file" <<'PY'
+          from __future__ import annotations
+
+          import os
+          import sys
+          from pathlib import Path
+
+          resolved_dataset_root_file = Path(sys.argv[1])
+          input_root = os.environ.get("DATASET_ROOT", "").strip()
+          cache_root = Path.home() / ".cache" / "datasets"
+          runner_cache_root = Path.home() / "github-runner" / ".cache" / "datasets"
+          rf_dir_names = {"RF Sensor and Radar", "RF_Sensor_and_Radar"}
+
+          def unique_paths(paths: list[Path]) -> list[Path]:
+              seen: set[Path] = set()
+              unique: list[Path] = []
+              for path in paths:
+                  expanded = path.expanduser()
+                  if expanded in seen:
+                      continue
+                  seen.add(expanded)
+                  unique.append(expanded)
+              return unique
+
+          def find_rf_root(root: Path, max_depth: int = 6) -> Path | None:
+              if not root.is_dir():
+                  return None
+              if root.name in rf_dir_names:
+                  return root
+              for name in rf_dir_names:
+                  direct = root / name
+                  if direct.is_dir():
+                      return direct
+              root_depth = len(root.parts)
+              for dirpath, dirnames, _ in os.walk(root):
+                  current = Path(dirpath)
+                  if len(current.parts) - root_depth >= max_depth:
+                      dirnames[:] = []
+                  if current.name in rf_dir_names:
+                      return current
+              return None
+
+          roots: list[Path] = []
+          if input_root:
+              requested = Path(input_root)
+              roots.extend([requested, requested.parent, requested.parent.parent])
+          roots.extend(
+              [
+                  cache_root / "AADM2025Dryad",
+                  cache_root,
+                  runner_cache_root / "AADM2025Dryad",
+                  runner_cache_root,
+                  Path("/srv/datasets/AADM2025Dryad"),
+                  Path("/srv/datasets"),
+                  Path("/data/AADM2025Dryad"),
+                  Path("/data"),
+                  Path("/mnt/data/AADM2025Dryad"),
+                  Path("/mnt/data"),
+                  Path.home() / "AADM2025Dryad",
+                  Path.home(),
+              ]
+          )
+
+          searched: list[str] = []
+          for root in unique_paths(roots):
+              searched.append(str(root))
+              rf_root = find_rf_root(root)
+              if rf_root is None:
+                  continue
+              dataset_root = rf_root.parent
+              resolved_dataset_root_file.write_text(str(dataset_root), encoding="utf-8")
+              print(f"Resolved dataset_root={dataset_root}")
+              print(f"Resolved RF Sensor and Radar root={rf_root}")
+              raise SystemExit(0)
+
+          print("Could not locate an RF Sensor and Radar directory.", file=sys.stderr)
+          print(f"Input dataset_root={input_root!r}", file=sys.stderr)
+          print("Searched roots:", file=sys.stderr)
+          for path in searched:
+              print(f"- {path}", file=sys.stderr)
+          raise SystemExit(1)
+          PY
+          }
+
+          ensure_rclone() {
+            if command -v rclone >/dev/null 2>&1; then
+              return 0
+            fi
+            echo "rclone is not installed; installing a temporary copy in RUNNER_TEMP."
+            mkdir -p "$RUNNER_TEMP/rclone-bin" "$RUNNER_TEMP/rclone-download"
+            curl -fsSL https://downloads.rclone.org/rclone-current-linux-amd64.zip \
+              -o "$RUNNER_TEMP/rclone.zip"
+            python -m zipfile -e "$RUNNER_TEMP/rclone.zip" "$RUNNER_TEMP/rclone-download"
+            rclone_bin="$(find "$RUNNER_TEMP/rclone-download" -type f -name rclone -print -quit)"
+            if [ -z "$rclone_bin" ]; then
+              echo "Could not find rclone binary after extracting download." >&2
+              exit 1
+            fi
+            cp "$rclone_bin" "$RUNNER_TEMP/rclone-bin/rclone"
+            chmod +x "$RUNNER_TEMP/rclone-bin/rclone"
+            export PATH="$RUNNER_TEMP/rclone-bin:$PATH"
+            echo "$RUNNER_TEMP/rclone-bin" >> "$GITHUB_PATH"
+          }
+
+          write_rclone_config() {
+            rclone_config_file="$RUNNER_TEMP/rclone.conf"
+            if [ -n "${RCLONE_CONFIG_B64:-}" ]; then
+              printf '%s' "$RCLONE_CONFIG_B64" | base64 --decode > "$rclone_config_file"
+            elif [ -n "${RCLONE_CONFIG:-}" ]; then
+              printf '%s' "$RCLONE_CONFIG" > "$rclone_config_file"
+            else
+              echo "AADM2025Dryad was not found locally, and neither RCLONE_CONFIG nor RCLONE_CONFIG_B64 is configured." >&2
+              echo "Set AADM2025DRYAD_RCLONE_SOURCE plus one of RCLONE_CONFIG or RCLONE_CONFIG_B64 as GitHub secrets." >&2
+              exit 1
+            fi
+            chmod 600 "$rclone_config_file"
+            echo "$rclone_config_file"
+          }
+
+          download_dataset_cache() {
+            if [ -z "${AADM2025DRYAD_RCLONE_SOURCE:-}" ]; then
+              echo "AADM2025Dryad was not found locally, and AADM2025DRYAD_RCLONE_SOURCE is not configured." >&2
+              echo "Set AADM2025DRYAD_RCLONE_SOURCE to the rclone remote path for the extracted AADM2025Dryad dataset." >&2
+              exit 1
+            fi
+            ensure_rclone
+            rclone_config_file="$(write_rclone_config)"
+            staging="${dataset_cache_dataset_root}.tmp.${GITHUB_RUN_ID}.${GITHUB_RUN_ATTEMPT}"
+            rm -rf "$staging"
+            mkdir -p "$staging"
+            echo "Dataset not found locally; downloading with rclone into $dataset_cache_dataset_root."
+            rclone copy "$AADM2025DRYAD_RCLONE_SOURCE" "$staging" \
+              --config "$rclone_config_file" \
+              --fast-list \
+              --transfers 8 \
+              --checkers 16
+            if ! find "$staging" -type d -name "RF Sensor and Radar" -print -quit | grep -q .; then
+              echo "rclone download completed, but no RF Sensor and Radar directory was found in $staging." >&2
+              find "$staging" -maxdepth 4 -type d | sed -n '1,120p' >&2 || true
+              rm -rf "$staging"
+              exit 1
+            fi
+            rm -rf "$dataset_cache_dataset_root"
+            mv "$staging" "$dataset_cache_dataset_root"
+            echo "Cached dataset at $dataset_cache_dataset_root"
+          }
+
+          if ! find_dataset; then
+            lock_file="$dataset_cache_root/.AADM2025Dryad.lock"
+            (
+              flock 9
+              if ! find_dataset; then
+                download_dataset_cache
+              fi
+            ) 9>"$lock_file"
           fi
-          if [ ! -d "$DATASET_ROOT" ]; then
-            echo "dataset_root does not exist: $DATASET_ROOT" >&2
-            exit 1
-          fi
+
+          find_dataset
+          DATASET_ROOT="$(cat "$resolved_dataset_root_file")"
+          echo "DATASET_ROOT=$DATASET_ROOT" >> "$GITHUB_ENV"
           if ! find "$DATASET_ROOT" -type d -name "RF Sensor and Radar" -print -quit | grep -q .; then
-            echo "dataset_root does not contain an RF Sensor and Radar directory: $DATASET_ROOT" >&2
-            find "$DATASET_ROOT" -maxdepth 4 -type d | sed -n '1,120p' >&2 || true
+            echo "Resolved dataset_root does not contain an RF Sensor and Radar directory: $DATASET_ROOT" >&2
             exit 1
           fi
           du -sh "$DATASET_ROOT" || true
@@ -219,7 +383,7 @@ jobs:
 
       - name: Upload smoke artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: stateful-learned-radar-association-${{ github.run_id }}
           retention-days: 14
