@@ -89,11 +89,17 @@ jobs:
     env:
       DATASET_ROOT: ${{ inputs.dataset_root }}
       TEST_FLIGHT: ${{ matrix.flight }}
-      OUT_DIR: ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}
+      OUT_SUBDIR: stateful_lofo/${{ matrix.flight }}
 
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
+
+      - name: Configure output directory
+        run: |
+          set -euo pipefail
+          echo "OUT_DIR=$RUNNER_TEMP/$OUT_SUBDIR" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/$OUT_SUBDIR"
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -309,20 +315,20 @@ jobs:
           retention-days: 30
           if-no-files-found: ignore
           path: |
-            ${{ env.OUT_DIR }}/summary.json
-            ${{ env.OUT_DIR }}/radar_assoc.json
-            ${{ env.OUT_DIR }}/radar_assoc_examples.csv
-            ${{ env.OUT_DIR }}/run/*/metrics.json
-            ${{ env.OUT_DIR }}/run/*/diagnostics.csv
-            ${{ env.OUT_DIR }}/run/*/selected_radar.csv
-            ${{ env.OUT_DIR }}/run/*/estimates.csv
-            ${{ env.OUT_DIR }}/run/*/hypotheses.csv
-            ${{ env.OUT_DIR }}/run/*/trajectory.png
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/summary.json
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/radar_assoc.json
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/radar_assoc_examples.csv
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/run/*/metrics.json
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/run/*/diagnostics.csv
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/run/*/selected_radar.csv
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/run/*/estimates.csv
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/run/*/hypotheses.csv
+            ${{ runner.temp }}/stateful_lofo/${{ matrix.flight }}/run/*/trajectory.png
 
       - name: Remove local LOFO output
         if: always()
         run: |
-          rm -rf "${{ env.OUT_DIR }}"
+          rm -rf "$OUT_DIR"
 
   aggregate:
     name: Aggregate LOFO metrics
