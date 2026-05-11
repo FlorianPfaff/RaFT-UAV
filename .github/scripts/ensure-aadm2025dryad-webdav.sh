@@ -80,6 +80,60 @@ ensure_rclone() {
   echo "${RUNNER_TEMP}/rclone-bin" >> "${GITHUB_PATH}"
 }
 
+extract_zip_archive() {
+  local archive="$1"
+  local target="$2"
+
+  python - "${archive}" "${target}" <<'PY'
+from __future__ import annotations
+
+import sys
+import zipfile
+from pathlib import Path
+
+archive = Path(sys.argv[1])
+target = Path(sys.argv[2])
+
+if not zipfile.is_zipfile(archive):
+    raise SystemExit(2)
+
+with zipfile.ZipFile(archive) as zip_file:
+    zip_file.extractall(target)
+PY
+}
+
+download_webdav_archive() {
+  local staging="$1"
+  local archive="${RUNNER_TEMP}/AADM2025Dryad.webdav.zip"
+  local base_url="${AADM2025DRYAD_DATA_WEBDAV_URL%/}"
+  local urls=("${AADM2025DRYAD_DATA_WEBDAV_URL}")
+
+  case "${base_url}" in
+    */download) ;;
+    *) urls+=("${base_url}/download") ;;
+  esac
+
+  for url in "${urls[@]}"; do
+    rm -f "${archive}"
+    echo "Trying authenticated WebDAV archive download fallback."
+    if ! curl --fail --location --retry 5 --retry-delay 20 --connect-timeout 60 \
+      --user "${AADM2025DRYAD_DATA_KEY}:${AADM2025DRYAD_WEBDAV_CRED}" \
+      --output "${archive}" \
+      "${url}"; then
+      continue
+    fi
+
+    du -sh "${archive}" || true
+    if extract_zip_archive "${archive}" "${staging}"; then
+      return 0
+    fi
+
+    echo "Downloaded WebDAV response was not a ZIP archive; trying next URL variant." >&2
+  done
+
+  return 1
+}
+
 download_dataset() {
   if [ -z "${AADM2025DRYAD_DATA_WEBDAV_URL:-}" ] || [ -z "${AADM2025DRYAD_DATA_KEY:-}" ] || [ -z "${AADM2025DRYAD_WEBDAV_CRED:-}" ]; then
     echo "AADM2025Dryad was not found locally, and the WebDAV source secrets are incomplete." >&2
@@ -94,14 +148,23 @@ download_dataset() {
 
   obscured_cred="$(rclone obscure "${AADM2025DRYAD_WEBDAV_CRED}")"
   echo "Dataset not found locally; downloading WebDAV source into ${cache_dataset_root}."
-  rclone copy ":webdav:" "${staging}" \
+  if ! rclone copy ":webdav:" "${staging}" \
     --webdav-url "${AADM2025DRYAD_DATA_WEBDAV_URL}" \
     --webdav-vendor owncloud \
     --webdav-user "${AADM2025DRYAD_DATA_KEY}" \
     --webdav-pass "${obscured_cred}" \
     --progress \
     --transfers 8 \
-    --checkers 16
+    --checkers 16; then
+    echo "rclone WebDAV copy failed; trying authenticated archive download fallback." >&2
+    rm -rf "${staging}"
+    mkdir -p "${staging}"
+    if ! download_webdav_archive "${staging}"; then
+      echo "WebDAV archive fallback failed." >&2
+      rm -rf "${staging}"
+      exit 1
+    fi
+  fi
 
   if ! find_rf_root "${staging}" >/dev/null; then
     echo "WebDAV download completed, but no RF Sensor and Radar directory was found in ${staging}." >&2
