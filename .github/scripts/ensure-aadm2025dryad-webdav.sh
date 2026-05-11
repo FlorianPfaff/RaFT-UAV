@@ -107,10 +107,38 @@ download_webdav_archive() {
   local archive="${RUNNER_TEMP}/AADM2025Dryad.webdav.zip"
   local base_url="${AADM2025DRYAD_DATA_WEBDAV_URL%/}"
   local urls=("${AADM2025DRYAD_DATA_WEBDAV_URL}")
+  local origin=""
+  local token=""
+
+  add_url_variant() {
+    local candidate="$1"
+    local existing=""
+    for existing in "${urls[@]}"; do
+      if [ "${existing}" = "${candidate}" ]; then
+        return 0
+      fi
+    done
+    urls+=("${candidate}")
+  }
 
   case "${base_url}" in
     */download) ;;
-    *) urls+=("${base_url}/download") ;;
+    *) add_url_variant "${base_url}/download" ;;
+  esac
+
+  case "${base_url}" in
+    */public.php/webdav*)
+      origin="${base_url%%/public.php/webdav*}"
+      add_url_variant "${origin}/index.php/s/${AADM2025DRYAD_DATA_KEY}/download"
+      add_url_variant "${origin}/s/${AADM2025DRYAD_DATA_KEY}/download"
+      ;;
+    */remote.php/dav/public-files/*)
+      origin="${base_url%%/remote.php/dav/public-files/*}"
+      token="${base_url#*/remote.php/dav/public-files/}"
+      token="${token%%/*}"
+      add_url_variant "${origin}/index.php/s/${token}/download"
+      add_url_variant "${origin}/s/${token}/download"
+      ;;
   esac
 
   for url in "${urls[@]}"; do
