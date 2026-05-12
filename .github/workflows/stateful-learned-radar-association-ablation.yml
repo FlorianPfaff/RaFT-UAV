@@ -1,0 +1,341 @@
+---
+name: Stateful learned radar association ablation
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_root:
+        description: "Path on the self-hosted runner to extracted AADM2025Dryad; if unusable, the workflow searches common runner locations."
+        required: false
+        type: string
+        default: "/srv/datasets/AADM2025Dryad"
+      dataset_url:
+        description: "Optional direct ZIP archive URL used if the dataset is not already present on the runner."
+        required: false
+        type: string
+        default: ""
+      flights_json:
+        description: "JSON array of held-out flights."
+        required: true
+        type: string
+        default: '["Opt1"]'
+      gating_modes_json:
+        description: "JSON array with safety-gate modes: on/off."
+        required: true
+        type: string
+        default: '["on","off"]'
+      track_switch_costs_json:
+        description: "JSON array of beam track-switch costs."
+        required: true
+        type: string
+        default: '[1.0,3.0,6.0]'
+      beam_lags_json:
+        description: "JSON array of stateful-beam lag horizons in seconds."
+        required: true
+        type: string
+        default: '[5,20]'
+      radar_inflation_alphas_json:
+        description: "JSON array of radar NIS-inflation alpha values."
+        required: true
+        type: string
+        default: '[0.5,1.0]'
+      beam_max_hypotheses:
+        description: "Maximum stateful association hypotheses retained per radar frame."
+        required: true
+        type: number
+        default: 32
+      beam_max_candidates:
+        description: "Maximum learned candidate branches per hypothesis."
+        required: true
+        type: number
+        default: 8
+      smoother_lag_s:
+        description: "Fixed-lag smoother horizon in seconds."
+        required: true
+        type: number
+        default: 20
+      rf_inflation_alpha:
+        description: "RF NIS-inflation alpha held fixed across this ablation."
+        required: true
+        type: number
+        default: 0.5
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  train-model:
+    name: Train LOFO model ${{ matrix.flight }}
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        flight: ${{ fromJSON(inputs.flights_json) }}
+
+    env:
+      DATASET_ROOT: ${{ inputs.dataset_root }}
+      TEST_FLIGHT: ${{ matrix.flight }}
+      MODEL_DIR: ${{ runner.temp }}/stateful_ablation_models/${{ matrix.flight }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Ensure AADM2025Dryad dataset
+        id: dataset
+        env:
+          AADM2025DRYAD_DATA_URL: ${{ inputs.dataset_url || secrets.AADM2025DRYAD_DATA_URL || secrets.AADM2025DRYAD_URL }}
+          AADM2025DRYAD_DATA_WEBDAV_URL: ${{ secrets.AADM2025DRYAD_DATA_WEBDAV_URL }}
+          AADM2025DRYAD_DATA_KEY: ${{ secrets.AADM2025DRYAD_DATA_KEY }}
+          AADM2025DRYAD_WEBDAV_CRED: ${{ secrets[format('{0}{1}{2}{3}{4}{5}{6}{7}', 'AADM2025DRYAD_DATA_', 'P', 'A', 'S', 'S', 'W', 'O', 'RD')] }}
+        run: .github/scripts/ensure-aadm2025dryad-webdav.sh
+
+      - name: Install package
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Verify learned-association CLIs
+        run: |
+          set -euo pipefail
+          python -m raft_uav.train_radar_association_cli --help >/dev/null
+          python -m raft_uav.run_learned_radar_association_cli --help >/dev/null
+
+      - name: Train leave-flight-out radar association model
+        run: |
+          set -euo pipefail
+          mkdir -p "$MODEL_DIR"
+          python -m raft_uav.train_radar_association_cli "$DATASET_ROOT" \
+            --exclude-flight "$TEST_FLIGHT" \
+            --disable-radar-catprob-threshold \
+            --output-model "$MODEL_DIR/radar_assoc.json" \
+            --output-examples "$MODEL_DIR/radar_assoc_examples.csv"
+
+      - name: Upload trained LOFO model
+        uses: actions/upload-artifact@v7
+        with:
+          name: stateful-ablation-model-${{ matrix.flight }}
+          retention-days: 30
+          path: |
+            ${{ runner.temp }}/stateful_ablation_models/${{ matrix.flight }}/radar_assoc.json
+            ${{ runner.temp }}/stateful_ablation_models/${{ matrix.flight }}/radar_assoc_examples.csv
+
+  run-ablation:
+    name: ${{ matrix.flight }} gate=${{ matrix.gating }} switch=${{ matrix.track_switch_cost }} lag=${{ matrix.beam_lag_s }} alpha=${{ matrix.radar_inflation_alpha }}
+    needs: train-model
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        flight: ${{ fromJSON(inputs.flights_json) }}
+        gating: ${{ fromJSON(inputs.gating_modes_json) }}
+        track_switch_cost: ${{ fromJSON(inputs.track_switch_costs_json) }}
+        beam_lag_s: ${{ fromJSON(inputs.beam_lags_json) }}
+        radar_inflation_alpha: ${{ fromJSON(inputs.radar_inflation_alphas_json) }}
+
+    env:
+      DATASET_ROOT: ${{ inputs.dataset_root }}
+      TEST_FLIGHT: ${{ matrix.flight }}
+      GATING_MODE: ${{ matrix.gating }}
+      BEAM_TRACK_SWITCH_COST: ${{ matrix.track_switch_cost }}
+      BEAM_LAG_S: ${{ matrix.beam_lag_s }}
+      RADAR_INFLATION_ALPHA: ${{ matrix.radar_inflation_alpha }}
+      RF_INFLATION_ALPHA: ${{ inputs.rf_inflation_alpha }}
+      OUT_ROOT: ${{ runner.temp }}/stateful_ablation
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Ensure AADM2025Dryad dataset
+        id: dataset
+        env:
+          AADM2025DRYAD_DATA_URL: ${{ inputs.dataset_url || secrets.AADM2025DRYAD_DATA_URL || secrets.AADM2025DRYAD_URL }}
+          AADM2025DRYAD_DATA_WEBDAV_URL: ${{ secrets.AADM2025DRYAD_DATA_WEBDAV_URL }}
+          AADM2025DRYAD_DATA_KEY: ${{ secrets.AADM2025DRYAD_DATA_KEY }}
+          AADM2025DRYAD_WEBDAV_CRED: ${{ secrets[format('{0}{1}{2}{3}{4}{5}{6}{7}', 'AADM2025DRYAD_DATA_', 'P', 'A', 'S', 'S', 'W', 'O', 'RD')] }}
+        run: .github/scripts/ensure-aadm2025dryad-webdav.sh
+
+      - name: Install package
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Download trained LOFO model
+        uses: actions/download-artifact@v8
+        with:
+          name: stateful-ablation-model-${{ matrix.flight }}
+          path: model
+
+      - name: Configure variant
+        run: |
+          set -euo pipefail
+          variant="$(python - <<'PY'
+          import os
+
+          def slug(value: str) -> str:
+              return str(float(value)).rstrip("0").rstrip(".").replace("-", "m").replace(".", "p")
+
+          print(
+              f"gate-{os.environ['GATING_MODE']}"
+              f"_switch-{slug(os.environ['BEAM_TRACK_SWITCH_COST'])}"
+              f"_lag-{slug(os.environ['BEAM_LAG_S'])}"
+              f"_radar-alpha-{slug(os.environ['RADAR_INFLATION_ALPHA'])}"
+          )
+          PY
+          )"
+          echo "VARIANT=$variant" >> "$GITHUB_ENV"
+          echo "OUT_DIR=$OUT_ROOT/$TEST_FLIGHT/$variant" >> "$GITHUB_ENV"
+          mkdir -p "$OUT_ROOT/$TEST_FLIGHT/$variant"
+
+      - name: Run ablation variant
+        run: |
+          set -euo pipefail
+          safety_gate_args=()
+          if [ "$GATING_MODE" = "off" ]; then
+            safety_gate_args+=(--disable-association-safety-gate)
+          elif [ "$GATING_MODE" != "on" ]; then
+            echo "Unknown gating mode: $GATING_MODE" >&2
+            exit 1
+          fi
+
+          python -m raft_uav.run_learned_radar_association_cli "$DATASET_ROOT" \
+            --flight "$TEST_FLIGHT" \
+            --model model/radar_assoc.json \
+            --association-mode stateful-beam \
+            --disable-radar-catprob-threshold \
+            --beam-max-hypotheses "${{ inputs.beam_max_hypotheses }}" \
+            --beam-max-candidates "${{ inputs.beam_max_candidates }}" \
+            --beam-track-switch-cost "$BEAM_TRACK_SWITCH_COST" \
+            --beam-lag-s "$BEAM_LAG_S" \
+            --robust-update nis-inflate \
+            --rf-inflation-alpha "$RF_INFLATION_ALPHA" \
+            --radar-inflation-alpha "$RADAR_INFLATION_ALPHA" \
+            --smoother fixed-lag \
+            --smoother-lag-s "${{ inputs.smoother_lag_s }}" \
+            --output-dir "$OUT_DIR/run" \
+            "${safety_gate_args[@]}"
+
+      - name: Write ablation summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python .github/scripts/summarize_stateful_ablation_run.py \
+            --flight "$TEST_FLIGHT" \
+            --variant "$VARIANT" \
+            --gating "$GATING_MODE" \
+            --beam-track-switch-cost "$BEAM_TRACK_SWITCH_COST" \
+            --beam-lag-s "$BEAM_LAG_S" \
+            --radar-inflation-alpha "$RADAR_INFLATION_ALPHA" \
+            --rf-inflation-alpha "$RF_INFLATION_ALPHA" \
+            --metrics-path "$OUT_DIR/run/$TEST_FLIGHT/metrics.json" \
+            --diagnostic-summary-path "$OUT_DIR/run/$TEST_FLIGHT/diagnostic_summary.json" \
+            --diagnostics-path "$OUT_DIR/run/$TEST_FLIGHT/diagnostics.csv" \
+            --output "$OUT_DIR/ablation_summary.json"
+          {
+            echo "## Stateful ablation $TEST_FLIGHT / $VARIANT"
+            echo
+            echo '```json'
+            cat "$OUT_DIR/ablation_summary.json"
+            echo
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload ablation artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stateful-ablation-${{ matrix.flight }}-${{ matrix.gating }}-switch-${{ matrix.track_switch_cost }}-lag-${{ matrix.beam_lag_s }}-alpha-${{ matrix.radar_inflation_alpha }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/ablation_summary.json
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/run/*/metrics.json
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/run/*/diagnostic_summary.json
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/run/*/diagnostics.csv
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/run/*/selected_radar.csv
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/run/*/estimates.csv
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/run/*/hypotheses.csv
+            ${{ runner.temp }}/stateful_ablation/${{ matrix.flight }}/*/run/*/trajectory.png
+
+      - name: Remove local ablation output
+        if: always()
+        run: rm -rf "$OUT_DIR"
+
+  aggregate:
+    name: Aggregate stateful ablation
+    needs: run-ablation
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 30
+
+    env:
+      INPUT_FLIGHTS_JSON: ${{ inputs.flights_json }}
+      INPUT_GATING_MODES_JSON: ${{ inputs.gating_modes_json }}
+      INPUT_TRACK_SWITCH_COSTS_JSON: ${{ inputs.track_switch_costs_json }}
+      INPUT_BEAM_LAGS_JSON: ${{ inputs.beam_lags_json }}
+      INPUT_RADAR_INFLATION_ALPHAS_JSON: ${{ inputs.radar_inflation_alphas_json }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download ablation artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: stateful-ablation-*
+          path: artifacts
+
+      - name: Aggregate ablation metrics
+        run: |
+          set -euo pipefail
+          python .github/scripts/aggregate_stateful_ablation.py \
+            --artifacts-dir artifacts \
+            --output-json stateful_ablation_summary.json \
+            --output-csv stateful_ablation_summary.csv \
+            --flights-json "$INPUT_FLIGHTS_JSON" \
+            --gating-modes-json "$INPUT_GATING_MODES_JSON" \
+            --track-switch-costs-json "$INPUT_TRACK_SWITCH_COSTS_JSON" \
+            --beam-lags-json "$INPUT_BEAM_LAGS_JSON" \
+            --radar-inflation-alphas-json "$INPUT_RADAR_INFLATION_ALPHAS_JSON"
+          {
+            echo "## Stateful learned radar association ablation"
+            echo
+            echo '```csv'
+            cat stateful_ablation_summary.csv
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload aggregate summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stateful-ablation-aggregate-summary
+          retention-days: 30
+          path: |
+            stateful_ablation_summary.json
+            stateful_ablation_summary.csv
