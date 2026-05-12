@@ -19,32 +19,49 @@ cache_root="${HOME}/github-runner/.cache/datasets"
 cache_dataset_root="${cache_root}/AADM2025Dryad"
 mkdir -p "${cache_root}"
 
-find_rf_root() {
+find_rf_root_impl() {
+  local allow_transient="$1"
+  shift
+
   for root in "$@"; do
     if [ -z "${root:-}" ] || [ ! -d "${root}" ]; then
       continue
     fi
-    case "${root}" in
-      *AADM2025Dryad.tmp.*)
-        continue
-        ;;
-    esac
+    if [ "${allow_transient}" != "true" ]; then
+      case "${root}" in
+        *AADM2025Dryad.tmp.*)
+          continue
+          ;;
+      esac
+    fi
     case "$(basename "${root}")" in
       "RF Sensor and Radar"|"RF_Sensor_and_Radar")
         printf '%s\n' "${root}"
         return 0
         ;;
     esac
-    found="$(find "${root}" -maxdepth 8 \
-      \( -type d -name "AADM2025Dryad.tmp.*" -prune \) -o \
-      \( -type d \( -name "RF Sensor and Radar" -o -name "RF_Sensor_and_Radar" \) -print -quit \) \
-      2>/dev/null || true)"
+    if [ "${allow_transient}" = "true" ]; then
+      found="$(find "${root}" -maxdepth 8 -type d \( -name "RF Sensor and Radar" -o -name "RF_Sensor_and_Radar" \) -print -quit 2>/dev/null || true)"
+    else
+      found="$(find "${root}" -maxdepth 8 \
+        \( -type d -name "AADM2025Dryad.tmp.*" -prune \) -o \
+        \( -type d \( -name "RF Sensor and Radar" -o -name "RF_Sensor_and_Radar" \) -print -quit \) \
+        2>/dev/null || true)"
+    fi
     if [ -n "${found}" ]; then
       printf '%s\n' "${found}"
       return 0
     fi
   done
   return 1
+}
+
+find_rf_root() {
+  find_rf_root_impl false "$@"
+}
+
+find_rf_root_allow_transient() {
+  find_rf_root_impl true "$@"
 }
 
 resolve_dataset() {
@@ -425,7 +442,7 @@ download_dataset() {
     fi
   fi
 
-  if ! find_rf_root "${staging}" >/dev/null; then
+  if ! find_rf_root_allow_transient "${staging}" >/dev/null; then
     echo "WebDAV download completed, but no RF Sensor and Radar directory was found in ${staging}." >&2
     find "${staging}" -maxdepth 4 -type d | sed -n '1,160p' >&2 || true
     rm -rf "${staging}"

@@ -28,8 +28,8 @@ def unique_paths(paths: list[Path]) -> list[Path]:
     return out
 
 
-def find_rf_root(root: Path, max_depth: int) -> Path | None:
-    if is_transient_dataset_path(root):
+def find_rf_root(root: Path, max_depth: int, *, allow_transient: bool = False) -> Path | None:
+    if not allow_transient and is_transient_dataset_path(root):
         return None
     if not root.exists() or not root.is_dir():
         return None
@@ -43,11 +43,12 @@ def find_rf_root(root: Path, max_depth: int) -> Path | None:
     root_depth = len(root.parts)
     for dirpath, dirnames, _ in os.walk(root):
         current = Path(dirpath)
-        dirnames[:] = [
-            dirname
-            for dirname in dirnames
-            if not dirname.startswith(TRANSIENT_DATASET_PREFIX)
-        ]
+        if not allow_transient:
+            dirnames[:] = [
+                dirname
+                for dirname in dirnames
+                if not dirname.startswith(TRANSIENT_DATASET_PREFIX)
+            ]
         depth = len(current.parts) - root_depth
         if depth >= max_depth:
             dirnames[:] = []
@@ -62,13 +63,14 @@ def main() -> int:
     parser.add_argument("--resolved-rf-root-file", required=True)
     parser.add_argument("--max-depth", type=int, default=8)
     parser.add_argument("--root", action="append", default=[])
+    parser.add_argument("--allow-transient", action="store_true")
     args = parser.parse_args()
 
     roots = [Path(root) for root in args.root if root]
     searched: list[str] = []
     for root in unique_paths(roots):
         searched.append(str(root))
-        rf_root = find_rf_root(root, args.max_depth)
+        rf_root = find_rf_root(root, args.max_depth, allow_transient=args.allow_transient)
         if rf_root is None:
             continue
 

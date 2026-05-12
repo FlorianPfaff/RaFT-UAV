@@ -31,6 +31,14 @@ def test_find_dataset_ignores_transient_cache_dirs(tmp_path: Path) -> None:
 
     assert module.find_rf_root(tmp_path, max_depth=8) is None
     assert module.find_rf_root(transient_rf_root.parent, max_depth=8) is None
+    assert (
+        module.find_rf_root(
+            transient_rf_root.parent,
+            max_depth=8,
+            allow_transient=True,
+        )
+        == transient_rf_root
+    )
 
 
 def test_find_dataset_accepts_persistent_cache_dir(tmp_path: Path) -> None:

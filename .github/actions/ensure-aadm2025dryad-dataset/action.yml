@@ -235,6 +235,7 @@ runs:
           if ! python "$GITHUB_ACTION_PATH/find_dataset.py" \
             --resolved-dataset-root-file "$RUNNER_TEMP/staging_aadm2025dryad_root.txt" \
             --resolved-rf-root-file "$RUNNER_TEMP/staging_aadm2025dryad_rf_root.txt" \
+            --allow-transient \
             --root "$staging"; then
             echo "Downloaded data did not contain an RF Sensor and Radar directory." >&2
             find "$staging" -maxdepth 4 -type d | sed -n '1,160p' >&2 || true
