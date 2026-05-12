@@ -284,6 +284,22 @@ runs:
           mkdir -p "$staging"
           obscured_pass="$(rclone obscure "$WEBDAV_PASSWORD")"
           echo "Dataset not found locally; downloading WebDAV source into $CACHE_DATASET_ROOT."
+          if ! timeout 45s rclone lsf ":webdav:" \
+            --webdav-url "$WEBDAV_URL" \
+            --webdav-vendor owncloud \
+            --webdav-user "$WEBDAV_USER" \
+            --webdav-pass "$obscured_pass" \
+            --max-depth 2 \
+            --contimeout 20s \
+            --timeout 30s \
+            --low-level-retries 1 \
+            --retries 1 \
+            > "$RUNNER_TEMP/aadm2025dryad_webdav_lsf.txt"; then
+            echo "Configured WebDAV source could not list the remote." >&2
+            return 1
+          fi
+          echo "Configured WebDAV source listed successfully; first entries:"
+          sed -n '1,20p' "$RUNNER_TEMP/aadm2025dryad_webdav_lsf.txt"
           rclone copy ":webdav:" "$staging" \
             --webdav-url "$WEBDAV_URL" \
             --webdav-vendor owncloud \

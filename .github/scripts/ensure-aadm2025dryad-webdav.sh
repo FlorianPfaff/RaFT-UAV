@@ -249,6 +249,7 @@ copy_webdav_to_staging() {
   local variant=0
   local total_variants=0
   local obscured_cred=""
+  local probe_output="${RUNNER_TEMP}/aadm2025dryad_webdav_lsf.txt"
 
   if [ -z "${AADM2025DRYAD_DATA_WEBDAV_URL:-}" ] || [ -z "${AADM2025DRYAD_WEBDAV_CRED:-}" ]; then
     return 1
@@ -272,6 +273,22 @@ copy_webdav_to_staging() {
       rm -rf "${staging:?}"/*
       obscured_cred="$(rclone obscure "${AADM2025DRYAD_WEBDAV_CRED}")"
       echo "Trying WebDAV source variant ${variant}/${total_variants}."
+      if ! timeout 45s rclone lsf ":webdav:" \
+        --webdav-url "${url}" \
+        --webdav-vendor "${vendor}" \
+        --webdav-user "${user}" \
+        --webdav-pass "${obscured_cred}" \
+        --max-depth 2 \
+        --contimeout 20s \
+        --timeout 30s \
+        --low-level-retries 1 \
+        --retries 1 \
+        > "${probe_output}"; then
+        echo "WebDAV source variant ${variant}/${total_variants} could not list the remote; trying next variant." >&2
+        continue
+      fi
+      echo "WebDAV source variant ${variant}/${total_variants} listed successfully; first entries:"
+      sed -n '1,20p' "${probe_output}"
       if rclone copy ":webdav:" "${staging}" \
         --webdav-url "${url}" \
         --webdav-vendor "${vendor}" \
