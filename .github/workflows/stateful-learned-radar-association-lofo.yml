@@ -69,6 +69,11 @@ on:
         required: true
         type: number
         default: 0
+      radar_catprob_threshold:
+        description: "Fortem radar category probability threshold."
+        required: true
+        type: number
+        default: 0.40
       enforce_thresholds:
         description: "Fail the workflow if target metrics are not met."
         required: true
@@ -154,7 +159,7 @@ jobs:
           mkdir -p "$OUT_DIR"
           python -m raft_uav.train_radar_association_cli "$DATASET_ROOT" \
             --exclude-flight "$TEST_FLIGHT" \
-            --radar-catprob-threshold 0.40 \
+            --radar-catprob-threshold "${{ inputs.radar_catprob_threshold }}" \
             --output-model "$OUT_DIR/radar_assoc.json" \
             --output-examples "$OUT_DIR/radar_assoc_examples.csv"
 
@@ -165,7 +170,7 @@ jobs:
             --flight "$TEST_FLIGHT" \
             --model "$OUT_DIR/radar_assoc.json" \
             --association-mode stateful-beam \
-            --radar-catprob-threshold 0.40 \
+            --radar-catprob-threshold "${{ inputs.radar_catprob_threshold }}" \
             --beam-max-hypotheses "${{ inputs.beam_max_hypotheses }}" \
             --beam-max-candidates "${{ inputs.beam_max_candidates }}" \
             --beam-track-switch-cost "${{ inputs.beam_track_switch_cost }}" \
