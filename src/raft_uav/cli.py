@@ -679,6 +679,11 @@ def _baseline_metrics(
     selected_ids = []
     if "track_id" in selected_radar.columns:
         selected_ids = sorted(int(value) for value in selected_radar["track_id"].dropna().unique())
+    catprob_fallback_rows = 0
+    if "association_catprob_fallback" in selected_radar.columns:
+        catprob_fallback_rows = int(
+            selected_radar["association_catprob_fallback"].fillna(False).astype(bool).sum()
+        )
 
     return {
         "flight": flight_name,
@@ -763,6 +768,7 @@ def _baseline_metrics(
         "rf_rows": int(len(rf)),
         "radar_rows": int(len(radar)),
         "selected_radar_rows": int(len(selected_radar)),
+        "radar_catprob_fallback_rows": catprob_fallback_rows,
         "selected_radar_track_ids": selected_ids,
         "posterior_records": int(len(estimate_frame)),
         "accepted_measurements": int(accepted_mask.sum()),

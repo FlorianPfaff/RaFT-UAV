@@ -3,6 +3,7 @@ import pandas as pd
 
 from raft_uav.baselines.kalman import AsyncConstantVelocityKalmanTracker, TrackingMeasurement
 from raft_uav.baselines.radar_association import (
+    _catprob_candidate_pool,
     _select_radar_candidate,
     run_async_cv_baseline_with_radar_association,
 )
@@ -116,6 +117,42 @@ def test_safety_gate_makes_impossible_radar_association_a_miss():
     assert records[-1]["update_action"] == "missed_detection"
     assert records[-1]["covariance_scale"] == 1.0
     assert selected.empty
+
+
+def test_catprob_candidate_pool_filters_when_possible():
+    candidates = pd.DataFrame(
+        {
+            "track_id": [1, 2],
+            "cat_prob_uav": [0.2, 0.8],
+            "east_m": [0.0, 1.0],
+            "north_m": [0.0, 0.0],
+            "up_m": [0.0, 0.0],
+        }
+    )
+
+    pool = _catprob_candidate_pool(candidates, 0.4)
+
+    assert pool["track_id"].tolist() == [2]
+    assert pool["association_catprob_threshold"].tolist() == [0.4]
+    assert pool["association_catprob_fallback"].tolist() == [False]
+
+
+def test_catprob_candidate_pool_falls_back_when_threshold_empty():
+    candidates = pd.DataFrame(
+        {
+            "track_id": [1, 2],
+            "cat_prob_uav": [0.1, 0.2],
+            "east_m": [0.0, 1.0],
+            "north_m": [0.0, 0.0],
+            "up_m": [0.0, 0.0],
+        }
+    )
+
+    pool = _catprob_candidate_pool(candidates, 0.4)
+
+    assert pool["track_id"].tolist() == [1, 2]
+    assert pool["association_catprob_threshold"].tolist() == [0.4, 0.4]
+    assert pool["association_catprob_fallback"].tolist() == [True, True]
 
 
 def test_track_continuity_keeps_current_track_for_small_nis_gain():

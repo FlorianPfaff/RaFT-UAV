@@ -873,7 +873,18 @@ def _catprob_candidate_pool(
     if candidate_catprob_threshold is None or "cat_prob_uav" not in candidates.columns:
         return candidates
     catprob = pd.to_numeric(candidates["cat_prob_uav"], errors="coerce")
-    return candidates.loc[catprob >= float(candidate_catprob_threshold)].copy()
+    threshold = float(candidate_catprob_threshold)
+    keep = catprob >= threshold
+    if keep.any():
+        pool = candidates.loc[keep].copy()
+        pool["association_catprob_threshold"] = threshold
+        pool["association_catprob_fallback"] = False
+        return pool
+
+    pool = candidates.copy()
+    pool["association_catprob_threshold"] = threshold
+    pool["association_catprob_fallback"] = True
+    return pool
 
 
 def _highest_catprob(candidates: pd.DataFrame) -> pd.Series | None:
