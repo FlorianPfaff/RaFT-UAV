@@ -89,7 +89,6 @@ jobs:
       DATASET_URL: ${{ inputs.dataset_url }}
       TEST_FLIGHT: ${{ matrix.flight }}
       VARIANT_JSON: ${{ toJSON(matrix.variant) }}
-      OUT_ROOT: ${{ runner.temp }}/stateful_sweep
       RF_INFLATION_ALPHA: ${{ inputs.rf_inflation_alpha }}
       RF_MAX_RESIDUAL_M: ${{ inputs.rf_max_residual_m }}
       RADAR_MAX_RESIDUAL_M: ${{ inputs.radar_max_residual_m }}
@@ -128,6 +127,11 @@ jobs:
           set -euo pipefail
           python -m pip install --upgrade pip
           python -m pip install -e ".[dev]"
+
+      - name: Configure sweep output root
+        run: |
+          set -euo pipefail
+          echo "OUT_ROOT=$RUNNER_TEMP/stateful_sweep" >> "$GITHUB_ENV"
 
       - name: Configure sweep variant
         run: |

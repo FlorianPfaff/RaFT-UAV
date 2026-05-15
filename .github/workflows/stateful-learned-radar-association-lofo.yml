@@ -15,7 +15,7 @@ on:
         type: string
         default: ""
       flights_json:
-        description: "Held-out flights as JSON or shorthand, e.g. [\"Opt1\",\"Opt2\"] or [Opt1,Opt2]."
+        description: 'Held-out flights as JSON or shorthand, e.g. ["Opt1","Opt2"] or [Opt1,Opt2].'
         required: true
         type: string
         default: '["Opt1","Opt2","Opt3"]'

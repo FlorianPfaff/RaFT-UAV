@@ -28,17 +28,17 @@ on:
         description: "JSON array of beam track-switch costs."
         required: true
         type: string
-        default: '[1.0,3.0,6.0]'
+        default: "[1.0,3.0,6.0]"
       beam_lags_json:
         description: "JSON array of stateful-beam lag horizons in seconds."
         required: true
         type: string
-        default: '[5,20]'
+        default: "[5,20]"
       radar_inflation_alphas_json:
         description: "JSON array of radar NIS-inflation alpha values."
         required: true
         type: string
-        default: '[0.5,1.0]'
+        default: "[0.5,1.0]"
       beam_max_hypotheses:
         description: "Maximum stateful association hypotheses retained per radar frame."
         required: true
@@ -94,7 +94,6 @@ jobs:
     env:
       DATASET_ROOT: ${{ inputs.dataset_root }}
       TEST_FLIGHT: ${{ matrix.flight }}
-      MODEL_DIR: ${{ runner.temp }}/stateful_ablation_models/${{ matrix.flight }}
 
     steps:
       - name: Check out repository
@@ -126,6 +125,11 @@ jobs:
           set -euo pipefail
           python -m raft_uav.train_radar_association_cli --help >/dev/null
           python -m raft_uav.run_learned_radar_association_cli --help >/dev/null
+
+      - name: Configure model output directory
+        run: |
+          set -euo pipefail
+          echo "MODEL_DIR=$RUNNER_TEMP/stateful_ablation_models/$TEST_FLIGHT" >> "$GITHUB_ENV"
 
       - name: Train leave-flight-out radar association model
         run: |
@@ -170,7 +174,6 @@ jobs:
       RF_INFLATION_ALPHA: ${{ inputs.rf_inflation_alpha }}
       RF_MAX_RESIDUAL_M: ${{ inputs.rf_max_residual_m }}
       RADAR_MAX_RESIDUAL_M: ${{ inputs.radar_max_residual_m }}
-      OUT_ROOT: ${{ runner.temp }}/stateful_ablation
 
     steps:
       - name: Check out repository
@@ -202,6 +205,11 @@ jobs:
         with:
           name: stateful-ablation-model-${{ matrix.flight }}
           path: model
+
+      - name: Configure ablation output root
+        run: |
+          set -euo pipefail
+          echo "OUT_ROOT=$RUNNER_TEMP/stateful_ablation" >> "$GITHUB_ENV"
 
       - name: Configure variant
         run: |
