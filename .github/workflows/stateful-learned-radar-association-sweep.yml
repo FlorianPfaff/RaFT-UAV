@@ -1,0 +1,311 @@
+---
+name: Stateful learned radar association sweep
+
+on:
+  workflow_dispatch:
+    inputs:
+      dataset_root:
+        description: "Path on the self-hosted runner to extracted AADM2025Dryad."
+        required: false
+        type: string
+        default: "/srv/datasets/AADM2025Dryad"
+      dataset_url:
+        description: "Optional direct ZIP archive URL used if the dataset is not already present."
+        required: false
+        type: string
+        default: ""
+      flights_json:
+        description: "Held-out flights as a JSON array."
+        required: true
+        type: string
+        default: '["Opt1","Opt2","Opt3"]'
+      variants_json:
+        description: "Sweep variants as JSON objects."
+        required: true
+        type: string
+        default: >-
+          [
+            {"name":"baseline","beam_max_hypotheses":32,"beam_max_candidates":8,"beam_track_switch_cost":3.0,"beam_missed_detection_cost":4.0,"beam_consecutive_miss_cost":0.5,"beam_missing_track_id_cost":1.0,"beam_lag_s":20,"radar_catprob_threshold":0.40,"radar_inflation_alpha":0.5,"association_safety_gate":true},
+            {"name":"high-switch-low-miss","beam_max_hypotheses":32,"beam_max_candidates":8,"beam_track_switch_cost":10.0,"beam_missed_detection_cost":2.0,"beam_consecutive_miss_cost":0.25,"beam_missing_track_id_cost":2.0,"beam_lag_s":20,"radar_catprob_threshold":0.40,"radar_inflation_alpha":0.5,"association_safety_gate":true},
+            {"name":"wide-beam","beam_max_hypotheses":64,"beam_max_candidates":10,"beam_track_switch_cost":10.0,"beam_missed_detection_cost":2.0,"beam_consecutive_miss_cost":0.25,"beam_missing_track_id_cost":2.0,"beam_lag_s":20,"radar_catprob_threshold":0.40,"radar_inflation_alpha":0.5,"association_safety_gate":true},
+            {"name":"short-lag","beam_max_hypotheses":32,"beam_max_candidates":8,"beam_track_switch_cost":10.0,"beam_missed_detection_cost":2.0,"beam_consecutive_miss_cost":0.25,"beam_missing_track_id_cost":2.0,"beam_lag_s":5,"radar_catprob_threshold":0.40,"radar_inflation_alpha":0.5,"association_safety_gate":true},
+            {"name":"strict-catprob","beam_max_hypotheses":32,"beam_max_candidates":8,"beam_track_switch_cost":10.0,"beam_missed_detection_cost":2.0,"beam_consecutive_miss_cost":0.25,"beam_missing_track_id_cost":2.0,"beam_lag_s":20,"radar_catprob_threshold":0.60,"radar_inflation_alpha":0.5,"association_safety_gate":true}
+          ]
+      smoother_lag_s:
+        description: "Fixed-lag RTS smoother horizon in seconds."
+        required: true
+        type: number
+        default: 20
+      rf_inflation_alpha:
+        description: "RF NIS-inflation alpha held fixed across this sweep."
+        required: true
+        type: number
+        default: 0.5
+      rf_max_residual_m:
+        description: "Hard Euclidean RF residual cap before Kalman update; <=0 disables it."
+        required: true
+        type: number
+        default: 750
+      radar_max_residual_m:
+        description: "Hard Euclidean radar residual cap before Kalman update; <=0 disables it."
+        required: true
+        type: number
+        default: 0
+      max_eval_time_delta_s:
+        description: "Maximum time offset for position and MOT-style matching."
+        required: true
+        type: number
+        default: 2.0
+      mot_distance_threshold_m:
+        description: "3D distance threshold for single-target MOT-style matching."
+        required: true
+        type: number
+        default: 150
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  run-sweep:
+    name: ${{ matrix.flight }} / ${{ matrix.variant.name }}
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 720
+    strategy:
+      fail-fast: false
+      matrix:
+        flight: ${{ fromJSON(inputs.flights_json) }}
+        variant: ${{ fromJSON(inputs.variants_json) }}
+
+    env:
+      DATASET_ROOT: ${{ inputs.dataset_root }}
+      DATASET_URL: ${{ inputs.dataset_url }}
+      TEST_FLIGHT: ${{ matrix.flight }}
+      VARIANT_JSON: ${{ toJSON(matrix.variant) }}
+      OUT_ROOT: ${{ runner.temp }}/stateful_sweep
+      RF_INFLATION_ALPHA: ${{ inputs.rf_inflation_alpha }}
+      RF_MAX_RESIDUAL_M: ${{ inputs.rf_max_residual_m }}
+      RADAR_MAX_RESIDUAL_M: ${{ inputs.radar_max_residual_m }}
+      SMOOTHER_LAG_S: ${{ inputs.smoother_lag_s }}
+      MAX_EVAL_TIME_DELTA_S: ${{ inputs.max_eval_time_delta_s }}
+      MOT_DISTANCE_THRESHOLD_M: ${{ inputs.mot_distance_threshold_m }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Ensure dataset exists
+        run: |
+          set -euo pipefail
+          if [ -d "$DATASET_ROOT" ]; then
+            echo "Using DATASET_ROOT=$DATASET_ROOT"
+            exit 0
+          fi
+          if [ -z "$DATASET_URL" ]; then
+            echo "Dataset root does not exist and dataset_url is empty: $DATASET_ROOT" >&2
+            exit 1
+          fi
+          mkdir -p "$(dirname "$DATASET_ROOT")"
+          tmp_zip="$RUNNER_TEMP/aadm2025dryad.zip"
+          curl -L --retry 3 --fail "$DATASET_URL" -o "$tmp_zip"
+          unzip -q "$tmp_zip" -d "$(dirname "$DATASET_ROOT")"
+
+      - name: Install package
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Configure sweep variant
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          variant = json.loads(os.environ["VARIANT_JSON"])
+
+          def value(name, default):
+              return variant.get(name, default)
+
+          def slug(text):
+              return re.sub(r"[^A-Za-z0-9_.-]+", "-", str(text)).strip("-")
+
+          name = slug(variant.get("name") or "variant")
+          out_dir = Path(os.environ["OUT_ROOT"]) / os.environ["TEST_FLIGHT"] / name
+          out_dir.mkdir(parents=True, exist_ok=True)
+          threshold = value("radar_catprob_threshold", 0.4)
+          if threshold is None or str(threshold).lower() == "none":
+              threshold = "none"
+          entries = {
+              "VARIANT": name,
+              "OUT_DIR": str(out_dir),
+              "BEAM_MAX_HYPOTHESES": int(value("beam_max_hypotheses", 32)),
+              "BEAM_MAX_CANDIDATES": int(value("beam_max_candidates", 8)),
+              "BEAM_TRACK_SWITCH_COST": float(value("beam_track_switch_cost", 3.0)),
+              "BEAM_MISSED_DETECTION_COST": float(value("beam_missed_detection_cost", 4.0)),
+              "BEAM_CONSECUTIVE_MISS_COST": float(value("beam_consecutive_miss_cost", 0.5)),
+              "BEAM_MISSING_TRACK_ID_COST": float(value("beam_missing_track_id_cost", 1.0)),
+              "BEAM_LAG_S": float(value("beam_lag_s", 20.0)),
+              "RADAR_CATPROB_THRESHOLD": threshold,
+              "RADAR_INFLATION_ALPHA": float(value("radar_inflation_alpha", 0.5)),
+              "ASSOCIATION_SAFETY_GATE": str(bool(value("association_safety_gate", True))).lower(),
+          }
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              for key, item in entries.items():
+                  handle.write(f"{key}={item}\n")
+          PY
+
+      - name: Train leave-flight-out radar association model
+        run: |
+          set -euo pipefail
+          threshold_args=()
+          if [ "$RADAR_CATPROB_THRESHOLD" = "none" ]; then
+            threshold_args+=(--disable-radar-catprob-threshold)
+          else
+            threshold_args+=(--radar-catprob-threshold "$RADAR_CATPROB_THRESHOLD")
+          fi
+          python -m raft_uav.train_radar_association_cli "$DATASET_ROOT" \
+            --exclude-flight "$TEST_FLIGHT" \
+            "${threshold_args[@]}" \
+            --output-model "$OUT_DIR/radar_assoc.json" \
+            --output-examples "$OUT_DIR/radar_assoc_examples.csv"
+
+      - name: Run stateful-beam variant
+        run: |
+          set -euo pipefail
+          threshold_args=()
+          if [ "$RADAR_CATPROB_THRESHOLD" = "none" ]; then
+            threshold_args+=(--disable-radar-catprob-threshold)
+          else
+            threshold_args+=(--radar-catprob-threshold "$RADAR_CATPROB_THRESHOLD")
+          fi
+          safety_gate_args=()
+          if [ "$ASSOCIATION_SAFETY_GATE" != "true" ]; then
+            safety_gate_args+=(--disable-association-safety-gate)
+          fi
+          python -m raft_uav.run_learned_radar_association_cli "$DATASET_ROOT" \
+            --flight "$TEST_FLIGHT" \
+            --model "$OUT_DIR/radar_assoc.json" \
+            --association-mode stateful-beam \
+            "${threshold_args[@]}" \
+            --beam-max-hypotheses "$BEAM_MAX_HYPOTHESES" \
+            --beam-max-candidates "$BEAM_MAX_CANDIDATES" \
+            --beam-track-switch-cost "$BEAM_TRACK_SWITCH_COST" \
+            --beam-missed-detection-cost "$BEAM_MISSED_DETECTION_COST" \
+            --beam-consecutive-miss-cost "$BEAM_CONSECUTIVE_MISS_COST" \
+            --beam-missing-track-id-cost "$BEAM_MISSING_TRACK_ID_COST" \
+            --beam-lag-s "$BEAM_LAG_S" \
+            --robust-update nis-inflate \
+            --rf-inflation-alpha "$RF_INFLATION_ALPHA" \
+            --radar-inflation-alpha "$RADAR_INFLATION_ALPHA" \
+            --rf-max-residual-m "$RF_MAX_RESIDUAL_M" \
+            --radar-max-residual-m "$RADAR_MAX_RESIDUAL_M" \
+            --smoother fixed-lag \
+            --smoother-lag-s "$SMOOTHER_LAG_S" \
+            --max-eval-time-delta-s "$MAX_EVAL_TIME_DELTA_S" \
+            --output-dir "$OUT_DIR/run" \
+            "${safety_gate_args[@]}"
+
+      - name: Write sweep summary
+        if: always()
+        run: |
+          set -euo pipefail
+          python .github/scripts/summarize_stateful_sweep_run.py \
+            --dataset-root "$DATASET_ROOT" \
+            --flight "$TEST_FLIGHT" \
+            --variant "$VARIANT" \
+            --beam-max-hypotheses "$BEAM_MAX_HYPOTHESES" \
+            --beam-max-candidates "$BEAM_MAX_CANDIDATES" \
+            --beam-track-switch-cost "$BEAM_TRACK_SWITCH_COST" \
+            --beam-missed-detection-cost "$BEAM_MISSED_DETECTION_COST" \
+            --beam-consecutive-miss-cost "$BEAM_CONSECUTIVE_MISS_COST" \
+            --beam-missing-track-id-cost "$BEAM_MISSING_TRACK_ID_COST" \
+            --beam-lag-s "$BEAM_LAG_S" \
+            --radar-catprob-threshold "$RADAR_CATPROB_THRESHOLD" \
+            --radar-inflation-alpha "$RADAR_INFLATION_ALPHA" \
+            --association-safety-gate-enabled "$ASSOCIATION_SAFETY_GATE" \
+            --max-eval-time-delta-s "$MAX_EVAL_TIME_DELTA_S" \
+            --mot-distance-threshold-m "$MOT_DISTANCE_THRESHOLD_M" \
+            --metrics-path "$OUT_DIR/run/$TEST_FLIGHT/metrics.json" \
+            --diagnostic-summary-path "$OUT_DIR/run/$TEST_FLIGHT/diagnostic_summary.json" \
+            --diagnostics-path "$OUT_DIR/run/$TEST_FLIGHT/diagnostics.csv" \
+            --estimates-path "$OUT_DIR/run/$TEST_FLIGHT/estimates.csv" \
+            --selected-radar-path "$OUT_DIR/run/$TEST_FLIGHT/selected_radar.csv" \
+            --output "$OUT_DIR/sweep_summary.json"
+
+      - name: Upload sweep artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stateful-sweep-${{ matrix.flight }}-${{ matrix.variant.name }}
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/sweep_summary.json
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/radar_assoc.json
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/radar_assoc_examples.csv
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/run/*/metrics.json
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/run/*/diagnostic_summary.json
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/run/*/diagnostics.csv
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/run/*/selected_radar.csv
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/run/*/estimates.csv
+            ${{ runner.temp }}/stateful_sweep/${{ matrix.flight }}/*/run/*/trajectory.png
+
+      - name: Remove local sweep output
+        if: always()
+        run: rm -rf "$OUT_DIR"
+
+  aggregate:
+    name: Aggregate stateful sweep
+    needs: run-sweep
+    runs-on: ubuntu-latest
+    if: always()
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Download sweep artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: stateful-sweep-*
+          path: artifacts
+
+      - name: Aggregate sweep metrics
+        run: |
+          set -euo pipefail
+          python .github/scripts/aggregate_stateful_sweep.py \
+            --artifacts-dir artifacts \
+            --output-json stateful_sweep_summary.json \
+            --output-csv stateful_sweep_summary.csv \
+            --output-runs-csv stateful_sweep_runs.csv \
+            --expected-flights-json '${{ inputs.flights_json }}' \
+            --expected-variants-json '${{ inputs.variants_json }}'
+
+      - name: Upload aggregate summary
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: stateful-sweep-aggregate-summary
+          retention-days: 30
+          path: |
+            stateful_sweep_summary.json
+            stateful_sweep_summary.csv
+            stateful_sweep_runs.csv
