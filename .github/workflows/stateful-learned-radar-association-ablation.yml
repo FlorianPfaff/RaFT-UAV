@@ -60,12 +60,12 @@ on:
         type: number
         default: 0.5
       rf_max_residual_m:
-        description: "Hard Euclidean RF residual cap before Kalman update; <=0 disables it."
+        description: "Euclidean RF residual safety cap; with safety NIS gating, rejects only statistically implausible updates; <=0 disables it."
         required: true
         type: number
         default: 750
       radar_max_residual_m:
-        description: "Hard Euclidean radar residual cap before Kalman update; <=0 disables it."
+        description: "Euclidean radar residual safety cap; with safety NIS gating, rejects only statistically implausible updates; <=0 disables it."
         required: true
         type: number
         default: 0

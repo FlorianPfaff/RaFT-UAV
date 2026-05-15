@@ -157,10 +157,18 @@ def plan_linear_measurement_update(
     update_action = "updated"
     accepted = True
 
-    if residual_threshold is not None and residual_norm > residual_threshold:
+    residual_over_threshold = (
+        residual_threshold is not None and residual_norm > residual_threshold
+    )
+    safety_over_threshold = safety_threshold is not None and nis > safety_threshold
+    reject_by_residual = residual_over_threshold and (
+        safety_threshold is None or safety_over_threshold
+    )
+
+    if reject_by_residual:
         accepted = False
         update_action = "missed_detection"
-    elif safety_threshold is not None and nis > safety_threshold:
+    elif safety_over_threshold:
         accepted = False
         update_action = "missed_detection"
     elif threshold is not None and nis > threshold and robust_update is None:

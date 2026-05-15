@@ -113,7 +113,7 @@ def test_safety_gate_turns_impossible_inflated_update_into_miss():
     assert np.linalg.norm(records[-1]["state"][:2]) < 100.0
 
 
-def test_residual_gate_rejects_high_covariance_rf_outlier():
+def test_residual_gate_accepts_large_but_covariance_plausible_update():
     far_uncertain = TrackingMeasurement(
         time_s=1.0,
         vector=np.array([10_000.0, 0.0]),
@@ -130,10 +130,52 @@ def test_residual_gate_rejects_high_covariance_rf_outlier():
     assert records[-1]["nis"] < 50.0
     assert records[-1]["residual_norm_m"] > 750.0
     assert records[-1]["residual_gate_threshold_m"] == 750.0
+    assert records[-1]["accepted"] is True
+    assert records[-1]["update_action"] == "updated"
+    assert records[-1]["covariance_scale"] == 1.0
+
+
+def test_residual_gate_rejects_large_update_when_safety_gate_fails():
+    far_certain = TrackingMeasurement(
+        time_s=1.0,
+        vector=np.array([10_000.0, 0.0]),
+        covariance=np.diag([1.0, 1.0]),
+        source="rf",
+    )
+    records = run_async_cv_baseline(
+        [_measurement(0.0, 0.0, 0.0), far_certain],
+        safety_gate_thresholds_by_source={"rf": 50.0},
+        robust_update_by_source={"rf": "nis-inflate"},
+        max_residual_norms_by_source={"rf": 750.0},
+    )
+
+    assert records[-1]["nis"] > 50.0
+    assert records[-1]["residual_norm_m"] > 750.0
+    assert records[-1]["residual_gate_threshold_m"] == 750.0
     assert records[-1]["accepted"] is False
     assert records[-1]["update_action"] == "missed_detection"
     assert records[-1]["covariance_scale"] == 1.0
     assert np.linalg.norm(records[-1]["state"][:2]) < 100.0
+
+
+def test_residual_gate_stays_hard_without_safety_gate():
+    far_uncertain = TrackingMeasurement(
+        time_s=1.0,
+        vector=np.array([10_000.0, 0.0]),
+        covariance=np.diag([1.0e12, 1.0e12]),
+        source="rf",
+    )
+    records = run_async_cv_baseline(
+        [_measurement(0.0, 0.0, 0.0), far_uncertain],
+        robust_update_by_source={"rf": "nis-inflate"},
+        max_residual_norms_by_source={"rf": 750.0},
+    )
+
+    assert records[-1]["nis"] < 50.0
+    assert records[-1]["residual_norm_m"] > 750.0
+    assert records[-1]["residual_gate_threshold_m"] == 750.0
+    assert records[-1]["accepted"] is False
+    assert records[-1]["update_action"] == "missed_detection"
 
 
 def test_nis_inflation_alpha_controls_outlier_pull():

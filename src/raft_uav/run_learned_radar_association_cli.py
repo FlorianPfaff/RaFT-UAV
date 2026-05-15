@@ -104,13 +104,19 @@ def main(argv: list[str] | None = None) -> int:
         "--rf-max-residual-m",
         type=float,
         default=750.0,
-        help="hard Euclidean residual cap for RF updates; <=0 disables it",
+        help=(
+            "Euclidean RF residual safety cap; with a safety NIS gate it rejects only "
+            "statistically implausible updates, <=0 disables it"
+        ),
     )
     parser.add_argument(
         "--radar-max-residual-m",
         type=float,
         default=0.0,
-        help="hard Euclidean residual cap for radar updates; <=0 disables it",
+        help=(
+            "Euclidean radar residual safety cap; with a safety NIS gate it rejects only "
+            "statistically implausible updates, <=0 disables it"
+        ),
     )
     parser.add_argument("--rf-inflation-alpha", type=float, default=1.0)
     parser.add_argument("--radar-inflation-alpha", type=float, default=1.0)
