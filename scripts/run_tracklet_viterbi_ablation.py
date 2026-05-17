@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-import ablation_common as common
-from raft_uav.tracklet_viterbi_cli import main as tracklet_viterbi_main
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
+
+import ablation_common as common  # noqa: E402
+from raft_uav.tracklet_viterbi_cli import main as tracklet_viterbi_main  # noqa: E402
 
 
 @dataclass(frozen=True)
