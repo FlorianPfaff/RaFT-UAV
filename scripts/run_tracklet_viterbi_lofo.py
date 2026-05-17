@@ -34,8 +34,15 @@ class RunEvaluation:
     row: dict[str, object]
     errors_2d_m: np.ndarray
     errors_3d_m: np.ndarray
+    selected_radar_errors_2d_m: np.ndarray
+    selected_radar_errors_3d_m: np.ndarray
     covered_truth_rows: int
     truth_rows: int
+    selected_radar_covered_truth_rows: int
+    selected_radar_frame_count: int
+    radar_frame_count: int
+    selected_radar_track_switch_count: int
+    selected_radar_unique_track_ids: int
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -183,6 +190,7 @@ def _evaluate_run(
 ) -> RunEvaluation:
     metrics = common.load_metrics(metrics_path)
     estimates = pd.read_csv(metrics_path.parent / "estimates.csv")
+    selected_radar = _read_optional_csv(metrics_path.parent / "selected_radar.csv")
     truth = _load_truth(dataset_root, flight)
     truth_times = truth["time_s"].to_numpy(dtype=float)
     truth_positions = truth[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
@@ -204,8 +212,54 @@ def _evaluate_run(
         max_time_delta_s=max_eval_time_delta_s,
         dimensions=3,
     )
+
+    selected_times, selected_positions = _trajectory_arrays(selected_radar)
+    if selected_times.size and truth_times.size:
+        selected_errors_2d = position_errors_m(
+            selected_times,
+            selected_positions,
+            truth_times,
+            truth_positions,
+            max_time_delta_s=max_eval_time_delta_s,
+            dimensions=2,
+        )
+        selected_errors_3d = position_errors_m(
+            selected_times,
+            selected_positions,
+            truth_times,
+            truth_positions,
+            max_time_delta_s=max_eval_time_delta_s,
+            dimensions=3,
+        )
+    else:
+        selected_errors_2d = np.array([], dtype=float)
+        selected_errors_3d = np.array([], dtype=float)
+
     coverage = _truth_coverage(truth_times, estimate_times, max_time_delta_s=max_eval_time_delta_s)
+    selected_coverage = _truth_coverage(
+        truth_times,
+        selected_times,
+        max_time_delta_s=max_eval_time_delta_s,
+    )
+    diagnostics = metrics.get("selected_radar_diagnostics") or {}
     smoother = metrics.get("smoother") or {}
+    radar_frame_count = _optional_int(diagnostics.get("radar_frame_count"), default=0)
+    selected_frame_count = _optional_int(
+        diagnostics.get("selected_radar_frame_count"),
+        default=_frame_count(selected_radar),
+    )
+    frame_coverage = _optional_float(diagnostics.get("radar_frame_coverage_rate"))
+    if frame_coverage is None and radar_frame_count > 0:
+        frame_coverage = float(selected_frame_count / radar_frame_count)
+    track_switch_count = _optional_int(
+        diagnostics.get("track_switch_count"),
+        default=_track_switch_count(selected_radar),
+    )
+    unique_track_ids = _optional_int(
+        diagnostics.get("unique_track_ids"),
+        default=_unique_track_id_count(selected_radar),
+    )
+
     row: dict[str, object] = {
         "heldout_flight": flight,
         "train_flights": ";".join(train_flights),
@@ -219,29 +273,52 @@ def _evaluate_run(
         "smoother": smoother.get("method", "") if isinstance(smoother, dict) else "",
         "smoother_lag_s": smoother.get("lag_s", "") if isinstance(smoother, dict) else "",
         "posterior_records": int(metrics.get("posterior_records", len(estimates))),
-        "selected_radar_rows": int(metrics.get("selected_radar_rows", 0)),
+        "selected_radar_rows": int(metrics.get("selected_radar_rows", len(selected_radar))),
         "accepted_measurements": int(metrics.get("accepted_measurements", 0)),
         "rejected_measurements": int(metrics.get("rejected_measurements", 0)),
+        "selected_radar_covered_truth_rows": int(selected_coverage["covered_truth_rows"]),
+        "selected_radar_truth_coverage_rate": float(selected_coverage["truth_coverage_rate"]),
+        "selected_radar_frame_count": int(selected_frame_count),
+        "radar_frame_count": int(radar_frame_count),
+        "selected_radar_frame_coverage_rate": _nan_if_none(frame_coverage),
+        "selected_radar_track_switch_count": int(track_switch_count),
+        "selected_radar_unique_track_ids": int(unique_track_ids),
         "metrics_path": str(metrics_path),
     }
     row.update(_prefixed_summary("error_2d", _summarize_scalar_errors(errors_2d)))
     row.update(_prefixed_summary("error_3d", _summarize_scalar_errors(errors_3d)))
+    row.update(_prefixed_summary("selected_radar_error_2d", _summarize_scalar_errors(selected_errors_2d)))
+    row.update(_prefixed_summary("selected_radar_error_3d", _summarize_scalar_errors(selected_errors_3d)))
+    row.update(_association_stat_columns(diagnostics, selected_radar))
     row.update(coverage)
     row.update(_nis_summary(estimates))
     return RunEvaluation(
         row=row,
         errors_2d_m=errors_2d,
         errors_3d_m=errors_3d,
+        selected_radar_errors_2d_m=selected_errors_2d,
+        selected_radar_errors_3d_m=selected_errors_3d,
         covered_truth_rows=int(coverage["covered_truth_rows"]),
         truth_rows=int(coverage["truth_rows"]),
+        selected_radar_covered_truth_rows=int(selected_coverage["covered_truth_rows"]),
+        selected_radar_frame_count=int(selected_frame_count),
+        radar_frame_count=int(radar_frame_count),
+        selected_radar_track_switch_count=int(track_switch_count),
+        selected_radar_unique_track_ids=int(unique_track_ids),
     )
 
 
 def _aggregate_row(evaluations: Sequence[RunEvaluation]) -> dict[str, object]:
     errors_2d = _concat([evaluation.errors_2d_m for evaluation in evaluations])
     errors_3d = _concat([evaluation.errors_3d_m for evaluation in evaluations])
+    selected_errors_2d = _concat([evaluation.selected_radar_errors_2d_m for evaluation in evaluations])
+    selected_errors_3d = _concat([evaluation.selected_radar_errors_3d_m for evaluation in evaluations])
     truth_rows = int(sum(evaluation.truth_rows for evaluation in evaluations))
     covered = int(sum(evaluation.covered_truth_rows for evaluation in evaluations))
+    selected_covered = int(sum(evaluation.selected_radar_covered_truth_rows for evaluation in evaluations))
+    selected_frames = int(sum(evaluation.selected_radar_frame_count for evaluation in evaluations))
+    radar_frames = int(sum(evaluation.radar_frame_count for evaluation in evaluations))
+    unique_track_ids = [evaluation.selected_radar_unique_track_ids for evaluation in evaluations]
     row: dict[str, object] = {
         "method": "cv_tracklet_viterbi_fixed_lag",
         "label": "CV tracklet-Viterbi fixed-lag",
@@ -252,9 +329,23 @@ def _aggregate_row(evaluations: Sequence[RunEvaluation]) -> dict[str, object]:
         "truth_rows": truth_rows,
         "covered_truth_rows": covered,
         "truth_coverage_rate": float(covered / truth_rows) if truth_rows else float("nan"),
+        "selected_radar_covered_truth_rows": selected_covered,
+        "selected_radar_truth_coverage_rate": float(selected_covered / truth_rows) if truth_rows else float("nan"),
+        "selected_radar_frame_count": selected_frames,
+        "radar_frame_count": radar_frames,
+        "selected_radar_frame_coverage_rate": float(selected_frames / radar_frames) if radar_frames else float("nan"),
+        "selected_radar_track_switch_count": int(
+            sum(evaluation.selected_radar_track_switch_count for evaluation in evaluations)
+        ),
+        "selected_radar_unique_track_ids_mean": float(np.mean(unique_track_ids))
+        if unique_track_ids
+        else float("nan"),
+        "selected_radar_unique_track_ids_max": int(max(unique_track_ids)) if unique_track_ids else 0,
     }
     row.update(_prefixed_summary("error_2d", _summarize_scalar_errors(errors_2d)))
     row.update(_prefixed_summary("error_3d", _summarize_scalar_errors(errors_3d)))
+    row.update(_prefixed_summary("selected_radar_error_2d", _summarize_scalar_errors(selected_errors_2d)))
+    row.update(_prefixed_summary("selected_radar_error_3d", _summarize_scalar_errors(selected_errors_3d)))
     row["rank_rmse_3d"] = 1
     return row
 
@@ -319,6 +410,119 @@ def _load_truth(dataset_root: Path, flight_name: str) -> pd.DataFrame:
         raise FileNotFoundError(f"{flight.name} has no truth telemetry file")
     truth, _, _ = normalize_truth(read_truth(flight.truth_txt))
     return truth
+
+
+def _read_optional_csv(path: Path) -> pd.DataFrame:
+    if not path.exists():
+        return pd.DataFrame()
+    return pd.read_csv(path)
+
+
+def _trajectory_arrays(frame: pd.DataFrame) -> tuple[np.ndarray, np.ndarray]:
+    if frame.empty or not {"time_s", "east_m", "north_m", "up_m"}.issubset(frame.columns):
+        return np.array([], dtype=float), np.empty((0, 3), dtype=float)
+    values = frame[["time_s", "east_m", "north_m", "up_m"]].apply(
+        pd.to_numeric,
+        errors="coerce",
+    ).to_numpy(dtype=float)
+    finite = np.isfinite(values).all(axis=1)
+    values = values[finite]
+    return values[:, 0], values[:, 1:4]
+
+
+def _association_stat_columns(
+    diagnostics: dict[str, object],
+    selected_radar: pd.DataFrame,
+) -> dict[str, object]:
+    columns: dict[str, object] = {}
+    mapping = {
+        "association_anchor_nis": "selected_radar_anchor_nis",
+        "association_nis": "selected_radar_association_nis",
+        "association_score": "selected_radar_association_score",
+    }
+    for diagnostics_key, column_prefix in mapping.items():
+        stats = diagnostics.get(diagnostics_key)
+        if not isinstance(stats, dict):
+            source_column = diagnostics_key if diagnostics_key in selected_radar.columns else diagnostics_key.replace("association_", "")
+            stats = _numeric_column_stats(selected_radar, source_column)
+        for statistic in ("count", "mean", "p50", "p95", "max"):
+            columns[f"{column_prefix}_{statistic}"] = _nan_if_none(_optional_float(stats.get(statistic)))
+    return columns
+
+
+def _numeric_column_stats(frame: pd.DataFrame, column: str) -> dict[str, float]:
+    if frame.empty or column not in frame.columns:
+        return _empty_numeric_column_stats()
+    values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy(dtype=float)
+    values = values[np.isfinite(values)]
+    if values.size == 0:
+        return _empty_numeric_column_stats()
+    return {
+        "count": float(values.size),
+        "mean": float(np.mean(values)),
+        "p50": float(np.percentile(values, 50)),
+        "p95": float(np.percentile(values, 95)),
+        "max": float(np.max(values)),
+    }
+
+
+def _empty_numeric_column_stats() -> dict[str, float]:
+    return {
+        "count": 0.0,
+        "mean": float("nan"),
+        "p50": float("nan"),
+        "p95": float("nan"),
+        "max": float("nan"),
+    }
+
+
+def _frame_count(frame: pd.DataFrame) -> int:
+    if frame.empty:
+        return 0
+    column = "frame_index" if "frame_index" in frame.columns else "time_s"
+    if column not in frame.columns:
+        return int(len(frame))
+    values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy(dtype=float)
+    return int(np.unique(values).size)
+
+
+def _track_switch_count(selected: pd.DataFrame) -> int:
+    if selected.empty or "track_id" not in selected.columns:
+        return 0
+    sort_columns = [column for column in ("time_s", "frame_index", "track_index") if column in selected.columns]
+    ordered = selected.sort_values(sort_columns) if sort_columns else selected
+    track_ids = pd.to_numeric(ordered["track_id"], errors="coerce").to_numpy(dtype=float)
+    track_ids = track_ids[np.isfinite(track_ids)].astype(int)
+    if track_ids.size < 2:
+        return 0
+    return int(np.count_nonzero(track_ids[1:] != track_ids[:-1]))
+
+
+def _unique_track_id_count(selected: pd.DataFrame) -> int:
+    if selected.empty or "track_id" not in selected.columns:
+        return 0
+    track_ids = pd.to_numeric(selected["track_id"], errors="coerce").dropna().to_numpy(dtype=float)
+    track_ids = track_ids[np.isfinite(track_ids)].astype(int)
+    return int(np.unique(track_ids).size)
+
+
+def _optional_float(value: object) -> float | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if np.isfinite(number) else None
+
+
+def _optional_int(value: object, *, default: int) -> int:
+    number = _optional_float(value)
+    return default if number is None else int(number)
+
+
+def _nan_if_none(value: float | None) -> float:
+    return float("nan") if value is None else float(value)
 
 
 def _nis_summary(estimates: pd.DataFrame) -> dict[str, object]:
