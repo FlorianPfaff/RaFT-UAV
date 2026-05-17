@@ -30,6 +30,7 @@ raft-uav-train-radar-association = "raft_uav.train_radar_association_cli:main"
 raft-uav-run-learned-radar-association = "raft_uav.run_learned_radar_association_cli:main"
 raft-uav-train-bias-model = "raft_uav.bias_cli:main"
 raft-uav-tracklet-viterbi = "raft_uav.tracklet_viterbi_cli:main"
+raft-uav-diagnose-time-offset = "raft_uav.diagnostics.time_offset:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
