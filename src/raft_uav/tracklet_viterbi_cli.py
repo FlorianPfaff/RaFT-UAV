@@ -6,10 +6,11 @@ association mode, and forwards all non-tracklet modes to the base dispatcher.
 The ``raft-uav-tracklet-viterbi`` command remains as a compatibility alias for
 older experiment notes.
 
-Controlled ablation runs can select the base, retention-aware, or
-range-covariance-aware implementation through wrapper-only command-line
-arguments or matching environment variables. The wrapper strips those
-``--tracklet-*`` arguments before forwarding to the shared base CLI parser.
+Controlled ablation runs can select the base, retention-aware,
+range-covariance-aware, or fixed-lag implementation through wrapper-only
+command-line arguments or matching environment variables. The wrapper strips
+those ``--tracklet-*`` arguments before forwarding to the shared base CLI
+parser.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ import pandas as pd
 
 from raft_uav import cli as _base_cli
 from raft_uav.baselines import tracklet_viterbi as _base_tracklet_viterbi
+from raft_uav.baselines import tracklet_viterbi_fixed_lag as _fixed_lag_tracklet_viterbi
 from raft_uav.baselines import (
     tracklet_viterbi_range_covariance as _range_covariance_tracklet_viterbi,
 )
@@ -44,7 +46,8 @@ _MAX_TRACK_SUPPORT_REWARD_ENV = "RAFT_UAV_TRACKLET_MAX_SUPPORT_REWARD"
 _MAX_CANDIDATES_PER_FRAME_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_FRAME"
 _MAX_CANDIDATE_POOL_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATE_POOL_PER_FRAME"
 _MAX_CANDIDATES_PER_TRACK_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_TRACK_ID"
-_TRACKLET_VARIANTS = ("base", "retention", "range-covariance")
+_VITERBI_LAG_S_ENV = "RAFT_UAV_TRACKLET_VITERBI_LAG_S"
+_TRACKLET_VARIANTS = ("base", "retention", "range-covariance", "fixed-lag")
 _CATPROB_RETENTION_MODES = ("soft", "hard")
 
 
@@ -174,9 +177,24 @@ def _tracklet_runner_from_environment() -> Callable[
         return _retention_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
     if variant == "range-covariance":
         return _range_covariance_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
+    if variant == "fixed-lag":
+        return _run_fixed_lag_tracklet_viterbi_association
     raise ValueError(
         f"{_TRACKLET_VARIANT_ENV} must be one of {_TRACKLET_VARIANTS}; got {variant!r}"
     )
+
+
+def _run_fixed_lag_tracklet_viterbi_association(
+    **kwargs: object,
+) -> tuple[list[dict[str, object]], pd.DataFrame]:
+    records, accepted, _ = (
+        _fixed_lag_tracklet_viterbi
+        .run_async_cv_baseline_with_fixed_lag_tracklet_viterbi_association_and_replay(
+            lag_s=_env_float(_VITERBI_LAG_S_ENV, 20.0),
+            **kwargs,
+        )
+    )
+    return records, accepted
 
 
 def _tracklet_config_from_environment() -> _TrackletConfigOverlay:
@@ -209,6 +227,7 @@ def _tracklet_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tracklet-max-candidates-per-frame", type=_positive_int)
     parser.add_argument("--tracklet-max-candidate-pool-per-frame", type=_positive_int)
     parser.add_argument("--tracklet-max-candidates-per-track-id", type=_positive_int)
+    parser.add_argument("--tracklet-viterbi-lag-s", type=_positive_float)
     return parser
 
 
@@ -233,6 +252,7 @@ def _environment_updates_from_namespace(namespace: argparse.Namespace) -> dict[s
     _maybe_add(updates, _MAX_CANDIDATES_PER_FRAME_ENV, namespace.tracklet_max_candidates_per_frame)
     _maybe_add(updates, _MAX_CANDIDATE_POOL_ENV, namespace.tracklet_max_candidate_pool_per_frame)
     _maybe_add(updates, _MAX_CANDIDATES_PER_TRACK_ENV, namespace.tracklet_max_candidates_per_track_id)
+    _maybe_add(updates, _VITERBI_LAG_S_ENV, namespace.tracklet_viterbi_lag_s)
     return updates
 
 
@@ -259,6 +279,13 @@ def _positive_int(value: str) -> int:
     parsed = int(value)
     if parsed < 1:
         raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0.0:
+        raise argparse.ArgumentTypeError("must be > 0")
     return parsed
 
 
