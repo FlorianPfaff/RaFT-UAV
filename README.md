@@ -119,11 +119,13 @@ Baseline runs write gitignored per-flight artifacts under `outputs/baseline/`:
 - `trajectory.png`
 
 Radar JSON frames contain many Fortem `trackData` entries. The default
-reproducibility baseline uses `--radar-association catprob`, which keeps radar
-rows whose UAV class probability `catProb[0]` is at least `0.5`. Use
-`--radar-association oracle-nearest-truth` only as a diagnostic upper bound
-because it uses ground truth. The online alternatives are
-`--radar-association prediction-nis`,
+reproducibility baseline uses `--radar-association catprob`, which selects the
+highest-UAV-probability radar row per JSON frame among rows whose UAV class
+probability `catProb[0]` is at least `0.5`; this gives the single-UAV filter at
+most one radar update per frame. Use `--radar-selection all` only for deliberate
+multi-row radar stress tests. Use `--radar-association oracle-nearest-truth`
+only as a diagnostic upper bound because it uses ground truth. The online
+alternatives are `--radar-association prediction-nis`,
 `--radar-association track-continuity`, and the experimental
 `--radar-association geometry-score` mode, which adds velocity consistency,
 track-switch, and UAV class-probability terms to the NIS score. The
