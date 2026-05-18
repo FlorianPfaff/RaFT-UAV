@@ -137,7 +137,7 @@ def test_catprob_candidate_pool_filters_when_possible():
     assert pool["association_catprob_fallback"].tolist() == [False]
 
 
-def test_catprob_candidate_pool_falls_back_when_threshold_empty():
+def test_catprob_candidate_pool_returns_empty_when_threshold_empty():
     candidates = pd.DataFrame(
         {
             "track_id": [1, 2],
@@ -150,9 +150,44 @@ def test_catprob_candidate_pool_falls_back_when_threshold_empty():
 
     pool = _catprob_candidate_pool(candidates, 0.4)
 
-    assert pool["track_id"].tolist() == [1, 2]
-    assert pool["association_catprob_threshold"].tolist() == [0.4, 0.4]
-    assert pool["association_catprob_fallback"].tolist() == [True, True]
+    assert pool.empty
+    assert "association_catprob_threshold" in pool.columns
+    assert "association_catprob_fallback" in pool.columns
+
+
+def test_prediction_nis_treats_empty_catprob_pool_as_no_radar_selection():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 0,
+                "track_id": 1,
+                "time_s": 2.0,
+                "east_m": 2.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.2,
+            },
+            {
+                "frame_index": 0,
+                "track_id": 2,
+                "time_s": 2.0,
+                "east_m": 3.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.3,
+            },
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(0.0, 0.0), _rf_measurement(1.0, 1.0)],
+        radar=radar,
+        association="prediction-nis",
+        candidate_catprob_threshold=0.4,
+    )
+
+    assert [record["source"] for record in records] == ["rf", "rf"]
+    assert selected.empty
 
 
 def test_track_continuity_keeps_current_track_for_small_nis_gain():

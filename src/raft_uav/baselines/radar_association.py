@@ -875,15 +875,9 @@ def _catprob_candidate_pool(
     catprob = pd.to_numeric(candidates["cat_prob_uav"], errors="coerce")
     threshold = float(candidate_catprob_threshold)
     keep = catprob >= threshold
-    if keep.any():
-        pool = candidates.loc[keep].copy()
-        pool["association_catprob_threshold"] = threshold
-        pool["association_catprob_fallback"] = False
-        return pool
-
-    pool = candidates.copy()
+    pool = candidates.loc[keep].copy()
     pool["association_catprob_threshold"] = threshold
-    pool["association_catprob_fallback"] = True
+    pool["association_catprob_fallback"] = False
     return pool
 
 
