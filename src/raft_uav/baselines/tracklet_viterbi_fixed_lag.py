@@ -18,6 +18,7 @@ from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.baselines.tracklet_viterbi import (
     TrackletViterbiAssociationConfig,
     _build_rf_anchor_states,
+    _optional_track_id,
     _radar_event_key,
     _select_tracklet_viterbi_path,
     _selected_row_event_key,
@@ -248,7 +249,7 @@ def _choose_prefix_consistent_selection(
     out = best.copy()
     out["association_prefix_adjusted_cost"] = float(best_cost)
     out["association_prefix_unconstrained_cost"] = float(selected_cost)
-    out["association_prefix_adjusted"] = bool(_selected_row_event_key(out) != _selected_row_event_key(selected))
+    out["association_prefix_adjusted"] = _track_id(out) != _track_id(selected)
     out["association_prefix_lag_window_start_s"] = float(window_start_s)
     out["association_prefix_lag_s"] = float(lag_s)
     return out
@@ -260,7 +261,7 @@ def _prefix_adjusted_cost(
     candidate: pd.Series,
     config: TrackletViterbiAssociationConfig,
 ) -> float:
-    from raft_uav.baselines.tracklet_viterbi import _ViterbiNode, _optional_track_id, _row_position, _row_velocity
+    from raft_uav.baselines.tracklet_viterbi import _ViterbiNode, _row_position, _row_velocity
 
     previous_position = _row_position(previous_committed)
     current_position = _row_position(candidate)
@@ -296,3 +297,7 @@ def _prefix_adjusted_cost(
     if not np.isfinite(unary):
         unary = 0.0
     return float(unary + _transition_cost(previous_node, current_node, config))
+
+
+def _track_id(row: pd.Series) -> int | None:
+    return _optional_track_id(row.get("track_id"))
