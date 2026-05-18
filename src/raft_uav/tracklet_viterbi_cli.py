@@ -6,10 +6,11 @@ association dispatcher before argument parsing.  It keeps the default
 sequence-level association method through ``raft-uav-tracklet-viterbi`` or
 ``python -m raft_uav.tracklet_viterbi_cli``.
 
-Controlled ablation runs can select the base or retention-aware implementation
-through environment variables. This avoids invasive changes to the shared
-``raft_uav.cli`` parser while still letting experiment scripts isolate the
-effect of retention, soft class-probability handling, and track-support priors.
+Controlled ablation runs can select the base, retention-aware, or
+range-covariance-aware implementation through environment variables. This
+avoids invasive changes to the shared ``raft_uav.cli`` parser while still
+letting experiment scripts isolate retention, soft class-probability handling,
+track-support priors, and range-adaptive radar covariance.
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import pandas as pd
 
 from raft_uav import cli as _base_cli
 from raft_uav.baselines import tracklet_viterbi as _base_tracklet_viterbi
+from raft_uav.baselines import tracklet_viterbi_range_covariance as _range_covariance_tracklet_viterbi
 from raft_uav.baselines import tracklet_viterbi_retention as _retention_tracklet_viterbi
 from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.baselines.radar_association import (
@@ -37,7 +39,7 @@ _TRACK_SUPPORT_WEIGHT_ENV = "RAFT_UAV_TRACKLET_SUPPORT_WEIGHT"
 _MAX_TRACK_SUPPORT_REWARD_ENV = "RAFT_UAV_TRACKLET_MAX_SUPPORT_REWARD"
 _MAX_CANDIDATE_POOL_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATE_POOL_PER_FRAME"
 _MAX_CANDIDATES_PER_TRACK_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_TRACK_ID"
-_TRACKLET_VARIANTS = ("base", "retention")
+_TRACKLET_VARIANTS = ("base", "retention", "range-covariance")
 
 
 class _TrackletConfigOverlay:
@@ -153,11 +155,13 @@ def run_async_cv_baseline_with_radar_association(
 def _tracklet_runner_from_environment() -> Callable[
     ..., tuple[list[dict[str, object]], pd.DataFrame]
 ]:
-    variant = os.environ.get(_TRACKLET_VARIANT_ENV, "retention").strip().lower()
+    variant = os.environ.get(_TRACKLET_VARIANT_ENV, "range-covariance").strip().lower()
     if variant == "base":
         return _base_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
     if variant == "retention":
         return _retention_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
+    if variant == "range-covariance":
+        return _range_covariance_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
     raise ValueError(
         f"{_TRACKLET_VARIANT_ENV} must be one of {_TRACKLET_VARIANTS}; got {variant!r}"
     )
