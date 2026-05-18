@@ -9,6 +9,7 @@ position columns are present.
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import numpy as np
@@ -25,12 +26,18 @@ from raft_uav.baselines.radar_covariance import (
 _INSTALLED = False
 _ORIGINAL_EVENTS: Any = None
 _ORIGINAL_RADAR_MEASUREMENTS_TO_ENU: Any = None
+_ORIGINAL_RADAR_ROW_TO_MEASUREMENT: Any = None
+
+_RADAR_UPDATE_DIMENSION_ENV = "RAFT_UAV_RADAR_UPDATE_DIMENSION"
+_RADAR_VELOCITY_STD_MPS_ENV = "RAFT_UAV_RADAR_VELOCITY_STD_MPS"
+_RADAR_UPDATE_DIMENSIONS = {"position", "position-velocity"}
 
 
 def install() -> None:
     """Install candidate-specific radar covariance support once."""
 
     global _INSTALLED, _ORIGINAL_EVENTS, _ORIGINAL_RADAR_MEASUREMENTS_TO_ENU
+    global _ORIGINAL_RADAR_ROW_TO_MEASUREMENT
     if _INSTALLED:
         return
 
@@ -39,11 +46,13 @@ def install() -> None:
 
     _ORIGINAL_EVENTS = association._events
     _ORIGINAL_RADAR_MEASUREMENTS_TO_ENU = aerpaw.radar_measurements_to_enu
+    _ORIGINAL_RADAR_ROW_TO_MEASUREMENT = association._radar_row_to_measurement
 
     association._events = _events_with_covariance
     association._nis_scored_candidates = _nis_scored_candidates_with_candidate_covariance
     association._row_covariance = row_radar_covariance
     association._pda_mixture_candidate = _pda_mixture_candidate_with_candidate_covariance
+    association._radar_row_to_measurement = _radar_row_to_measurement_with_runtime_config
     aerpaw.radar_measurements_to_enu = _radar_measurements_to_enu_with_candidate_covariance
 
     _INSTALLED = True
@@ -140,6 +149,45 @@ def _pda_mixture_candidate_with_candidate_covariance(
     return selected
 
 
+def _radar_row_to_measurement_with_runtime_config(
+    row: pd.Series,
+    covariance: np.ndarray,
+) -> Any:
+    """Convert one selected radar row using the configured update dimension."""
+
+    assert _ORIGINAL_RADAR_ROW_TO_MEASUREMENT is not None
+    if _radar_update_dimension() == "position":
+        return _ORIGINAL_RADAR_ROW_TO_MEASUREMENT(row, covariance)
+
+    from raft_uav.io import aerpaw
+
+    position = np.array([float(row["east_m"]), float(row["north_m"]), float(row["up_m"])])
+    velocity = aerpaw._radar_velocity_vector_enu(row)
+    if velocity is None:
+        _write_radar_update_diagnostics(row, dimension="position", velocity_used=False)
+        return _ORIGINAL_RADAR_ROW_TO_MEASUREMENT(row, covariance)
+
+    from raft_uav.baselines.kalman import TrackingMeasurement
+
+    position_covariance = row_radar_covariance(row, np.asarray(covariance, dtype=float))
+    velocity_std_mps = _radar_velocity_std_mps(default=12.0)
+    full_covariance = np.zeros((6, 6), dtype=float)
+    full_covariance[:3, :3] = position_covariance
+    full_covariance[3:, 3:] = np.diag([velocity_std_mps**2] * 3)
+    _write_radar_update_diagnostics(
+        row,
+        dimension="position-velocity",
+        velocity_used=True,
+        velocity_std_mps=velocity_std_mps,
+    )
+    return TrackingMeasurement(
+        time_s=float(row["time_s"]),
+        vector=np.concatenate([position, velocity]),
+        covariance=full_covariance,
+        source="radar",
+    )
+
+
 def _radar_measurements_to_enu_with_candidate_covariance(
     radar: pd.DataFrame,
     projector: Any | None = None,
@@ -159,19 +207,20 @@ def _radar_measurements_to_enu_with_candidate_covariance(
     frame = _annotate_radar(frame)
 
     fallback_position_covariance = fixed_radar_covariance(default_xy_std_m, default_z_std_m)
+    velocity_std_mps = _radar_velocity_std_mps(default=default_velocity_std_mps)
     measurements: list[TrackingMeasurement] = []
     for _, row in frame.iterrows():
         position = np.array([float(row["east_m"]), float(row["north_m"]), float(row["up_m"])])
         position_covariance = row_radar_covariance(row, fallback_position_covariance)
         velocity = aerpaw._radar_velocity_vector_enu(row)
-        if velocity is None:
+        if _radar_update_dimension() == "position" or velocity is None:
             vector = position
             covariance = position_covariance
         else:
             vector = np.concatenate([position, velocity])
             covariance = np.zeros((6, 6), dtype=float)
             covariance[:3, :3] = position_covariance
-            covariance[3:, 3:] = np.diag([default_velocity_std_mps**2] * 3)
+            covariance[3:, 3:] = np.diag([velocity_std_mps**2] * 3)
         measurements.append(
             TrackingMeasurement(
                 time_s=float(row["time_s"]),
@@ -181,3 +230,34 @@ def _radar_measurements_to_enu_with_candidate_covariance(
             )
         )
     return measurements
+
+
+def _radar_update_dimension() -> str:
+    value = os.environ.get(_RADAR_UPDATE_DIMENSION_ENV, "position").strip().lower()
+    if value not in _RADAR_UPDATE_DIMENSIONS:
+        raise ValueError(
+            f"{_RADAR_UPDATE_DIMENSION_ENV} must be one of {sorted(_RADAR_UPDATE_DIMENSIONS)}; "
+            f"got {value!r}"
+        )
+    return value
+
+
+def _radar_velocity_std_mps(*, default: float) -> float:
+    value = os.environ.get(_RADAR_VELOCITY_STD_MPS_ENV)
+    number = float(default if value is None or value == "" else value)
+    if not np.isfinite(number) or number <= 0.0:
+        raise ValueError(f"{_RADAR_VELOCITY_STD_MPS_ENV} must be finite and positive")
+    return number
+
+
+def _write_radar_update_diagnostics(
+    row: pd.Series,
+    *,
+    dimension: str,
+    velocity_used: bool,
+    velocity_std_mps: float | None = None,
+) -> None:
+    row["association_radar_update_dimension"] = dimension
+    row["association_radar_velocity_used"] = bool(velocity_used)
+    if velocity_std_mps is not None:
+        row["association_radar_velocity_std_mps"] = float(velocity_std_mps)
