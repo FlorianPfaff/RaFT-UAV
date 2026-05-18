@@ -61,6 +61,13 @@ RADAR_SELECTIONS = (
     "radar-oracle-nearest-truth",
     "radar-catprob-oracle-nearest",
 )
+RANGE_GATED_RADAR_SELECTIONS = (
+    "radar-longest-track-range-gated",
+    "radar-longest-continuous-track-range-gated",
+    "radar-longest-track-range-gated-interpolated",
+    "radar-stable-segments-range-gated",
+    "radar-stable-segments-range-gated-interpolated",
+)
 FUSION_ASSOCIATIONS = (
     "prediction-nis",
     "tracklet-viterbi",
@@ -191,9 +198,7 @@ def run_paper_table_diagnostic(
                 truth=truth,
                 selection=selection,
                 catprob_threshold=radar_catprob_threshold,
-                range_gate_m=radar_range_gate_m
-                if selection == "radar-longest-track-range-gated"
-                else None,
+                range_gate_m=radar_range_gate_m if selection in RANGE_GATED_RADAR_SELECTIONS else None,
                 max_time_delta_s=truth_time_gate_s,
             )
             rows.append(
