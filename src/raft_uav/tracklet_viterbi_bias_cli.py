@@ -6,7 +6,7 @@ import os
 import sys
 from pathlib import Path
 
-from raft_uav import tracklet_viterbi_cli as _tracklet_cli
+from raft_uav.calibration import bias_runtime
 from raft_uav.calibration.bias_runtime import BIAS_MODEL_ENV
 
 
@@ -17,7 +17,10 @@ def main(argv: list[str] | None = None) -> int:
     bias_model, remaining = _extract_bias_model(args)
     if bias_model is not None:
         os.environ[BIAS_MODEL_ENV] = str(bias_model)
-    return _tracklet_cli.main(remaining)
+        bias_runtime.install()
+    from raft_uav import tracklet_viterbi_cli
+
+    return tracklet_viterbi_cli.main(remaining)
 
 
 def _extract_bias_model(argv: list[str]) -> tuple[Path | None, list[str]]:
