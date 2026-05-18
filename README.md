@@ -88,6 +88,22 @@ Analyze online radar association against the diagnostic oracle on Opt1:
 python scripts/analyze_association_failures.py data/raw/AADM2025Dryad --flight Opt1
 ```
 
+Build a paper-style comparison table with the paper-compatible hard-gated
+fusion row:
+
+```bash
+python -m raft_uav.diagnostics.paper_table data/raw/AADM2025Dryad \
+  --flight Opt1 \
+  --fusion-association paper-compatible
+```
+
+The `paper-compatible` fusion path applies an 800 m radar range gate, radar
+class-probability thresholding, NIS gates for RF/radar updates, and records a
+radar `missed_detection` posterior when no radar candidate passes the hard
+preselector. The table also includes stable range-gated radar segment rows,
+including an interpolated full-frame diagnostic, to separate clean radar
+coverage from long-gap fill behavior.
+
 Run the Opt1-Opt3 radar candidate class-probability threshold ablation:
 
 ```bash
