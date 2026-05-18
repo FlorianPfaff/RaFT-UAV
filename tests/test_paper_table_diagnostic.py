@@ -3,6 +3,7 @@ import pandas as pd
 
 from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.diagnostics.paper_table import (
+    _normalize_radar_selections,
     metric_row,
     run_paper_compatible_cv_fusion,
     run_paper_longest_track_cv_fusion,
@@ -40,6 +41,23 @@ def test_metric_row_reports_paper_style_error_columns():
     assert row["track_switches"] == 1
     assert row["error_2d_mean_m"] == 2.5
     assert row["error_3d_max_m"] == 5.0
+
+
+def test_normalize_radar_selections_deduplicates_and_rejects_unknown_rows():
+    assert _normalize_radar_selections(
+        (
+            "radar-stable-segments-range-gated",
+            "radar-longest-track-range-gated",
+            "radar-stable-segments-range-gated",
+        )
+    ) == ("radar-stable-segments-range-gated", "radar-longest-track-range-gated")
+
+    try:
+        _normalize_radar_selections(("not-a-row",))
+    except ValueError as exc:
+        assert "unknown radar table selection" in str(exc)
+    else:
+        raise AssertionError("expected unknown radar selection to fail")
 
 
 def test_select_radar_for_table_oracle_picks_nearest_truth_per_frame():

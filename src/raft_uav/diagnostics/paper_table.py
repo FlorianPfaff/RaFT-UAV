@@ -104,6 +104,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--radar-range-gate-m", type=float, default=800.0)
     parser.add_argument("--stable-segment-min-frames", type=int, default=100)
     parser.add_argument("--stable-segment-max-transition-speed-mps", type=float, default=65.0)
+    parser.add_argument(
+        "--radar-selection",
+        action="append",
+        choices=RADAR_SELECTIONS,
+        default=None,
+        help="radar table row to include; repeat to limit the diagnostic to selected rows",
+    )
     parser.add_argument("--fusion-nis-gate-prob", type=float, default=0.99)
     parser.add_argument("--rf-nis-gate-prob", type=float, default=0.99)
     parser.add_argument("--truth-time-gate-s", type=float, default=2.0)
@@ -125,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         radar_range_gate_m=None if args.radar_range_gate_m <= 0.0 else args.radar_range_gate_m,
         stable_segment_min_frames=args.stable_segment_min_frames,
         stable_segment_max_transition_speed_mps=args.stable_segment_max_transition_speed_mps,
+        radar_selections=tuple(args.radar_selection or RADAR_SELECTIONS),
         fusion_nis_gate_prob=args.fusion_nis_gate_prob,
         rf_nis_gate_prob=args.rf_nis_gate_prob,
         truth_time_gate_s=args.truth_time_gate_s,
@@ -149,6 +157,7 @@ def run_paper_table_diagnostic(
     radar_range_gate_m: float | None = 800.0,
     stable_segment_min_frames: int = 100,
     stable_segment_max_transition_speed_mps: float = 65.0,
+    radar_selections: tuple[str, ...] = RADAR_SELECTIONS,
     fusion_nis_gate_prob: float = 0.99,
     rf_nis_gate_prob: float = 0.99,
     truth_time_gate_s: float = 2.0,
@@ -163,6 +172,7 @@ def run_paper_table_diagnostic(
         raise ValueError("stable_segment_min_frames must be positive")
     if stable_segment_max_transition_speed_mps <= 0.0:
         raise ValueError("stable_segment_max_transition_speed_mps must be positive")
+    radar_selections = _normalize_radar_selections(radar_selections)
 
     flight = select_flight(Path(dataset_root), flight_name)
     if flight.truth_txt is None:
@@ -203,7 +213,7 @@ def run_paper_table_diagnostic(
             )
         )
     if not radar.empty:
-        for selection in RADAR_SELECTIONS:
+        for selection in radar_selections:
             selected = select_radar_for_table(
                 radar=radar,
                 truth=truth,
@@ -262,6 +272,7 @@ def run_paper_table_diagnostic(
         "radar_range_gate_m": None if radar_range_gate_m is None else float(radar_range_gate_m),
         "stable_segment_min_frames": int(stable_segment_min_frames),
         "stable_segment_max_transition_speed_mps": float(stable_segment_max_transition_speed_mps),
+        "radar_selections": list(radar_selections),
         "fusion_nis_gate_prob": float(fusion_nis_gate_prob),
         "rf_nis_gate_prob": float(rf_nis_gate_prob),
         "truth_time_gate_s": float(truth_time_gate_s),
@@ -358,6 +369,19 @@ def fusion_rows(
         )
     )
     return rows
+
+
+def _normalize_radar_selections(selections: tuple[str, ...]) -> tuple[str, ...]:
+    """Return valid radar selections with duplicates removed in request order."""
+
+    normalized: list[str] = []
+    valid = set(RADAR_SELECTIONS)
+    for selection in selections:
+        if selection not in valid:
+            raise ValueError(f"unknown radar table selection {selection!r}")
+        if selection not in normalized:
+            normalized.append(selection)
+    return tuple(normalized)
 
 
 def select_radar_for_table(
