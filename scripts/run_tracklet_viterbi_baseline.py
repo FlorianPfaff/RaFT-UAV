@@ -114,6 +114,7 @@ def main(argv: list[str] | None = None) -> int:
     records = result.records
     selected_radar = result.accepted_radar
     viterbi_selected_radar = result.viterbi_selected_radar
+    radar_candidate_ledger = result.radar_candidate_ledger
     if not records:
         raise RuntimeError(f"{flight.name} produced no posterior records")
 
@@ -143,12 +144,20 @@ def main(argv: list[str] | None = None) -> int:
         viterbi_selected_radar_diagnostics,
         args,
     )
+    metrics["radar_candidate_ledger_rows"] = int(len(radar_candidate_ledger))
+    if "association_viterbi_selected" in radar_candidate_ledger.columns:
+        metrics["radar_candidate_ledger_selected_rows"] = int(
+            radar_candidate_ledger["association_viterbi_selected"].astype(bool).sum()
+        )
+    else:
+        metrics["radar_candidate_ledger_selected_rows"] = 0
 
     out = args.output_dir / flight.name
     out.mkdir(parents=True, exist_ok=True)
     estimates.to_csv(out / "estimates.csv", index=False)
     selected_radar.to_csv(out / "selected_radar.csv", index=False)
     viterbi_selected_radar.to_csv(out / "viterbi_selected_radar.csv", index=False)
+    radar_candidate_ledger.to_csv(out / "radar_candidate_ledger.csv", index=False)
     (out / "selected_radar_diagnostics.json").write_text(
         json.dumps(selected_radar_diagnostics, indent=2),
         encoding="utf-8",
@@ -167,6 +176,8 @@ def main(argv: list[str] | None = None) -> int:
     print(f"viterbi_selected_radar_rows={len(viterbi_selected_radar)}")
     print(f"viterbi_selected_radar_csv={out / 'viterbi_selected_radar.csv'}")
     print(f"viterbi_selected_radar_diagnostics_json={out / 'viterbi_selected_radar_diagnostics.json'}")
+    print(f"radar_candidate_ledger_rows={len(radar_candidate_ledger)}")
+    print(f"radar_candidate_ledger_csv={out / 'radar_candidate_ledger.csv'}")
     print(f"rmse_3d_m={metrics['position_error_3d']['rmse_m']:.3f}")
     print(f"p95_3d_m={metrics['position_error_3d']['p95_m']:.3f}")
     selected_rmse = selected_radar_diagnostics["position_error_3d"]["rmse_m"]
