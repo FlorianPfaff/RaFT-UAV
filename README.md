@@ -114,6 +114,14 @@ Run the Opt1-Opt3 radar candidate class-probability threshold ablation:
 python scripts/run_candidate_threshold_ablation.py data/raw/AADM2025Dryad --thresholds 0.4 0.5
 ```
 
+Sweep the stable radar segment diagnostic without running fusion or oracle rows:
+
+```bash
+python scripts/run_stable_radar_segment_ablation.py data/raw/AADM2025Dryad \
+  --min-segment-frames 75 100 150 \
+  --max-transition-speeds-mps 35 65 100
+```
+
 Run the Opt1-Opt3 PDA-mixture association ablation:
 
 ```bash
