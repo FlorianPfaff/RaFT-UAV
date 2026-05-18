@@ -252,9 +252,7 @@ def select_radar_measurement_rows(
     if selection == "all":
         return radar.copy()
     if selection == "catprob":
-        if "cat_prob_uav" not in radar.columns:
-            raise KeyError("radar catprob selection requires cat_prob_uav")
-        return radar.loc[radar["cat_prob_uav"] >= float(catprob_threshold)].copy()
+        return _catprob_selected_rows(radar, catprob_threshold)
     if selection == "truth-gated":
         if truth is None:
             raise ValueError("truth-gated radar selection requires normalized truth")
@@ -449,6 +447,33 @@ def _flatten_track(
         "cat_prob_uav": _list_get(cat_prob, 0),
         "cat_prob_raw": cat_prob,
     }
+
+
+def _catprob_selected_rows(radar: pd.DataFrame, catprob_threshold: float) -> pd.DataFrame:
+    """Select the highest-UAV-probability radar row per frame."""
+
+    if "cat_prob_uav" not in radar.columns:
+        raise KeyError("radar catprob selection requires cat_prob_uav")
+
+    scores = pd.to_numeric(radar["cat_prob_uav"], errors="coerce")
+    candidates = radar.loc[scores >= float(catprob_threshold)].copy()
+    if candidates.empty:
+        return candidates
+
+    if "frame_index" in candidates.columns:
+        group_key = "frame_index"
+    elif "time_s" in candidates.columns:
+        group_key = "time_s"
+    else:
+        raise KeyError("radar catprob selection requires frame_index or time_s")
+
+    score_column = "_catprob_score_for_selection"
+    while score_column in candidates.columns:
+        score_column = f"_{score_column}"
+    candidates[score_column] = scores.loc[candidates.index]
+    selected_index = candidates.groupby(group_key, sort=False, dropna=False)[score_column].idxmax()
+    selected = candidates.loc[selected_index].drop(columns=score_column)
+    return selected.sort_index().copy()
 
 
 def _truth_gated_rows(
