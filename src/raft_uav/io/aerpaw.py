@@ -13,7 +13,11 @@ import pandas as pd
 from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.coordinates import LocalENUProjector
 
-SENSOR_CLOCK_OFFSET_S = -4.0 * 60.0 * 60.0
+DEFAULT_SENSOR_CLOCK_OFFSET_S = -4.0 * 60.0 * 60.0
+DEFAULT_RF_CLOCK_OFFSET_S = DEFAULT_SENSOR_CLOCK_OFFSET_S
+DEFAULT_RADAR_CLOCK_OFFSET_S = DEFAULT_SENSOR_CLOCK_OFFSET_S
+# Backward-compatible alias for callers that imported the historical shared name.
+SENSOR_CLOCK_OFFSET_S = DEFAULT_SENSOR_CLOCK_OFFSET_S
 TRUTH_COLUMNS = [
     "sample",
     "longitude",
@@ -154,13 +158,19 @@ def normalize_rf(
     projector: LocalENUProjector,
     truth_origin_time: pd.Timestamp,
     default_std_m: float = 75.0,
+    clock_offset_s: float = DEFAULT_RF_CLOCK_OFFSET_S,
 ) -> pd.DataFrame:
-    """Normalize RF rows to truth-relative time and local ENU coordinates."""
+    """Normalize RF rows to truth-relative time and local ENU coordinates.
+
+    ``clock_offset_s`` is added to each RF timestamp before converting to the
+    truth-relative timeline. RF and radar offsets are intentionally independent
+    because the raw sensors can encode time in different reference frames.
+    """
 
     out = rf.copy()
     out["timestamp_raw"] = out["Time"].astype(str)
     out["timestamp"] = pd.to_datetime(out["Time"], errors="coerce") + pd.to_timedelta(
-        SENSOR_CLOCK_OFFSET_S, unit="s"
+        clock_offset_s, unit="s"
     )
     out["time_s"] = (out["timestamp"] - truth_origin_time).dt.total_seconds()
 
@@ -199,8 +209,14 @@ def normalize_radar(
     radar: pd.DataFrame,
     projector: LocalENUProjector,
     truth_origin_time: pd.Timestamp,
+    clock_offset_s: float = DEFAULT_RADAR_CLOCK_OFFSET_S,
 ) -> pd.DataFrame:
-    """Normalize radar track rows to truth-relative time and local ENU coordinates."""
+    """Normalize radar track rows to truth-relative time and local ENU coordinates.
+
+    ``clock_offset_s`` is added to each Fortem ``globalTime`` timestamp before
+    converting to the truth-relative timeline. This offset is independent of the
+    RF offset to avoid silently coupling two different sensor clocks.
+    """
 
     out = radar.copy()
     if out.empty:
@@ -209,7 +225,7 @@ def normalize_radar(
 
     out["timestamp_raw"] = out["global_time_raw_s"]
     out["timestamp"] = pd.to_datetime(out["global_time_raw_s"], unit="s", errors="coerce")
-    out["timestamp"] = out["timestamp"] + pd.to_timedelta(SENSOR_CLOCK_OFFSET_S, unit="s")
+    out["timestamp"] = out["timestamp"] + pd.to_timedelta(clock_offset_s, unit="s")
     out["time_s"] = (out["timestamp"] - truth_origin_time).dt.total_seconds()
 
     for column in ["latitude", "longitude", "altitude_m", "cat_prob_uav", "track_id"]:
@@ -295,6 +311,7 @@ def rf_measurements_to_enu(
     projector: LocalENUProjector | None = None,
     truth_origin_time: pd.Timestamp | None = None,
     default_std_m: float = 75.0,
+    clock_offset_s: float = DEFAULT_RF_CLOCK_OFFSET_S,
 ) -> list[TrackingMeasurement]:
     """Convert RF localization rows to 2D ENU measurements."""
 
@@ -302,7 +319,13 @@ def rf_measurements_to_enu(
     if "east_m" not in frame.columns:
         if projector is None or truth_origin_time is None:
             raise ValueError("raw RF rows require projector and truth_origin_time")
-        frame = normalize_rf(frame, projector, truth_origin_time, default_std_m=default_std_m)
+        frame = normalize_rf(
+            frame,
+            projector,
+            truth_origin_time,
+            default_std_m=default_std_m,
+            clock_offset_s=clock_offset_s,
+        )
 
     measurements: list[TrackingMeasurement] = []
     for _, row in frame.iterrows():
@@ -326,6 +349,7 @@ def radar_measurements_to_enu(
     default_z_std_m: float = 35.0,
     default_velocity_std_mps: float = 12.0,
     include_velocity: bool = False,
+    clock_offset_s: float = DEFAULT_RADAR_CLOCK_OFFSET_S,
 ) -> list[TrackingMeasurement]:
     """Convert radar track rows to ENU measurements.
 
@@ -340,7 +364,12 @@ def radar_measurements_to_enu(
     if "east_m" not in frame.columns:
         if projector is None or truth_origin_time is None:
             raise ValueError("raw radar rows require projector and truth_origin_time")
-        frame = normalize_radar(frame, projector, truth_origin_time)
+        frame = normalize_radar(
+            frame,
+            projector,
+            truth_origin_time,
+            clock_offset_s=clock_offset_s,
+        )
 
     position_covariance = np.diag(
         [default_xy_std_m**2, default_xy_std_m**2, default_z_std_m**2]
@@ -385,7 +414,12 @@ def _radar_velocity_vector_enu(row: pd.Series) -> np.ndarray | None:
     return velocity if np.isfinite(velocity).all() else None
 
 
-def summarize_flight_schema(flight: FlightPaths) -> dict[str, Any]:
+def summarize_flight_schema(
+    flight: FlightPaths,
+    *,
+    rf_clock_offset_s: float = DEFAULT_RF_CLOCK_OFFSET_S,
+    radar_clock_offset_s: float = DEFAULT_RADAR_CLOCK_OFFSET_S,
+) -> dict[str, Any]:
     """Return row counts, columns, and time ranges for one discovered flight."""
 
     summary: dict[str, Any] = {"flight": flight.name, "root": str(flight.root)}
@@ -401,14 +435,32 @@ def summarize_flight_schema(flight: FlightPaths) -> dict[str, Any]:
 
     if flight.rf_csv is not None:
         rf_raw = read_rf_csv(flight.rf_csv)
-        rf = normalize_rf(rf_raw, projector, origin_time) if projector and origin_time else rf_raw
+        rf = (
+            normalize_rf(
+                rf_raw,
+                projector,
+                origin_time,
+                clock_offset_s=rf_clock_offset_s,
+            )
+            if projector and origin_time
+            else rf_raw
+        )
         summary["rf"] = _frame_summary(flight.rf_csv, rf, "timestamp_raw")
     else:
         summary["rf"] = None
 
     if flight.radar_json is not None:
         radar_raw = read_radar_tracks_json(flight.radar_json)
-        radar = normalize_radar(radar_raw, projector, origin_time) if projector and origin_time else radar_raw
+        radar = (
+            normalize_radar(
+                radar_raw,
+                projector,
+                origin_time,
+                clock_offset_s=radar_clock_offset_s,
+            )
+            if projector and origin_time
+            else radar_raw
+        )
         summary["radar"] = _frame_summary(flight.radar_json, radar, "timestamp_raw")
         if "track_id" in radar.columns:
             ids = sorted(int(value) for value in radar["track_id"].dropna().unique())
