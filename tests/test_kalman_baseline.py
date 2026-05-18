@@ -24,6 +24,25 @@ def test_process_noise_is_symmetric():
     np.testing.assert_allclose(covariance, covariance.T)
 
 
+def test_process_noise_matches_continuous_white_acceleration_model():
+    covariance = white_acceleration_process_noise(2.0, 3.0)
+    expected_block = np.array(
+        [
+            [24.0, 18.0],
+            [18.0, 18.0],
+        ]
+    )
+
+    for position_index, velocity_index in ((0, 3), (1, 4), (2, 5)):
+        np.testing.assert_allclose(
+            covariance[np.ix_([position_index, velocity_index], [position_index, velocity_index])],
+            expected_block,
+        )
+
+    assert covariance[0, 1] == 0.0
+    assert covariance[3, 4] == 0.0
+
+
 def test_async_cv_baseline_returns_one_record_per_measurement():
     covariance = np.diag([10.0, 10.0, 10.0])
     measurements = [

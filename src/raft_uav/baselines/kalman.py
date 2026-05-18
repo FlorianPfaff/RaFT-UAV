@@ -99,14 +99,20 @@ def constant_velocity_matrix(dt_s: float) -> np.ndarray:
 
 
 def white_acceleration_process_noise(dt_s: float, acceleration_std: float) -> np.ndarray:
-    """Return continuous white-acceleration process noise discretized for 3D CV."""
+    """Return discretized continuous white-acceleration noise for 3D CV.
+
+    ``acceleration_std`` is the square-root spectral density used by the
+    continuous-time white-acceleration model. For one position/velocity axis,
+    the discretized covariance is ``q * [[dt**3 / 3, dt**2 / 2], [dt**2 / 2,
+    dt]]`` with ``q = acceleration_std**2``.
+    """
 
     dt = float(dt_s)
     q = float(acceleration_std) ** 2
     block = q * np.array(
         [
-            [dt**4 / 4.0, dt**3 / 2.0],
-            [dt**3 / 2.0, dt**2],
+            [dt**3 / 3.0, dt**2 / 2.0],
+            [dt**2 / 2.0, dt],
         ]
     )
     covariance = np.zeros((6, 6))
