@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 
@@ -234,6 +235,54 @@ def test_aggregate_and_ranking_rows_sort_by_mean_then_tail() -> None:
     assert low_coverage["pareto_front"] is True
     dominated = next(row for row in ranking_rows if row["config"] == "dominated")
     assert dominated["pareto_front"] is False
+
+
+def test_recommendation_payload_selects_decision_rows(tmp_path: Path) -> None:
+    ranking_rows = [
+        {
+            "rank": 1,
+            "eligible_for_recommendation": True,
+            "ranking_min_coverage": 0.95,
+            "method": "radar-stable-segments-range-gated-interpolated",
+            "config": "stable_full",
+            "coverage": 1.0,
+            "coverage_penalized_error_3d_mean_m": 80.0,
+            "coverage_penalized_error_3d_p95_m": 150.0,
+            "pareto_front": True,
+            "error_3d_mean_m": 80.0,
+            "error_3d_p95_m": 150.0,
+        },
+        {
+            "rank": 2,
+            "eligible_for_recommendation": False,
+            "ranking_min_coverage": 0.95,
+            "method": "radar-longest-track-range-gated",
+            "config": "partial_clean",
+            "coverage": 0.4,
+            "coverage_penalized_error_3d_mean_m": 100.0,
+            "coverage_penalized_error_3d_p95_m": 200.0,
+            "pareto_front": True,
+            "error_3d_mean_m": 40.0,
+            "error_3d_p95_m": 80.0,
+        },
+    ]
+
+    payload = ablation._recommendation_payload(
+        ranking_rows,
+        summary_output=tmp_path / "summary.csv",
+        ranking_output=tmp_path / "ranking.csv",
+        min_coverage=0.95,
+    )
+    output = tmp_path / "recommendation.json"
+    ablation._write_recommendation(output, payload)
+    loaded = json.loads(output.read_text(encoding="utf-8"))
+
+    assert loaded["schema_version"] == 1
+    assert loaded["ranking_rows"] == 2
+    assert loaded["eligible_rows"] == 1
+    assert loaded["pareto_front_rows"] == 2
+    assert loaded["best_eligible"]["config"] == "stable_full"
+    assert loaded["best_ineligible_pareto_front"]["config"] == "partial_clean"
 
 
 def test_validate_args_rejects_empty_and_nonpositive_grids() -> None:

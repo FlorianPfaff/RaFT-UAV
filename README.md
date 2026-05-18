@@ -127,7 +127,8 @@ separate ranking CSV next to it for quickly identifying the best knob setting.
 Ranking defaults to `--ranking-min-coverage 0.95`, so low-coverage rows remain
 visible but are not treated as recommendation-eligible. Ranking rows also
 include coverage-penalized error columns and a Pareto-front flag for comparing
-coverage/error tradeoffs.
+coverage/error tradeoffs. A compact recommendation JSON is written next to the
+summary and ranking CSVs for workflow and paper-note automation.
 
 Run the Opt1-Opt3 PDA-mixture association ablation:
 

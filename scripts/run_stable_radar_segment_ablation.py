@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import itertools
+import json
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -105,6 +107,7 @@ def main() -> int:
     parser.add_argument("--min-segment-frames", nargs="*", type=int, default=[75, 100, 150])
     parser.add_argument("--max-transition-speeds-mps", nargs="*", type=float, default=[35.0, 65.0, 100.0])
     parser.add_argument("--ranking-output", type=Path, default=None)
+    parser.add_argument("--recommendation-output", type=Path, default=None)
     parser.add_argument(
         "--ranking-min-coverage",
         type=float,
@@ -143,10 +146,23 @@ def main() -> int:
     ranking_output = args.ranking_output or args.summary_output.with_name(
         f"{args.summary_output.stem}_ranking.csv"
     )
+    recommendation_output = args.recommendation_output or args.summary_output.with_name(
+        f"{args.summary_output.stem}_recommendation.json"
+    )
     _write_summary(args.summary_output, [*rows, *aggregate_rows])
     _write_ranking(ranking_output, ranking_rows)
+    _write_recommendation(
+        recommendation_output,
+        _recommendation_payload(
+            ranking_rows,
+            summary_output=args.summary_output,
+            ranking_output=ranking_output,
+            min_coverage=args.ranking_min_coverage,
+        ),
+    )
     print(f"wrote {len(rows) + len(aggregate_rows)} rows to {args.summary_output}")
     print(f"wrote {len(ranking_rows)} ranking rows to {ranking_output}")
+    print(f"wrote recommendation to {recommendation_output}")
     return 0
 
 
@@ -319,6 +335,54 @@ def _ranking_candidates(
     return rows
 
 
+def _recommendation_payload(
+    ranking_rows: list[dict[str, object]],
+    *,
+    summary_output: Path,
+    ranking_output: Path,
+    min_coverage: float,
+) -> dict[str, object]:
+    """Return a compact JSON payload for downstream paper/workflow decisions."""
+
+    best_eligible = _first_row(
+        ranking_rows,
+        lambda row: bool(row.get("eligible_for_recommendation")),
+    )
+    best_pareto = _first_row(
+        ranking_rows,
+        lambda row: bool(row.get("pareto_front")),
+    )
+    best_ineligible_pareto = _first_row(
+        ranking_rows,
+        lambda row: bool(row.get("pareto_front"))
+        and not bool(row.get("eligible_for_recommendation")),
+    )
+    return {
+        "schema_version": 1,
+        "summary_csv": str(summary_output),
+        "ranking_csv": str(ranking_output),
+        "ranking_min_coverage": float(min_coverage),
+        "ranking_rows": int(len(ranking_rows)),
+        "eligible_rows": int(
+            sum(bool(row.get("eligible_for_recommendation")) for row in ranking_rows)
+        ),
+        "pareto_front_rows": int(sum(bool(row.get("pareto_front")) for row in ranking_rows)),
+        "best_eligible": _json_row(best_eligible),
+        "best_pareto_front": _json_row(best_pareto),
+        "best_ineligible_pareto_front": _json_row(best_ineligible_pareto),
+    }
+
+
+def _first_row(
+    rows: list[dict[str, object]],
+    predicate: Callable[[dict[str, object]], bool],
+) -> dict[str, object] | None:
+    for row in rows:
+        if predicate(row):
+            return row
+    return None
+
+
 def _pareto_front_flags(rows: list[dict[str, object]]) -> list[bool]:
     """Mark rows not dominated on mean error, tail error, and coverage."""
 
@@ -401,6 +465,20 @@ def _csv_value(value: Any) -> object:
     return value
 
 
+def _json_row(row: dict[str, object] | None) -> dict[str, object] | None:
+    if row is None:
+        return None
+    return {key: _json_value(value) for key, value in row.items()}
+
+
+def _json_value(value: object) -> object:
+    if pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        return value.item()
+    return value
+
+
 def _write_summary(path: Path, rows: list[dict[str, object]]) -> None:
     if not rows:
         raise RuntimeError("No stable radar segment ablation rows were produced")
@@ -413,6 +491,11 @@ def _write_ranking(path: Path, rows: list[dict[str, object]]) -> None:
         raise RuntimeError("No stable radar segment ranking rows were produced")
     path.parent.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows, columns=list(RANKING_COLUMNS)).to_csv(path, index=False)
+
+
+def _write_recommendation(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 if __name__ == "__main__":
