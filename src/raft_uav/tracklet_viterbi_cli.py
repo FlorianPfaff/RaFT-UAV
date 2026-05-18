@@ -1,10 +1,10 @@
-"""Command-line wrapper that enables the tracklet-Viterbi radar association mode.
+"""Canonical command-line entry point with tracklet-Viterbi association enabled.
 
-This module reuses :mod:`raft_uav.cli` and patches only its in-process radar
-association dispatcher before argument parsing.  It keeps the default
-``raft-uav`` entry point unchanged while exposing the experimental
-sequence-level association method through ``raft-uav-tracklet-viterbi`` or
-``python -m raft_uav.tracklet_viterbi_cli``.
+The installed ``raft-uav`` command routes through this module.  It reuses
+:mod:`raft_uav.cli`, registers ``tracklet-viterbi`` as an additional radar
+association mode, and forwards all non-tracklet modes to the base dispatcher.
+The ``raft-uav-tracklet-viterbi`` command remains as a compatibility alias for
+older experiment notes.
 
 Controlled ablation runs can select the base, retention-aware, or
 range-covariance-aware implementation through environment variables. This
@@ -56,6 +56,12 @@ class _TrackletConfigOverlay:
         return getattr(self._base, name)
 
 
+def enabled_radar_association_modes() -> tuple[str, ...]:
+    """Return base radar association modes plus the canonical tracklet mode."""
+
+    return tuple(dict.fromkeys((*_BASE_RADAR_ASSOCIATION_MODES, _TRACKLET_MODE)))
+
+
 def run_async_cv_baseline_with_radar_association(
     *,
     rf_measurements: Iterable[TrackingMeasurement],
@@ -90,7 +96,7 @@ def run_async_cv_baseline_with_radar_association(
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
-    """Dispatch to the experimental tracklet-Viterbi runner when requested."""
+    """Dispatch to the tracklet-Viterbi runner when requested."""
 
     if association == _TRACKLET_MODE:
         del truth, track_switch_nis_ratio, geometry_velocity_std_mps
@@ -205,10 +211,9 @@ def _env_int(name: str, default: int) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the standard CLI with the experimental association mode enabled."""
+    """Run the standard CLI with tracklet-Viterbi association enabled."""
 
-    modes = tuple(dict.fromkeys((*_BASE_RADAR_ASSOCIATION_MODES, _TRACKLET_MODE)))
-    _base_cli.RADAR_ASSOCIATION_MODES = modes
+    _base_cli.RADAR_ASSOCIATION_MODES = enabled_radar_association_modes()
     _base_cli.run_async_cv_baseline_with_radar_association = (
         run_async_cv_baseline_with_radar_association
     )
