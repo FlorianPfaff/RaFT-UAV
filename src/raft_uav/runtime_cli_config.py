@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 RADAR_COVARIANCE_MODES = ("fixed", "range-angle")
+RADAR_UPDATE_DIMENSIONS = ("position", "position-velocity")
 
 
 def add_runtime_configuration_arguments(parser: argparse.ArgumentParser) -> None:
@@ -24,6 +25,23 @@ def add_runtime_configuration_arguments(parser: argparse.ArgumentParser) -> None
     radar.add_argument("--radar-origin-east-m", type=float, default=0.0)
     radar.add_argument("--radar-origin-north-m", type=float, default=0.0)
     radar.add_argument("--radar-origin-up-m", type=float, default=0.0)
+
+    radar_update = parser.add_argument_group("radar measurement update runtime configuration")
+    radar_update.add_argument(
+        "--radar-update-dimension",
+        choices=RADAR_UPDATE_DIMENSIONS,
+        default="position",
+        help=(
+            "radar Kalman update vector; position preserves the historical 3D "
+            "update, position-velocity also conditions on Fortem velocityNed"
+        ),
+    )
+    radar_update.add_argument(
+        "--radar-velocity-std-mps",
+        type=float,
+        default=12.0,
+        help="per-axis standard deviation for Fortem velocity components in 6D radar updates",
+    )
 
     tracklet = parser.add_argument_group("tracklet-viterbi runtime configuration")
     tracklet.add_argument("--tracklet-max-candidates", type=int, default=8)
@@ -74,6 +92,13 @@ def runtime_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     if radar["max_std_m"] < radar["min_std_m"]:
         raise ValueError("radar_covariance_max_std_m must be >= radar_covariance_min_std_m")
 
+    radar_update = {
+        "dimension": str(args.radar_update_dimension),
+        "velocity_std_mps": _positive_float(args.radar_velocity_std_mps, "radar_velocity_std_mps"),
+    }
+    if radar_update["dimension"] not in RADAR_UPDATE_DIMENSIONS:
+        raise ValueError(f"radar_update_dimension must be one of {RADAR_UPDATE_DIMENSIONS}")
+
     tracklet = {
         "max_candidates": _positive_int(args.tracklet_max_candidates, "tracklet_max_candidates"),
         "missed_detection_cost": _positive_float(args.tracklet_missed_detection_cost, "tracklet_missed_detection_cost"),
@@ -94,13 +119,14 @@ def runtime_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
         "range_penalty": _nonnegative_float(args.tracklet_range_penalty, "tracklet_range_penalty"),
         "use_rf_anchor": not bool(args.disable_tracklet_rf_anchor),
     }
-    return {"radar_covariance": radar, "tracklet_viterbi": tracklet}
+    return {"radar_covariance": radar, "radar_update": radar_update, "tracklet_viterbi": tracklet}
 
 
 def apply_runtime_environment(runtime_config: dict[str, Any]) -> None:
     """Apply CLI runtime config to the existing RAFT_UAV_* runtime layer."""
 
     radar = runtime_config["radar_covariance"]
+    radar_update = runtime_config["radar_update"]
     tracklet = runtime_config["tracklet_viterbi"]
     mapping = {
         "RAFT_UAV_RADAR_COVARIANCE_MODE": radar["mode"],
@@ -114,6 +140,8 @@ def apply_runtime_environment(runtime_config: dict[str, Any]) -> None:
         "RAFT_UAV_RADAR_ORIGIN_EAST_M": radar["origin_east_m"],
         "RAFT_UAV_RADAR_ORIGIN_NORTH_M": radar["origin_north_m"],
         "RAFT_UAV_RADAR_ORIGIN_UP_M": radar["origin_up_m"],
+        "RAFT_UAV_RADAR_UPDATE_DIMENSION": radar_update["dimension"],
+        "RAFT_UAV_RADAR_VELOCITY_STD_MPS": radar_update["velocity_std_mps"],
         "RAFT_UAV_TRACKLET_MAX_CANDIDATES": tracklet["max_candidates"],
         "RAFT_UAV_TRACKLET_MISSED_DETECTION_COST": tracklet["missed_detection_cost"],
         "RAFT_UAV_TRACKLET_CONSECUTIVE_MISS_COST": tracklet["consecutive_miss_cost"],
