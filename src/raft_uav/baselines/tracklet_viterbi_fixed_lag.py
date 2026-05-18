@@ -199,8 +199,8 @@ def select_fixed_lag_tracklet_viterbi_path(
         row["association_lag_window_radar_count"] = int(
             sum(event.get("kind") == "radar" for event in local_events)
         )
-        row["association_prefix_constrained"] = bool(previous_committed is not None)
         if previous_committed is not None:
+            row["association_prefix_constrained"] = True
             row["association_prefix_track_id"] = previous_committed.get("track_id", np.nan)
             row["association_prefix_time_s"] = prefix_time_s
         committed[event_key] = row
