@@ -8,6 +8,8 @@ from raft_uav.baselines.tracklet_viterbi import TrackletViterbiAssociationConfig
 from raft_uav.baselines.tracklet_viterbi_retention import (
     _catprob_threshold_penalty,
     _nodes_for_radar_frame_with_track_retention,
+    _select_tracklet_viterbi_path,
+    _track_support_by_event_prefix,
     _track_support_by_id,
     _track_support_cost,
 )
@@ -119,6 +121,79 @@ def test_track_support_prior_rewards_longer_continuous_tracks() -> None:
     assert long_support["count"] == 4.0
     assert long_support["continuity"] == 1.0
     assert long_cost < short_cost
+
+
+def test_track_support_by_event_prefix_excludes_current_and_future_frames() -> None:
+    events = [
+        {"kind": "radar", "time_s": 0.0, "candidates": _radar_frame(0, [{"track_id": 2}])},
+        {"kind": "radar", "time_s": 1.0, "candidates": _radar_frame(1, [{"track_id": 2}])},
+        {"kind": "radar", "time_s": 2.0, "candidates": _radar_frame(2, [{"track_id": 2}])},
+    ]
+
+    support_by_event = _track_support_by_event_prefix(events)
+
+    assert support_by_event[0] == {}
+    assert support_by_event[1][2]["count"] == 1.0
+    assert support_by_event[1][2]["span_s"] == 0.0
+    assert support_by_event[2][2]["count"] == 2.0
+    assert support_by_event[2][2]["span_s"] == 1.0
+
+
+def test_retention_viterbi_uses_prefix_track_support_by_event() -> None:
+    events = [
+        {
+            "kind": "radar",
+            "time_s": 0.0,
+            "candidates": _radar_frame(
+                0,
+                [{"track_id": 2, "east_m": 0.0, "north_m": 0.0, "cat_prob_uav": 1.0}],
+            ),
+        },
+        {
+            "kind": "radar",
+            "time_s": 1.0,
+            "candidates": _radar_frame(
+                1,
+                [{"track_id": 2, "east_m": 0.0, "north_m": 0.0, "cat_prob_uav": 1.0}],
+            ),
+        },
+        {
+            "kind": "radar",
+            "time_s": 2.0,
+            "candidates": _radar_frame(
+                2,
+                [{"track_id": 2, "east_m": 0.0, "north_m": 0.0, "cat_prob_uav": 1.0}],
+            ),
+        },
+    ]
+    config = TrackletViterbiAssociationConfig(
+        max_candidates_per_frame=1,
+        missed_detection_cost=100.0,
+        consecutive_miss_cost=0.0,
+        track_switch_cost=0.0,
+        missing_track_id_cost=0.0,
+        catprob_weight=0.0,
+        anchor_nis_weight=0.0,
+        transition_nis_weight=0.0,
+        velocity_nis_weight=0.0,
+        max_speed_penalty=0.0,
+        range_gate_m=None,
+    )
+
+    selected = _select_tracklet_viterbi_path(
+        events=events,
+        anchors={},
+        covariance=np.eye(3),
+        candidate_catprob_threshold=None,
+        config=config,
+        track_support_by_event=_track_support_by_event_prefix(events),
+    )
+
+    support_counts = {
+        int(row["frame_index"]): float(row["association_track_support_count"])
+        for row in selected
+    }
+    assert support_counts == {0: 0.0, 1: 1.0, 2: 2.0}
 
 
 def test_track_support_diagnostics_are_added_to_retained_rows() -> None:
