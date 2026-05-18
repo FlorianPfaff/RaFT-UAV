@@ -15,6 +15,8 @@ import os
 import numpy as np
 import pandas as pd
 
+from raft_uav.calibration.bias import BIAS_RESIDUAL_STD_COLUMN_PREFIX
+
 RADAR_COVARIANCE_COLUMNS = (
     "association_cov_ee",
     "association_cov_nn",
@@ -23,6 +25,12 @@ RADAR_COVARIANCE_COLUMNS = (
     "association_cov_eu",
     "association_cov_nu",
 )
+BIAS_RESIDUAL_COVARIANCE_COLUMNS = (
+    f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}east_m",
+    f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}north_m",
+    f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}up_m",
+)
+BIAS_RESIDUAL_INCLUDED_COLUMN = "association_cov_includes_bias_residual"
 
 
 @dataclass(frozen=True)
@@ -135,10 +143,18 @@ def append_radar_covariance_columns(
     out = radar.copy()
     covariances: list[np.ndarray] = []
     used_ranges: list[float] = []
+    includes_bias_residual: list[bool] = []
     for _, row in out.iterrows():
         covariance, used_range_m = range_angle_radar_covariance(row, cfg)
+        covariance, included_bias = _add_bias_residual_uncertainty(
+            row,
+            covariance,
+            min_std_m=1.0e-6,
+            max_std_m=float(cfg.max_std_m),
+        )
         covariances.append(covariance)
         used_ranges.append(float(used_range_m))
+        includes_bias_residual.append(bool(included_bias))
 
     out["association_cov_ee"] = [float(cov[0, 0]) for cov in covariances]
     out["association_cov_nn"] = [float(cov[1, 1]) for cov in covariances]
@@ -149,6 +165,7 @@ def append_radar_covariance_columns(
     out["association_covariance_mode"] = cfg.mode
     out["association_cov_range_m"] = used_ranges
     out["association_cov_trace_m2"] = [float(np.trace(cov)) for cov in covariances]
+    out[BIAS_RESIDUAL_INCLUDED_COLUMN] = includes_bias_residual
     return out
 
 
@@ -219,20 +236,58 @@ def row_radar_covariance(
     row: pd.Series,
     fallback_covariance: np.ndarray | None = None,
 ) -> np.ndarray | None:
-    """Return covariance encoded in a radar row, or ``fallback_covariance``."""
+    """Return covariance encoded in a radar row, or ``fallback_covariance``.
+
+    Bias-corrected radar rows may carry learned residual standard deviations.
+    These are added as independent per-axis variance terms unless the encoded
+    association covariance already declares that it includes them.
+    """
 
     fallback = None if fallback_covariance is None else np.asarray(fallback_covariance, dtype=float)
     if not all(column in row for column in RADAR_COVARIANCE_COLUMNS):
-        return fallback
+        if fallback is None:
+            return fallback
+        covariance, _ = _add_bias_residual_uncertainty(
+            row,
+            fallback,
+            min_std_m=1.0e-6,
+            max_std_m=1.0e9,
+        )
+        return covariance
     try:
         ee, nn, uu, en, eu, nu = [float(row[column]) for column in RADAR_COVARIANCE_COLUMNS]
     except (TypeError, ValueError):
-        return fallback
+        if fallback is None:
+            return fallback
+        covariance, _ = _add_bias_residual_uncertainty(
+            row,
+            fallback,
+            min_std_m=1.0e-6,
+            max_std_m=1.0e9,
+        )
+        return covariance
     values = np.array([ee, nn, uu, en, eu, nu], dtype=float)
     if not np.isfinite(values).all():
-        return fallback
+        if fallback is None:
+            return fallback
+        covariance, _ = _add_bias_residual_uncertainty(
+            row,
+            fallback,
+            min_std_m=1.0e-6,
+            max_std_m=1.0e9,
+        )
+        return covariance
     covariance = np.array([[ee, en, eu], [en, nn, nu], [eu, nu, uu]], dtype=float)
-    return _regularized_covariance(covariance, min_std_m=1.0e-6, max_std_m=1.0e9)
+    covariance = _regularized_covariance(covariance, min_std_m=1.0e-6, max_std_m=1.0e9)
+    if _truthy(row.get(BIAS_RESIDUAL_INCLUDED_COLUMN, False)):
+        return covariance
+    covariance, _ = _add_bias_residual_uncertainty(
+        row,
+        covariance,
+        min_std_m=1.0e-6,
+        max_std_m=1.0e9,
+    )
+    return covariance
 
 
 def candidate_radar_covariances(
@@ -275,6 +330,46 @@ def _env_float(name: str, default: float) -> float:
         return float(value)
     except ValueError as exc:
         raise ValueError(f"{name} must be a float") from exc
+
+
+def _bias_residual_variance(row: pd.Series) -> np.ndarray | None:
+    variances: list[float] = []
+    has_finite_value = False
+    for column in BIAS_RESIDUAL_COVARIANCE_COLUMNS:
+        value = _positive_float(row.get(column))
+        if value is None:
+            variances.append(0.0)
+            continue
+        has_finite_value = True
+        variances.append(float(value) ** 2)
+    if not has_finite_value:
+        return None
+    return np.asarray(variances, dtype=float)
+
+
+def _add_bias_residual_uncertainty(
+    row: pd.Series,
+    covariance: np.ndarray,
+    *,
+    min_std_m: float,
+    max_std_m: float,
+) -> tuple[np.ndarray, bool]:
+    variances = _bias_residual_variance(row)
+    if variances is None:
+        return np.asarray(covariance, dtype=float), False
+    inflated = np.asarray(covariance, dtype=float).reshape(3, 3) + np.diag(variances)
+    return _regularized_covariance(inflated, min_std_m=min_std_m, max_std_m=max_std_m), True
+
+
+def _truthy(value: object) -> bool:
+    if isinstance(value, (bool, np.bool_)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    try:
+        return bool(int(value))
+    except (TypeError, ValueError):
+        return False
 
 
 def _regularized_covariance(
