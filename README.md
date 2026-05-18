@@ -124,6 +124,8 @@ python scripts/run_stable_radar_segment_ablation.py data/raw/AADM2025Dryad \
 
 The script writes per-flight rows plus aggregate rows to the summary CSV, and a
 separate ranking CSV next to it for quickly identifying the best knob setting.
+Ranking defaults to `--ranking-min-coverage 0.95`, so low-coverage rows remain
+visible but are not treated as recommendation-eligible.
 
 Run the Opt1-Opt3 PDA-mixture association ablation:
 

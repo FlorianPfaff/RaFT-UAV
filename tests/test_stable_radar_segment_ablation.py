@@ -18,6 +18,7 @@ def _args(**overrides: object) -> argparse.Namespace:
         "range_gates_m": [800.0],
         "min_segment_frames": [100],
         "max_transition_speeds_mps": [65.0],
+        "ranking_min_coverage": 0.95,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -154,10 +155,33 @@ def test_aggregate_and_ranking_rows_sort_by_mean_then_tail() -> None:
             "error_2d_p95_m": 140.0,
             "table_path": "c",
         },
+        {
+            "flight": "Opt1",
+            "method": "radar-longest-track-range-gated",
+            "config": "low_coverage",
+            "radar_catprob_threshold": 0.4,
+            "radar_range_gate_m": 800.0,
+            "stable_segment_min_frames": 100,
+            "stable_segment_max_transition_speed_mps": 65.0,
+            "flight_count": 1,
+            "candidate_count": 10,
+            "selected_count": 2,
+            "matched_count": 2,
+            "coverage": 0.2,
+            "track_switches": 0,
+            "error_3d_mean_m": 5.0,
+            "error_3d_rmse_m": 10.0,
+            "error_3d_p95_m": 20.0,
+            "error_3d_max_m": 25.0,
+            "error_2d_mean_m": 4.0,
+            "error_2d_rmse_m": 9.0,
+            "error_2d_p95_m": 18.0,
+            "table_path": "d",
+        },
     ]
 
     aggregate_rows = ablation._aggregate_rows(rows)
-    ranking_rows = ablation._ranking_rows(aggregate_rows)
+    ranking_rows = ablation._ranking_rows(aggregate_rows, min_coverage=0.95)
 
     stable_a = next(row for row in aggregate_rows if row["config"] == "stable_a")
     assert stable_a["flight"] == "aggregate"
@@ -170,6 +194,15 @@ def test_aggregate_and_ranking_rows_sort_by_mean_then_tail() -> None:
     assert stable_a["error_3d_mean_m"] == 60.0
     assert ranking_rows[0]["rank"] == 1
     assert ranking_rows[0]["config"] == "stable_b"
+    assert ranking_rows[0]["eligible_for_recommendation"] is True
+    assert [row["eligible_for_recommendation"] for row in ranking_rows] == [
+        True,
+        False,
+        False,
+    ]
+    low_coverage = next(row for row in ranking_rows if row["config"] == "low_coverage")
+    assert low_coverage["eligible_for_recommendation"] is False
+    assert low_coverage["ranking_min_coverage"] == 0.95
 
 
 def test_validate_args_rejects_empty_and_nonpositive_grids() -> None:
@@ -178,6 +211,7 @@ def test_validate_args_rejects_empty_and_nonpositive_grids() -> None:
         {"range_gates_m": [0.0]},
         {"min_segment_frames": [0]},
         {"max_transition_speeds_mps": [0.0]},
+        {"ranking_min_coverage": 1.1},
     ):
         try:
             ablation._validate_args(_args(**kwargs))

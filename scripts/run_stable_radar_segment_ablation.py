@@ -48,6 +48,8 @@ SUMMARY_COLUMNS = (
 )
 RANKING_COLUMNS = (
     "rank",
+    "eligible_for_recommendation",
+    "ranking_min_coverage",
     "method",
     "config",
     "flight_count",
@@ -100,6 +102,12 @@ def main() -> int:
     parser.add_argument("--min-segment-frames", nargs="*", type=int, default=[75, 100, 150])
     parser.add_argument("--max-transition-speeds-mps", nargs="*", type=float, default=[35.0, 65.0, 100.0])
     parser.add_argument("--ranking-output", type=Path, default=None)
+    parser.add_argument(
+        "--ranking-min-coverage",
+        type=float,
+        default=0.95,
+        help="minimum aggregate coverage for a row to be ranked as recommendation-eligible",
+    )
     parser.add_argument("--truth-time-gate-s", type=float, default=2.0)
     parser.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args()
@@ -125,7 +133,10 @@ def main() -> int:
                 )
             rows.extend(_rows_from_table(config, table_path))
     aggregate_rows = _aggregate_rows(rows)
-    ranking_rows = _ranking_rows(aggregate_rows)
+    ranking_rows = _ranking_rows(
+        aggregate_rows,
+        min_coverage=args.ranking_min_coverage,
+    )
     ranking_output = args.ranking_output or args.summary_output.with_name(
         f"{args.summary_output.stem}_ranking.csv"
     )
@@ -151,6 +162,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--range-gates-m values must be positive")
     if any(value <= 0.0 for value in args.max_transition_speeds_mps):
         raise SystemExit("--max-transition-speeds-mps values must be positive")
+    if not 0.0 <= float(args.ranking_min_coverage) <= 1.0:
+        raise SystemExit("--ranking-min-coverage must be in [0, 1]")
 
 
 def _configs(args: argparse.Namespace) -> list[StableSegmentConfig]:
@@ -244,12 +257,17 @@ def _aggregate_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
     return aggregate_rows
 
 
-def _ranking_rows(aggregate_rows: list[dict[str, object]]) -> list[dict[str, object]]:
+def _ranking_rows(
+    aggregate_rows: list[dict[str, object]],
+    *,
+    min_coverage: float = 0.95,
+) -> list[dict[str, object]]:
     """Return aggregate rows sorted by paper-facing stable-segment quality."""
 
     ranking = sorted(
         aggregate_rows,
         key=lambda row: (
+            not _coverage_eligible(row, min_coverage=min_coverage),
             _sort_value(row.get("error_3d_mean_m")),
             _sort_value(row.get("error_3d_p95_m")),
             -float(row.get("coverage") or 0.0),
@@ -257,7 +275,15 @@ def _ranking_rows(aggregate_rows: list[dict[str, object]]) -> list[dict[str, obj
     )
     rows: list[dict[str, object]] = []
     for rank, row in enumerate(ranking, start=1):
-        ranked = {"rank": rank, **row}
+        ranked = {
+            "rank": rank,
+            "eligible_for_recommendation": _coverage_eligible(
+                row,
+                min_coverage=min_coverage,
+            ),
+            "ranking_min_coverage": float(min_coverage),
+            **row,
+        }
         rows.append({column: ranked.get(column, "") for column in RANKING_COLUMNS})
     return rows
 
@@ -279,6 +305,11 @@ def _safe_ratio(numerator: object, denominator: object) -> object:
 def _sort_value(value: object) -> float:
     number = pd.to_numeric(pd.Series([value]), errors="coerce").iloc[0]
     return float(number) if pd.notna(number) else float("inf")
+
+
+def _coverage_eligible(row: dict[str, object], *, min_coverage: float) -> bool:
+    coverage = pd.to_numeric(pd.Series([row.get("coverage")]), errors="coerce").iloc[0]
+    return bool(pd.notna(coverage) and float(coverage) >= float(min_coverage))
 
 
 def _csv_value(value: Any) -> object:
