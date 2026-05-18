@@ -96,9 +96,11 @@ def main() -> int:
 
 def _configs(args: argparse.Namespace) -> list[_Config]:
     configs: list[_Config] = []
+    variants = list(getattr(args, "variants", ["support"]))
+    legacy_names = not hasattr(args, "variants")
     for values in itertools.product(
         args.thresholds,
-        args.variants,
+        variants,
         args.tracklet_max_candidates_per_frame,
         args.tracklet_max_candidate_pool_per_frame,
         args.tracklet_max_candidates_per_track_id,
@@ -124,7 +126,8 @@ def _configs(args: argparse.Namespace) -> list[_Config]:
             track_support_weight=support_weight,
             max_track_support_reward=support_reward,
         )
-        configs.append(_Config(name=_config_name(config), **_config_values(config)))
+        name = _legacy_config_name(config) if legacy_names else _config_name(config)
+        configs.append(_Config(name=name, **_config_values(config)))
     return configs
 
 
@@ -267,9 +270,24 @@ def _config_name(config: _Config) -> str:
     )
 
 
+def _legacy_config_name(config: _Config) -> str:
+    return "_".join(
+        [
+            f"tracklet_t{common.slug(config.threshold, precision=2)}",
+            f"k{config.max_candidates_per_frame}",
+            f"pool{config.max_candidate_pool_per_frame}",
+            f"perid{config.max_candidates_per_track_id}",
+            f"catpen{common.slug(config.below_catprob_threshold_penalty, precision=1)}",
+            f"sw{common.slug(config.track_support_weight, precision=2)}",
+            f"sr{common.slug(config.max_track_support_reward, precision=1)}",
+        ]
+    )
+
+
 def _validate_args(args: argparse.Namespace) -> None:
     _require_nonempty("--thresholds", args.thresholds)
-    _require_nonempty("--variants", args.variants)
+    if hasattr(args, "variants"):
+        _require_nonempty("--variants", args.variants)
     _require_positive_ints(
         "--tracklet-max-candidates-per-frame",
         args.tracklet_max_candidates_per_frame,

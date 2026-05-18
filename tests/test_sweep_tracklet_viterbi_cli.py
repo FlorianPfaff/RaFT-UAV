@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 
 from raft_uav.sweep_tracklet_viterbi_cli import (
     TrackletSweepConfig,

@@ -63,7 +63,7 @@ def test_fixed_lag_tracklet_viterbi_conditions_on_previous_committed_choice():
     radar = pd.DataFrame(
         [
             _row(0, 1, 0.0, 0.0, 0.9),
-            _row(0, 2, 0.0, 100.0, 0.99),
+            _row(0, 2, 0.0, 100.0, 0.01),
             _row(1, 1, 1.0, 10.0, 0.3),
             _row(1, 2, 1.0, 110.0, 0.99),
         ]
