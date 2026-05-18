@@ -6,28 +6,30 @@ import os
 import sys
 from pathlib import Path
 
-from raft_uav import cli as _base_cli
 from raft_uav.calibration import bias_runtime
 from raft_uav.calibration.bias_runtime import BIAS_MODEL_ENV
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the standard CLI with optional runtime bias correction enabled."""
+    """Run the tracklet-enabled CLI with optional runtime bias correction."""
 
     args = list(sys.argv[1:] if argv is None else argv)
     bias_model, remaining = _extract_bias_model(args)
     if bias_model is not None:
         os.environ[BIAS_MODEL_ENV] = str(bias_model)
         bias_runtime.install()
-        _refresh_base_cli_normalizers()
-    return _base_cli.main(remaining)
+    _refresh_cli_normalizers()
+    from raft_uav import tracklet_viterbi_cli
+
+    return tracklet_viterbi_cli.main(remaining)
 
 
-def _refresh_base_cli_normalizers() -> None:
+def _refresh_cli_normalizers() -> None:
+    from raft_uav import cli as base_cli
     from raft_uav.io import aerpaw
 
-    _base_cli.normalize_rf = aerpaw.normalize_rf
-    _base_cli.normalize_radar = aerpaw.normalize_radar
+    base_cli.normalize_rf = aerpaw.normalize_rf
+    base_cli.normalize_radar = aerpaw.normalize_radar
 
 
 def _extract_bias_model(argv: list[str]) -> tuple[Path | None, list[str]]:
