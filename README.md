@@ -94,7 +94,9 @@ fusion row:
 ```bash
 python -m raft_uav.diagnostics.paper_table data/raw/AADM2025Dryad \
   --flight Opt1 \
-  --fusion-association paper-compatible
+  --fusion-association paper-compatible \
+  --stable-segment-min-frames 100 \
+  --stable-segment-max-transition-speed-mps 65
 ```
 
 The `paper-compatible` fusion path applies an 800 m radar range gate, radar
@@ -102,7 +104,9 @@ class-probability thresholding, NIS gates for RF/radar updates, and records a
 radar `missed_detection` posterior when no radar candidate passes the hard
 preselector. The table also includes stable range-gated radar segment rows,
 including an interpolated full-frame diagnostic, to separate clean radar
-coverage from long-gap fill behavior.
+coverage from long-gap fill behavior. The stable-segment knobs control how long
+a same-track run must be before it is trusted and how aggressively separate
+segments may be stitched across radar ID changes.
 
 Run the Opt1-Opt3 radar candidate class-probability threshold ablation:
 

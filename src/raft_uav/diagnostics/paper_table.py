@@ -102,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/paper-table"))
     parser.add_argument("--radar-catprob-threshold", type=float, default=0.4)
     parser.add_argument("--radar-range-gate-m", type=float, default=800.0)
+    parser.add_argument("--stable-segment-min-frames", type=int, default=100)
+    parser.add_argument("--stable-segment-max-transition-speed-mps", type=float, default=65.0)
     parser.add_argument("--fusion-nis-gate-prob", type=float, default=0.99)
     parser.add_argument("--rf-nis-gate-prob", type=float, default=0.99)
     parser.add_argument("--truth-time-gate-s", type=float, default=2.0)
@@ -121,6 +123,8 @@ def main(argv: list[str] | None = None) -> int:
         output_dir=args.output_dir,
         radar_catprob_threshold=args.radar_catprob_threshold,
         radar_range_gate_m=None if args.radar_range_gate_m <= 0.0 else args.radar_range_gate_m,
+        stable_segment_min_frames=args.stable_segment_min_frames,
+        stable_segment_max_transition_speed_mps=args.stable_segment_max_transition_speed_mps,
         fusion_nis_gate_prob=args.fusion_nis_gate_prob,
         rf_nis_gate_prob=args.rf_nis_gate_prob,
         truth_time_gate_s=args.truth_time_gate_s,
@@ -143,6 +147,8 @@ def run_paper_table_diagnostic(
     output_dir: Path = Path("outputs/paper-table"),
     radar_catprob_threshold: float = 0.4,
     radar_range_gate_m: float | None = 800.0,
+    stable_segment_min_frames: int = 100,
+    stable_segment_max_transition_speed_mps: float = 65.0,
     fusion_nis_gate_prob: float = 0.99,
     rf_nis_gate_prob: float = 0.99,
     truth_time_gate_s: float = 2.0,
@@ -152,6 +158,11 @@ def run_paper_table_diagnostic(
     fusion_associations: tuple[str, ...] = FUSION_ASSOCIATIONS,
 ) -> dict[str, Any]:
     """Build and write a paper-style comparison table for one flight."""
+
+    if stable_segment_min_frames < 1:
+        raise ValueError("stable_segment_min_frames must be positive")
+    if stable_segment_max_transition_speed_mps <= 0.0:
+        raise ValueError("stable_segment_max_transition_speed_mps must be positive")
 
     flight = select_flight(Path(dataset_root), flight_name)
     if flight.truth_txt is None:
@@ -199,6 +210,8 @@ def run_paper_table_diagnostic(
                 selection=selection,
                 catprob_threshold=radar_catprob_threshold,
                 range_gate_m=radar_range_gate_m if selection in RANGE_GATED_RADAR_SELECTIONS else None,
+                stable_segment_min_frames=stable_segment_min_frames,
+                stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
                 max_time_delta_s=truth_time_gate_s,
             )
             rows.append(
@@ -247,6 +260,8 @@ def run_paper_table_diagnostic(
         "rows": int(len(table)),
         "radar_catprob_threshold": float(radar_catprob_threshold),
         "radar_range_gate_m": None if radar_range_gate_m is None else float(radar_range_gate_m),
+        "stable_segment_min_frames": int(stable_segment_min_frames),
+        "stable_segment_max_transition_speed_mps": float(stable_segment_max_transition_speed_mps),
         "fusion_nis_gate_prob": float(fusion_nis_gate_prob),
         "rf_nis_gate_prob": float(rf_nis_gate_prob),
         "truth_time_gate_s": float(truth_time_gate_s),
@@ -352,6 +367,8 @@ def select_radar_for_table(
     selection: str,
     catprob_threshold: float,
     range_gate_m: float | None = None,
+    stable_segment_min_frames: int = 100,
+    stable_segment_max_transition_speed_mps: float = 65.0,
     max_time_delta_s: float,
 ) -> pd.DataFrame:
     """Select one radar row per frame for paper-table diagnostics."""
@@ -363,9 +380,15 @@ def select_radar_for_table(
             selection="radar-longest-track-range-gated",
             catprob_threshold=catprob_threshold,
             range_gate_m=range_gate_m,
+            stable_segment_min_frames=stable_segment_min_frames,
+            stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
             max_time_delta_s=max_time_delta_s,
         )
-        return _interpolate_selected_radar_to_frame_times(radar, anchors)
+        return _interpolate_selected_radar_to_frame_times(
+            radar,
+            anchors,
+            association_mode="radar-longest-track-range-gated-interpolated",
+        )
     if selection == "radar-stable-segments-range-gated-interpolated":
         anchors = select_radar_for_table(
             radar=radar,
@@ -373,14 +396,22 @@ def select_radar_for_table(
             selection="radar-stable-segments-range-gated",
             catprob_threshold=catprob_threshold,
             range_gate_m=range_gate_m,
+            stable_segment_min_frames=stable_segment_min_frames,
+            stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
             max_time_delta_s=max_time_delta_s,
         )
-        return _interpolate_selected_radar_to_frame_times(radar, anchors)
+        return _interpolate_selected_radar_to_frame_times(
+            radar,
+            anchors,
+            association_mode="radar-stable-segments-range-gated-interpolated",
+        )
     if selection == "radar-stable-segments-range-gated":
         return select_stable_radar_segments(
             radar,
             range_gate_m=range_gate_m,
             catprob_threshold=catprob_threshold,
+            min_segment_frames=stable_segment_min_frames,
+            max_transition_speed_mps=stable_segment_max_transition_speed_mps,
         )
 
     groups = radar_frame_groups(radar)
@@ -892,6 +923,8 @@ def _range_candidate_pool(candidates: pd.DataFrame, range_gate_m: float | None) 
 def _interpolate_selected_radar_to_frame_times(
     radar: pd.DataFrame,
     selected: pd.DataFrame,
+    *,
+    association_mode: str,
 ) -> pd.DataFrame:
     if radar.empty or selected.empty:
         return radar.iloc[0:0].copy()
@@ -918,7 +951,7 @@ def _interpolate_selected_radar_to_frame_times(
             anchor_times,
             anchors[column].to_numpy(dtype=float),
         )
-    out["association_mode"] = "radar-longest-track-range-gated-interpolated"
+    out["association_mode"] = association_mode
     out["association_interpolated"] = True
     if "track_id" in anchors.columns:
         track_ids = pd.to_numeric(anchors["track_id"], errors="coerce").dropna()

@@ -308,6 +308,76 @@ def test_stable_segments_stitch_high_confidence_tracks():
     assert selected["association_segment_count"].iloc[0] == 2
 
 
+def test_stable_segments_respect_tunable_min_frames_and_transition_speed():
+    radar = pd.DataFrame(
+        [
+            *[
+                {
+                    "frame_index": frame,
+                    "track_id": 1,
+                    "time_s": float(frame),
+                    "east_m": float(frame),
+                    "north_m": 0.0,
+                    "up_m": 0.0,
+                    "range_m": float(frame),
+                    "cat_prob_uav": 0.9,
+                }
+                for frame in range(3)
+            ],
+            *[
+                {
+                    "frame_index": frame,
+                    "track_id": 2,
+                    "time_s": float(frame),
+                    "east_m": 100.0 + float(frame),
+                    "north_m": 0.0,
+                    "up_m": 0.0,
+                    "range_m": 100.0 + float(frame),
+                    "cat_prob_uav": 0.9,
+                }
+                for frame in range(5, 8)
+            ],
+        ]
+    )
+
+    strict_min_frames = select_radar_for_table(
+        radar=radar,
+        truth=_truth(),
+        selection="radar-stable-segments-range-gated",
+        catprob_threshold=0.4,
+        range_gate_m=800.0,
+        stable_segment_min_frames=4,
+        stable_segment_max_transition_speed_mps=500.0,
+        max_time_delta_s=0.5,
+    )
+    strict_transition = select_radar_for_table(
+        radar=radar,
+        truth=_truth(),
+        selection="radar-stable-segments-range-gated",
+        catprob_threshold=0.4,
+        range_gate_m=800.0,
+        stable_segment_min_frames=3,
+        stable_segment_max_transition_speed_mps=10.0,
+        max_time_delta_s=0.5,
+    )
+    loose_transition = select_radar_for_table(
+        radar=radar,
+        truth=_truth(),
+        selection="radar-stable-segments-range-gated-interpolated",
+        catprob_threshold=0.4,
+        range_gate_m=800.0,
+        stable_segment_min_frames=3,
+        stable_segment_max_transition_speed_mps=500.0,
+        max_time_delta_s=0.5,
+    )
+
+    assert strict_min_frames.empty
+    assert strict_transition["track_id"].tolist() == [1, 1, 1]
+    assert loose_transition["association_mode"].unique().tolist() == [
+        "radar-stable-segments-range-gated-interpolated"
+    ]
+
+
 def test_paper_compatible_fusion_coasts_when_all_radar_candidates_fail_hard_gate():
     rf_measurements = [
         TrackingMeasurement(
