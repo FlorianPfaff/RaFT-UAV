@@ -132,6 +132,10 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     events = _events(list(rf_measurements), radar)
     if not events:
         return [], _empty_selected_radar(radar)
+    bootstrap_index = _first_rf_bootstrap_index(events)
+    if bootstrap_index is None:
+        return [], _empty_selected_radar(radar)
+    events = events[bootstrap_index:]
     initial = _initial_measurement(
         events[0],
         association="tracklet-viterbi",
@@ -176,6 +180,23 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         max_residual_norms_by_source=max_residual_norms_by_source,
     )
     return records, _selected_rows_frame(radar, accepted)
+
+
+def _first_rf_bootstrap_index(events: list[dict[str, object]]) -> int | None:
+    """Return the causal bootstrap index for non-oracle tracklet replay.
+
+    The tracklet selector is truth-free and should not initialize from an
+    arbitrary pre-RF radar candidate selected only by class probability.  If RF
+    measurements are present, start at the first RF event and ignore earlier
+    radar frames.  Radar-only inputs keep their historical radar bootstrap.
+    """
+
+    if not events:
+        return None
+    for index, event in enumerate(events):
+        if event.get("kind") == "rf":
+            return index
+    return 0
 
 
 def _build_rf_anchor_states(

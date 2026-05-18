@@ -147,6 +147,7 @@ def _radar_measurements_to_enu_with_candidate_covariance(
     default_xy_std_m: float = 25.0,
     default_z_std_m: float = 35.0,
     default_velocity_std_mps: float = 12.0,
+    include_velocity: bool = False,
 ) -> list[Any]:
     from raft_uav.baselines.kalman import TrackingMeasurement
     from raft_uav.io import aerpaw
@@ -156,14 +157,13 @@ def _radar_measurements_to_enu_with_candidate_covariance(
         if projector is None or truth_origin_time is None:
             raise ValueError("raw radar rows require projector and truth_origin_time")
         frame = aerpaw.normalize_radar(frame, projector, truth_origin_time)
-    frame = _annotate_radar(frame)
 
     fallback_position_covariance = fixed_radar_covariance(default_xy_std_m, default_z_std_m)
     measurements: list[TrackingMeasurement] = []
     for _, row in frame.iterrows():
         position = np.array([float(row["east_m"]), float(row["north_m"]), float(row["up_m"])])
         position_covariance = row_radar_covariance(row, fallback_position_covariance)
-        velocity = aerpaw._radar_velocity_vector_enu(row)
+        velocity = aerpaw._radar_velocity_vector_enu(row) if include_velocity else None
         if velocity is None:
             vector = position
             covariance = position_covariance

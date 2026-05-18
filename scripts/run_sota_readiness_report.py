@@ -14,6 +14,7 @@ import json
 import os
 import subprocess
 import sys
+from decimal import Decimal, InvalidOperation, ROUND_HALF_EVEN
 from pathlib import Path
 from typing import Any
 
@@ -650,7 +651,12 @@ def rounded(value: object) -> object:
         out = float(value)
     except (TypeError, ValueError):
         return ""
-    return round(out, 3) if np.isfinite(out) else ""
+    if not np.isfinite(out):
+        return ""
+    try:
+        return float(Decimal(str(value)).quantize(Decimal("0.001"), rounding=ROUND_HALF_EVEN))
+    except (InvalidOperation, ValueError):
+        return round(out, 3)
 
 
 def integer(value: object) -> object:
