@@ -1,8 +1,14 @@
-"""Compatibility wrapper for replay-preserving tracklet-Viterbi results."""
+"""Deprecated compatibility wrapper for replay-preserving tracklet-Viterbi results.
+
+Use :func:`raft_uav.baselines.tracklet_viterbi_result.run_async_cv_baseline_with_tracklet_viterbi_result`
+for new code.  This module remains as a tuple-returning compatibility shim for
+older scripts.
+"""
 
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import warnings
 
 import pandas as pd
 
@@ -30,8 +36,15 @@ def run_async_cv_baseline_with_tracklet_viterbi_association_and_replay(
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
 ) -> tuple[list[dict[str, object]], pd.DataFrame, pd.DataFrame]:
-    """Compatibility wrapper around the result API."""
+    """Return legacy tuple outputs from the canonical result-object API."""
 
+    warnings.warn(
+        "run_async_cv_baseline_with_tracklet_viterbi_association_and_replay "
+        "is deprecated; use run_async_cv_baseline_with_tracklet_viterbi_result "
+        "and its TrackletViterbiResult return object instead.",
+        DeprecationWarning,
+        stacklevel=2,
+    )
     result = run_async_cv_baseline_with_tracklet_viterbi_result(
         rf_measurements=rf_measurements,
         radar=radar,
