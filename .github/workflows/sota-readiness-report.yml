@@ -1,0 +1,220 @@
+---
+name: SOTA readiness report
+
+"on":
+  workflow_dispatch:
+    inputs:
+      dataset_root:
+        description: "Path on the self-hosted runner to extracted AADM2025Dryad; if unusable, the workflow searches and populates the persistent dataset cache."
+        required: false
+        type: string
+        default: "/srv/datasets/AADM2025Dryad"
+      dataset_url:
+        description: "Optional direct ZIP archive URL used if the dataset is not already present on the runner."
+        required: false
+        type: string
+        default: ""
+      flights:
+        description: "Space-separated flight names passed to the report."
+        required: false
+        type: string
+        default: "Opt1 Opt2 Opt3"
+      methods:
+        description: "Space-separated tracking methods passed to the report."
+        required: false
+        type: string
+        default: "catprob prediction-nis track-continuity geometry-score pda-mixture track-bank tracklet-viterbi"
+      include_lofo:
+        description: "Include LOFO time-offset rows if the LOFO summary CSV exists."
+        required: false
+        type: boolean
+        default: true
+      skip_tracking:
+        description: "Only collect oracle/LOFO rows; do not run tracking methods."
+        required: false
+        type: boolean
+        default: false
+      skip_oracles:
+        description: "Only collect tracking/LOFO rows; do not run nearest-candidate oracle diagnostics."
+        required: false
+        type: boolean
+        default: false
+      skip_existing:
+        description: "Reuse existing run artifacts under the output directory when possible."
+        required: false
+        type: boolean
+        default: true
+      output_dir:
+        description: "Output directory for report artifacts."
+        required: false
+        type: string
+        default: "outputs/sota_readiness"
+      offset_min_s:
+        description: "Minimum timestamp offset for nearest-candidate oracle sweep."
+        required: false
+        type: string
+        default: "-10"
+      offset_max_s:
+        description: "Maximum timestamp offset for nearest-candidate oracle sweep."
+        required: false
+        type: string
+        default: "10"
+      offset_step_s:
+        description: "Timestamp offset grid step for nearest-candidate oracle sweep."
+        required: false
+        type: string
+        default: "0.25"
+      retention_days:
+        description: "Artifact retention days."
+        required: false
+        type: number
+        default: 21
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  PYTHONUNBUFFERED: "1"
+
+jobs:
+  report:
+    name: Dataset-backed SOTA readiness report
+    runs-on: [self-hosted, Linux]
+    timeout-minutes: 1440
+    env:
+      DATASET_ROOT: ${{ inputs.dataset_root }}
+      FLIGHTS: ${{ inputs.flights }}
+      METHODS: ${{ inputs.methods }}
+      OUTPUT_DIR: ${{ inputs.output_dir }}
+      OFFSET_MIN_S: ${{ inputs.offset_min_s }}
+      OFFSET_MAX_S: ${{ inputs.offset_max_s }}
+      OFFSET_STEP_S: ${{ inputs.offset_step_s }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Ensure AADM2025Dryad dataset
+        id: dataset
+        uses: ./.github/actions/ensure-aadm2025dryad-dataset
+        with:
+          dataset-root: ${{ inputs.dataset_root }}
+          dataset-url: ${{ inputs.dataset_url || secrets.AADM2025DRYAD_DATA_URL || secrets.AADM2025DRYAD_URL || vars.AADM2025DRYAD_DATA_URL || vars.AADM2025DRYAD_URL }}
+          cache-key: aadm2025dryad-${{ runner.os }}-v1
+          rclone-source: ${{ secrets.AADM2025DRYAD_RCLONE_SOURCE }}
+          rclone-config: ${{ secrets.RCLONE_CONFIG }}
+          rclone-config-b64: ${{ secrets.RCLONE_CONFIG_B64 }}
+          webdav-url: ${{ secrets.AADM2025DRYAD_DATA_WEBDAV_URL || vars.AADM2025DRYAD_DATA_WEBDAV_URL }}
+          webdav-user: ${{ secrets.AADM2025DRYAD_DATA_KEY || vars.AADM2025DRYAD_DATA_KEY }}
+          webdav-password: ${{ secrets.AADM2025DRYAD_DATA_PASSWORD }}
+
+      - name: Install package
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[dev]"
+
+      - name: Run SOTA readiness report
+        run: |
+          set -euo pipefail
+          args=(
+            scripts/run_sota_readiness_report.py
+            "${DATASET_ROOT}"
+            --output-dir "${OUTPUT_DIR}"
+            --offset-min-s "${OFFSET_MIN_S}"
+            --offset-max-s "${OFFSET_MAX_S}"
+            --offset-step-s "${OFFSET_STEP_S}"
+            --flights ${FLIGHTS}
+            --methods ${METHODS}
+          )
+          if [ "${{ inputs.skip_existing }}" = "true" ]; then
+            args+=(--skip-existing)
+          fi
+          if [ "${{ inputs.skip_tracking }}" = "true" ]; then
+            args+=(--skip-tracking)
+          fi
+          if [ "${{ inputs.skip_oracles }}" = "true" ]; then
+            args+=(--skip-oracles)
+          fi
+          if [ "${{ inputs.include_lofo }}" = "true" ]; then
+            args+=(--include-lofo)
+          fi
+          python "${args[@]}"
+
+      - name: Summarize report
+        if: always()
+        run: |
+          set -euo pipefail
+          report="${OUTPUT_DIR}/sota_readiness_report.csv"
+          json_report="${OUTPUT_DIR}/sota_readiness_report.json"
+          {
+            echo "## SOTA readiness report"
+            echo
+            echo "dataset_root=${DATASET_ROOT}"
+            echo "output_dir=${OUTPUT_DIR}"
+            echo
+            if [ -f "$report" ]; then
+              echo "### Report CSV"
+              echo "$report"
+              echo
+              echo "### Top rows"
+              echo '```text'
+          python - <<'PY'
+          import csv
+          import os
+          from pathlib import Path
+          
+          report = Path(os.environ["OUTPUT_DIR"]) / "sota_readiness_report.csv"
+          with report.open(newline="") as fh:
+              reader = csv.DictReader(fh)
+              rows = list(reader)
+          key_fields = [
+              "method",
+              "flight",
+              "row_type",
+              "rmse_3d_error_m",
+              "p95_3d_error_m",
+              "coverage",
+              "selected_radar_rows",
+              "track_switch_count",
+              "best_oracle_time_offset_s",
+          ]
+          for row in rows[:20]:
+              print(" | ".join(f"{field}={row.get(field, '')}" for field in key_fields))
+          PY
+              echo '```'
+            else
+              echo "No SOTA readiness CSV was produced."
+            fi
+            if [ -f "$json_report" ]; then
+              echo
+              echo "JSON report: $json_report"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload report artifacts
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sota-readiness-report-${{ github.run_id }}
+          retention-days: ${{ inputs.retention_days }}
+          path: |
+            ${{ inputs.output_dir }}/sota_readiness_report.csv
+            ${{ inputs.output_dir }}/sota_readiness_report.json
+            ${{ inputs.output_dir }}/runs/*/*/metrics.json
+            ${{ inputs.output_dir }}/runs/*/*/diagnostic_summary.json
+            ${{ inputs.output_dir }}/runs/*/*/diagnostics.csv
+            ${{ inputs.output_dir }}/runs/*/*/selected_radar.csv
+            ${{ inputs.output_dir }}/runs/*/*/estimates.csv
+            ${{ inputs.output_dir }}/oracles/*/*.csv
