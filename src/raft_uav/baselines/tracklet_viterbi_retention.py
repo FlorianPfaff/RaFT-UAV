@@ -5,6 +5,9 @@ monkey-patching.  It reuses the base tracklet-Viterbi event handling,
 RF-anchor construction, transition costs, and replay logic, but performs node
 construction and Viterbi selection locally with track-aware candidate retention,
 optional soft catProb penalties, and a truth-free Fortem track-support prior.
+Track-support statistics are computed from prefix-only radar history for each
+radar event, so the reward does not leak future Fortem detections into earlier
+association decisions.
 """
 
 from __future__ import annotations
@@ -84,7 +87,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         covariance=covariance,
         candidate_catprob_threshold=candidate_catprob_threshold,
         config=cfg,
-        track_support_by_id=_track_support_by_id(radar),
+        track_support_by_event=_track_support_by_event_prefix(events),
     )
     records, accepted = _base._replay_selected_tracklet_path(
         events=events,
@@ -111,22 +114,39 @@ def _select_tracklet_viterbi_path(
     candidate_catprob_threshold: float | None,
     config: TrackletViterbiAssociationConfig,
     track_support_by_id: Mapping[int, Mapping[str, float]] | None = None,
+    track_support_by_event: Mapping[int, Mapping[int, Mapping[str, float]]] | None = None,
 ) -> list[pd.Series]:
-    """Return selected radar rows from retention-aware Viterbi scoring."""
+    """Return selected radar rows from retention-aware Viterbi scoring.
 
-    frames = [
-        _nodes_for_radar_frame_with_track_retention(
-            event_index=i,
-            candidates=event["candidates"],
-            anchor=anchors.get(i),
-            covariance=covariance,
-            candidate_catprob_threshold=candidate_catprob_threshold,
-            config=config,
-            track_support_by_id=track_support_by_id,
+    ``track_support_by_event`` maps each global radar event index to support
+    statistics computed from radar frames that precede that event.  The older
+    ``track_support_by_id`` argument is kept for focused unit tests and explicit
+    offline ablations, but callers must not use it for causal/default results.
+    """
+
+    if track_support_by_id is not None and track_support_by_event is not None:
+        raise ValueError("provide either track_support_by_id or track_support_by_event, not both")
+
+    frames: list[list[_base._ViterbiNode]] = []
+    for i, event in enumerate(events):
+        if event["kind"] != "radar":
+            continue
+        support_by_id = (
+            track_support_by_event.get(i, {})
+            if track_support_by_event is not None
+            else track_support_by_id
         )
-        for i, event in enumerate(events)
-        if event["kind"] == "radar"
-    ]
+        frames.append(
+            _nodes_for_radar_frame_with_track_retention(
+                event_index=i,
+                candidates=event["candidates"],
+                anchor=anchors.get(i),
+                covariance=covariance,
+                candidate_catprob_threshold=candidate_catprob_threshold,
+                config=config,
+                track_support_by_id=support_by_id,
+            )
+        )
     if not frames:
         return []
 
@@ -142,7 +162,10 @@ def _select_tracklet_viterbi_path(
         current_parents = np.empty(len(current), dtype=int)
         for j, node in enumerate(current):
             transition = np.array(
-                [costs[-1][k] + _base._transition_cost(prev, node, config) for k, prev in enumerate(previous)]
+                [
+                    costs[-1][k] + _base._transition_cost(prev, node, config)
+                    for k, prev in enumerate(previous)
+                ]
             )
             parent = int(np.argmin(transition))
             current_parents[j] = parent
@@ -296,8 +319,35 @@ def _write_track_support_diagnostics(
     )
 
 
+def _track_support_by_event_prefix(
+    events: Iterable[dict[str, object]],
+) -> dict[int, dict[int, dict[str, float]]]:
+    """Return prefix-only Fortem track support for each radar event.
+
+    The support attached to event ``i`` is computed from radar candidates in
+    events with lower indices only.  This keeps the track-support reward causal
+    with respect to the radar stream, while still allowing persistent track IDs
+    to be rewarded once they have already survived previous frames.
+    """
+
+    support_by_event: dict[int, dict[int, dict[str, float]]] = {}
+    previous_radar_frames: list[pd.DataFrame] = []
+    for event_index, event in enumerate(events):
+        if event.get("kind") != "radar":
+            continue
+        if previous_radar_frames:
+            prefix = pd.concat(previous_radar_frames, ignore_index=True, sort=False)
+            support_by_event[event_index] = _track_support_by_id(prefix)
+        else:
+            support_by_event[event_index] = {}
+        candidates = event.get("candidates")
+        if isinstance(candidates, pd.DataFrame) and not candidates.empty:
+            previous_radar_frames.append(candidates)
+    return support_by_event
+
+
 def _track_support_by_id(radar: pd.DataFrame) -> dict[int, dict[str, float]]:
-    """Return truth-free support statistics for every finite Fortem track ID."""
+    """Return truth-free support statistics for finite Fortem track IDs in ``radar``."""
 
     if radar.empty or "track_id" not in radar.columns:
         return {}

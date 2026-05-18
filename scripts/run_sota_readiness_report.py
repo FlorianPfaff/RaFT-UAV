@@ -49,6 +49,81 @@ DEFAULT_METHODS = [
     "tracklet-viterbi",
 ]
 ORACLE_METHODS = ["oracle-nearest-candidate-offset0", "oracle-nearest-candidate-best-offset"]
+PAPER_PRIMARY_METRIC = "mean_3d_error_m"
+REPORT_COLUMNS = [
+    "flight",
+    "method",
+    "row_type",
+    "paper_primary_metric",
+    "matched_count",
+    "eval_sample_count",
+    "coverage",
+    "mean_3d_error_m",
+    "std_3d_error_m",
+    "max_3d_error_m",
+    "p95_3d_error_m",
+    "rmse_3d_error_m",
+    "mean_2d_error_m",
+    "std_2d_error_m",
+    "max_2d_error_m",
+    "p95_2d_error_m",
+    "rmse_2d_error_m",
+    "posterior_records",
+    "selected_radar_rows",
+    "radar_frame_count",
+    "missed_radar_frame_count",
+    "track_switch_count",
+    "selected_cat_prob_mean",
+    "association_anchor_nis_p95",
+    "association_score_p95",
+    "rejected_measurements",
+    "reweighted_measurements",
+    "applied_radar_time_offset_s",
+    "applied_rf_time_offset_s",
+    "best_oracle_time_offset_s",
+    "metrics_path",
+    "estimates_path",
+    "selected_radar_path",
+    "oracle_sweep_path",
+]
+PAPER_LEADERBOARD_COLUMNS = [
+    "rank",
+    "flight",
+    "method",
+    "row_type",
+    "paper_primary_metric",
+    "matched_count",
+    "eval_sample_count",
+    "coverage",
+    "mean_3d_error_m",
+    "std_3d_error_m",
+    "max_3d_error_m",
+    "p95_3d_error_m",
+    "rmse_3d_error_m",
+    "mean_2d_error_m",
+    "std_2d_error_m",
+    "max_2d_error_m",
+    "p95_2d_error_m",
+    "rmse_2d_error_m",
+    "posterior_records",
+    "selected_radar_rows",
+    "radar_frame_count",
+    "missed_radar_frame_count",
+    "track_switch_count",
+    "selected_cat_prob_mean",
+    "association_anchor_nis_p95",
+    "association_score_p95",
+    "rejected_measurements",
+    "reweighted_measurements",
+    "applied_radar_time_offset_s",
+    "applied_rf_time_offset_s",
+    "best_oracle_time_offset_s",
+    "metrics_path",
+    "estimates_path",
+    "selected_radar_path",
+    "oracle_sweep_path",
+]
+ROW_TYPE_SORT = {"tracking": 0, "oracle": 1}
 
 
 def main() -> int:
@@ -56,6 +131,7 @@ def main() -> int:
     parser.add_argument("dataset_root", type=Path)
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/sota_readiness"))
     parser.add_argument("--summary-output", type=Path, default=None)
+    parser.add_argument("--leaderboard-output", type=Path, default=None)
     parser.add_argument("--flights", nargs="*", default=DEFAULT_FLIGHTS)
     parser.add_argument("--methods", nargs="*", default=DEFAULT_METHODS)
     parser.add_argument("--skip-existing", action="store_true")
@@ -78,6 +154,9 @@ def main() -> int:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary_output = args.summary_output or args.output_dir / "sota_readiness_report.csv"
+    leaderboard_output = args.leaderboard_output or summary_output.with_name(
+        f"{summary_output.stem}_leaderboard.csv"
+    )
 
     rows: list[dict[str, object]] = []
     if not args.skip_tracking:
@@ -92,14 +171,22 @@ def main() -> int:
 
     if not rows:
         raise RuntimeError("No report rows were produced")
-    write_csv(summary_output, rows)
+    rows = sort_report_rows(rows)
+    write_csv(summary_output, rows, preferred_columns=REPORT_COLUMNS)
     write_json(summary_output.with_suffix(".json"), rows)
+    leaderboard_rows = build_leaderboard_rows(rows)
+    write_csv(leaderboard_output, leaderboard_rows, preferred_columns=PAPER_LEADERBOARD_COLUMNS)
+    write_json(leaderboard_output.with_suffix(".json"), leaderboard_rows)
     print(f"summary_csv={summary_output}")
     print(f"summary_json={summary_output.with_suffix('.json')}")
+    print(f"leaderboard_csv={leaderboard_output}")
+    print(f"leaderboard_json={leaderboard_output.with_suffix('.json')}")
     return 0
 
 
-def run_or_collect_tracking(args: argparse.Namespace, method: str, flight: str) -> dict[str, object]:
+def run_or_collect_tracking(
+    args: argparse.Namespace, method: str, flight: str
+) -> dict[str, object]:
     run_dir = args.output_dir / "runs" / method
     metrics_path = run_dir / flight / "metrics.json"
     estimates_path = run_dir / flight / "estimates.csv"
@@ -196,6 +283,8 @@ def oracle_rows(args: argparse.Namespace, flight: str) -> list[dict[str, object]
         selected_path = oracle_dir / f"{method}.csv"
         selected.to_csv(selected_path, index=False)
         summary = summarize_oracle_selection(selected, frame_count=frame_count)
+        summary["matched_count"] = summary.get("count", 0.0)
+        summary["eval_sample_count"] = frame_count
         row = base_row(method=method, flight=flight, row_type="oracle")
         row.update(paper_error_columns(summary))
         row.update(selected_radar_diagnostics(selected, frame_count=frame_count))
@@ -216,10 +305,21 @@ def lofo_rows(path: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for _, item in frame.iterrows():
         flight = str(item.get("flight", ""))
-        row = base_row(method="tracklet-viterbi-lofo-time-offset", flight=flight, row_type="tracking")
+        row = base_row(
+            method="tracklet-viterbi-lofo-time-offset", flight=flight, row_type="tracking"
+        )
+        row["matched_count"] = integer(
+            first_existing(item, ("matched_count", "count", "n_matched"))
+        )
+        row["eval_sample_count"] = integer(
+            first_existing(item, ("eval_sample_count", "posterior_records", "n_estimates"))
+        )
+        row["coverage"] = rounded(item.get("coverage"))
         row["rmse_3d_error_m"] = rounded(item.get("rmse_3d_m"))
         row["p95_3d_error_m"] = rounded(item.get("p95_3d_m"))
         row["mean_3d_error_m"] = rounded(item.get("mae_3d_m"))
+        row["std_3d_error_m"] = rounded(item.get("std_3d_m"))
+        row["max_3d_error_m"] = rounded(item.get("max_3d_m"))
         row["applied_radar_time_offset_s"] = rounded(item.get("radar_offset_s"))
         row["applied_rf_time_offset_s"] = rounded(item.get("rf_offset_s"))
         row["metrics_path"] = str(item.get("metrics_json", ""))
@@ -232,6 +332,9 @@ def base_row(*, method: str, flight: str, row_type: str) -> dict[str, object]:
         "flight": flight,
         "method": method,
         "row_type": row_type,
+        "paper_primary_metric": PAPER_PRIMARY_METRIC,
+        "matched_count": "",
+        "eval_sample_count": "",
         "coverage": "",
         "mean_3d_error_m": "",
         "std_3d_error_m": "",
@@ -278,7 +381,9 @@ def extract_tracking_metadata(
     return out
 
 
-def selected_radar_diagnostics(selected: pd.DataFrame, *, frame_count: int = 0) -> dict[str, object]:
+def selected_radar_diagnostics(
+    selected: pd.DataFrame, *, frame_count: int = 0
+) -> dict[str, object]:
     if selected.empty:
         return {
             "selected_radar_rows": 0,
@@ -309,19 +414,30 @@ def error_summary_from_estimates(
     max_time_delta_s: float,
 ) -> dict[str, object]:
     if estimates.empty:
-        return paper_error_columns({})
+        return paper_error_columns({"matched_count": 0, "eval_sample_count": 0})
     times = estimates["time_s"].to_numpy(dtype=float)
     positions = estimates[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
     truth_times = truth["time_s"].to_numpy(dtype=float)
     truth_positions = truth[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
     errors_3d = position_errors_m(
-        times, positions, truth_times, truth_positions, max_time_delta_s=max_time_delta_s, dimensions=3
+        times,
+        positions,
+        truth_times,
+        truth_positions,
+        max_time_delta_s=max_time_delta_s,
+        dimensions=3,
     )
     errors_2d = position_errors_m(
-        times, positions, truth_times, truth_positions, max_time_delta_s=max_time_delta_s, dimensions=2
+        times,
+        positions,
+        truth_times,
+        truth_positions,
+        max_time_delta_s=max_time_delta_s,
+        dimensions=2,
     )
     summary = {
-        "count": float(errors_3d.size),
+        "matched_count": int(errors_3d.size),
+        "eval_sample_count": int(len(estimates)),
         "coverage": safe_divide(float(errors_3d.size), float(len(estimates))),
         **stats(errors_3d, "3d"),
         **stats(errors_2d, "2d"),
@@ -330,6 +446,7 @@ def error_summary_from_estimates(
 
 
 def paper_error_columns(summary: dict[str, Any]) -> dict[str, object]:
+    matched_count = summary.get("matched_count", summary.get("count"))
     keys = [
         "coverage",
         "mean_3d_error_m",
@@ -343,7 +460,12 @@ def paper_error_columns(summary: dict[str, Any]) -> dict[str, object]:
         "p95_2d_error_m",
         "max_2d_error_m",
     ]
-    return {key: rounded(summary.get(key)) for key in keys}
+    out: dict[str, object] = {
+        "matched_count": integer(matched_count),
+        "eval_sample_count": integer(summary.get("eval_sample_count")),
+    }
+    out.update({key: rounded(summary.get(key)) for key in keys})
+    return out
 
 
 def stats(errors: np.ndarray, suffix: str) -> dict[str, float]:
@@ -364,6 +486,74 @@ def stats(errors: np.ndarray, suffix: str) -> dict[str, float]:
         f"p95_{suffix}_error_m": float(np.percentile(values, 95)),
         f"max_{suffix}_error_m": float(np.max(values)),
     }
+
+
+def build_leaderboard_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    """Return a paper-metric leaderboard ranked by mean 3D error within each flight."""
+
+    grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
+    for row in rows:
+        entry = {
+            column: row.get(column, "")
+            for column in PAPER_LEADERBOARD_COLUMNS
+            if column != "rank"
+        }
+        entry["paper_primary_metric"] = PAPER_PRIMARY_METRIC
+        key = (str(entry.get("flight", "")), str(entry.get("row_type", "")))
+        grouped.setdefault(key, []).append(entry)
+
+    leaderboard: list[dict[str, object]] = []
+    for key in sorted(grouped, key=lambda item: (item[0], ROW_TYPE_SORT.get(item[1], 99), item[1])):
+        rank = 1
+        ordered = sorted(
+            grouped[key],
+            key=lambda row: (
+                metric_sort_value(row, PAPER_PRIMARY_METRIC),
+                str(row.get("method", "")),
+            ),
+        )
+        for entry in ordered:
+            metric_value = finite_float(entry.get(PAPER_PRIMARY_METRIC))
+            entry["rank"] = rank if metric_value is not None else ""
+            if metric_value is not None:
+                rank += 1
+            leaderboard.append(entry)
+    return leaderboard
+
+
+def sort_report_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    return sorted(
+        rows,
+        key=lambda row: (
+            str(row.get("flight", "")),
+            ROW_TYPE_SORT.get(str(row.get("row_type", "")), 99),
+            metric_sort_value(row, PAPER_PRIMARY_METRIC),
+            str(row.get("method", "")),
+        ),
+    )
+
+
+def metric_sort_value(row: dict[str, object], metric: str) -> float:
+    value = finite_float(row.get(metric))
+    return value if value is not None else float("inf")
+
+
+def finite_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if np.isfinite(numeric) else None
+
+
+def first_existing(row: pd.Series, names: tuple[str, ...]) -> object:
+    for name in names:
+        value = row.get(name)
+        if finite_float(value) is not None:
+            return value
+    return ""
 
 
 def load_truth(dataset_root: Path, flight_name: str) -> pd.DataFrame:
@@ -413,9 +603,18 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def write_csv(path: Path, rows: list[dict[str, object]]) -> None:
+def write_csv(
+    path: Path,
+    rows: list[dict[str, object]],
+    *,
+    preferred_columns: list[str] | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     columns: list[str] = []
+    if preferred_columns is not None:
+        for column in preferred_columns:
+            if any(column in row for row in rows) and column not in columns:
+                columns.append(column)
     for row in rows:
         for key in row:
             if key not in columns:
@@ -452,6 +651,11 @@ def rounded(value: object) -> object:
     except (TypeError, ValueError):
         return ""
     return round(out, 3) if np.isfinite(out) else ""
+
+
+def integer(value: object) -> object:
+    numeric = finite_float(value)
+    return int(round(numeric)) if numeric is not None else ""
 
 
 def safe_divide(numerator: float, denominator: float) -> object:

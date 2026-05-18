@@ -23,6 +23,7 @@ BIAS_MODEL_VERSION = 1
 RF_TARGET_COLUMNS = ("east_m", "north_m")
 RADAR_TARGET_COLUMNS = ("east_m", "north_m", "up_m")
 TARGET_COLUMNS_BY_SOURCE = {"rf": RF_TARGET_COLUMNS, "radar": RADAR_TARGET_COLUMNS}
+BIAS_RESIDUAL_STD_COLUMN_PREFIX = "bias_residual_std_"
 
 _DEFAULT_FEATURE_COLUMNS: dict[str, tuple[str, ...]] = {
     "rf": ("time_s", "east_m", "north_m", "std_m", "CEP"),
@@ -38,7 +39,6 @@ _DEFAULT_FEATURE_COLUMNS: dict[str, tuple[str, ...]] = {
         "velocity_north_mps",
         "velocity_east_mps",
         "velocity_down_mps",
-        "track_id",
     ),
 }
 
@@ -109,11 +109,16 @@ class SensorBiasCorrectionModel:
         for index, column in enumerate(self.target_columns):
             raw_column = _raw_column_name(column)
             bias_column = _bias_column_name(column)
+            residual_std_column = _bias_residual_std_column_name(column)
             raw = pd.to_numeric(out[raw_column], errors="coerce").to_numpy(dtype=float)
             bias = predicted[:, index]
             corrected = raw - bias
             valid = np.isfinite(raw) & np.isfinite(bias)
+            residual_std = float(self.residual_std[index])
+            if not np.isfinite(residual_std) or residual_std < 0.0:
+                residual_std = float("nan")
             out[bias_column] = bias
+            out[residual_std_column] = residual_std
             out.loc[valid, column] = corrected[valid]
         out["bias_correction_source"] = self.source
         out["bias_correction_training_rows"] = int(self.training_rows)
@@ -566,3 +571,7 @@ def _raw_column_name(column: str) -> str:
 
 def _bias_column_name(column: str) -> str:
     return f"bias_{column}"
+
+
+def _bias_residual_std_column_name(column: str) -> str:
+    return f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}{column}"
