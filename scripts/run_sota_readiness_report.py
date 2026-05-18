@@ -184,7 +184,9 @@ def main() -> int:
     return 0
 
 
-def run_or_collect_tracking(args: argparse.Namespace, method: str, flight: str) -> dict[str, object]:
+def run_or_collect_tracking(
+    args: argparse.Namespace, method: str, flight: str
+) -> dict[str, object]:
     run_dir = args.output_dir / "runs" / method
     metrics_path = run_dir / flight / "metrics.json"
     estimates_path = run_dir / flight / "estimates.csv"
@@ -303,8 +305,12 @@ def lofo_rows(path: Path) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for _, item in frame.iterrows():
         flight = str(item.get("flight", ""))
-        row = base_row(method="tracklet-viterbi-lofo-time-offset", flight=flight, row_type="tracking")
-        row["matched_count"] = integer(first_existing(item, ("matched_count", "count", "n_matched")))
+        row = base_row(
+            method="tracklet-viterbi-lofo-time-offset", flight=flight, row_type="tracking"
+        )
+        row["matched_count"] = integer(
+            first_existing(item, ("matched_count", "count", "n_matched"))
+        )
         row["eval_sample_count"] = integer(
             first_existing(item, ("eval_sample_count", "posterior_records", "n_estimates"))
         )
@@ -375,7 +381,9 @@ def extract_tracking_metadata(
     return out
 
 
-def selected_radar_diagnostics(selected: pd.DataFrame, *, frame_count: int = 0) -> dict[str, object]:
+def selected_radar_diagnostics(
+    selected: pd.DataFrame, *, frame_count: int = 0
+) -> dict[str, object]:
     if selected.empty:
         return {
             "selected_radar_rows": 0,
@@ -412,10 +420,20 @@ def error_summary_from_estimates(
     truth_times = truth["time_s"].to_numpy(dtype=float)
     truth_positions = truth[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
     errors_3d = position_errors_m(
-        times, positions, truth_times, truth_positions, max_time_delta_s=max_time_delta_s, dimensions=3
+        times,
+        positions,
+        truth_times,
+        truth_positions,
+        max_time_delta_s=max_time_delta_s,
+        dimensions=3,
     )
     errors_2d = position_errors_m(
-        times, positions, truth_times, truth_positions, max_time_delta_s=max_time_delta_s, dimensions=2
+        times,
+        positions,
+        truth_times,
+        truth_positions,
+        max_time_delta_s=max_time_delta_s,
+        dimensions=2,
     )
     summary = {
         "matched_count": int(errors_3d.size),
@@ -475,7 +493,11 @@ def build_leaderboard_rows(rows: list[dict[str, object]]) -> list[dict[str, obje
 
     grouped: dict[tuple[str, str], list[dict[str, object]]] = {}
     for row in rows:
-        entry = {column: row.get(column, "") for column in PAPER_LEADERBOARD_COLUMNS if column != "rank"}
+        entry = {
+            column: row.get(column, "")
+            for column in PAPER_LEADERBOARD_COLUMNS
+            if column != "rank"
+        }
         entry["paper_primary_metric"] = PAPER_PRIMARY_METRIC
         key = (str(entry.get("flight", "")), str(entry.get("row_type", "")))
         grouped.setdefault(key, []).append(entry)
@@ -485,7 +507,10 @@ def build_leaderboard_rows(rows: list[dict[str, object]]) -> list[dict[str, obje
         rank = 1
         ordered = sorted(
             grouped[key],
-            key=lambda row: (metric_sort_value(row, PAPER_PRIMARY_METRIC), str(row.get("method", ""))),
+            key=lambda row: (
+                metric_sort_value(row, PAPER_PRIMARY_METRIC),
+                str(row.get("method", "")),
+            ),
         )
         for entry in ordered:
             metric_value = finite_float(entry.get(PAPER_PRIMARY_METRIC))
