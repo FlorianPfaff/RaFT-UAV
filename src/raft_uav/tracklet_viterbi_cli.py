@@ -7,22 +7,26 @@ The ``raft-uav-tracklet-viterbi`` command remains as a compatibility alias for
 older experiment notes.
 
 Controlled ablation runs can select the base, retention-aware, or
-range-covariance-aware implementation through environment variables. This
-avoids invasive changes to the shared ``raft_uav.cli`` parser while still
-letting experiment scripts isolate retention, soft class-probability handling,
-track-support priors, and range-adaptive radar covariance.
+range-covariance-aware implementation through wrapper-only command-line
+arguments or matching environment variables. The wrapper strips those
+``--tracklet-*`` arguments before forwarding to the shared base CLI parser.
 """
 
 from __future__ import annotations
 
+import argparse
 from collections.abc import Callable, Iterable, Mapping
+from contextlib import contextmanager
 import os
+import sys
 
 import pandas as pd
 
 from raft_uav import cli as _base_cli
 from raft_uav.baselines import tracklet_viterbi as _base_tracklet_viterbi
-from raft_uav.baselines import tracklet_viterbi_range_covariance as _range_covariance_tracklet_viterbi
+from raft_uav.baselines import (
+    tracklet_viterbi_range_covariance as _range_covariance_tracklet_viterbi,
+)
 from raft_uav.baselines import tracklet_viterbi_retention as _retention_tracklet_viterbi
 from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.baselines.radar_association import (
@@ -41,6 +45,7 @@ _MAX_CANDIDATES_PER_FRAME_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_FRAME"
 _MAX_CANDIDATE_POOL_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATE_POOL_PER_FRAME"
 _MAX_CANDIDATES_PER_TRACK_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_TRACK_ID"
 _TRACKLET_VARIANTS = ("base", "retention", "range-covariance")
+_CATPROB_RETENTION_MODES = ("soft", "hard")
 
 
 class _TrackletConfigOverlay:
@@ -191,6 +196,79 @@ def _tracklet_config_from_environment() -> _TrackletConfigOverlay:
     )
 
 
+def _tracklet_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--tracklet-variant", choices=_TRACKLET_VARIANTS)
+    parser.add_argument("--tracklet-catprob-retention-mode", choices=_CATPROB_RETENTION_MODES)
+    parser.add_argument(
+        "--tracklet-below-catprob-threshold-penalty",
+        type=_nonnegative_float,
+    )
+    parser.add_argument("--tracklet-track-support-weight", type=_nonnegative_float)
+    parser.add_argument("--tracklet-max-track-support-reward", type=_nonnegative_float)
+    parser.add_argument("--tracklet-max-candidates-per-frame", type=_positive_int)
+    parser.add_argument("--tracklet-max-candidate-pool-per-frame", type=_positive_int)
+    parser.add_argument("--tracklet-max-candidates-per-track-id", type=_positive_int)
+    return parser
+
+
+def _extract_tracklet_args(argv: list[str] | None) -> tuple[list[str], dict[str, str]]:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    namespace, remaining = _tracklet_parser().parse_known_args(raw_argv)
+    updates = _environment_updates_from_namespace(namespace)
+    return remaining, updates
+
+
+def _environment_updates_from_namespace(namespace: argparse.Namespace) -> dict[str, str]:
+    updates: dict[str, str] = {}
+    _maybe_add(updates, _TRACKLET_VARIANT_ENV, namespace.tracklet_variant)
+    _maybe_add(updates, _CATPROB_MODE_ENV, namespace.tracklet_catprob_retention_mode)
+    _maybe_add(
+        updates,
+        _BELOW_CATPROB_PENALTY_ENV,
+        namespace.tracklet_below_catprob_threshold_penalty,
+    )
+    _maybe_add(updates, _TRACK_SUPPORT_WEIGHT_ENV, namespace.tracklet_track_support_weight)
+    _maybe_add(updates, _MAX_TRACK_SUPPORT_REWARD_ENV, namespace.tracklet_max_track_support_reward)
+    _maybe_add(updates, _MAX_CANDIDATES_PER_FRAME_ENV, namespace.tracklet_max_candidates_per_frame)
+    _maybe_add(updates, _MAX_CANDIDATE_POOL_ENV, namespace.tracklet_max_candidate_pool_per_frame)
+    _maybe_add(updates, _MAX_CANDIDATES_PER_TRACK_ENV, namespace.tracklet_max_candidates_per_track_id)
+    return updates
+
+
+def _maybe_add(updates: dict[str, str], key: str, value: object | None) -> None:
+    if value is not None:
+        updates[key] = str(value)
+
+
+@contextmanager
+def _temporary_environment(updates: Mapping[str, str]):
+    previous = {key: os.environ.get(key) for key in updates}
+    os.environ.update(updates)
+    try:
+        yield
+    finally:
+        for key, value in previous.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0.0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def _env_str(name: str, default: str) -> str:
     value = os.environ.get(name)
     return default if value is None or value == "" else value
@@ -213,11 +291,13 @@ def _env_int(name: str, default: int) -> int:
 def main(argv: list[str] | None = None) -> int:
     """Run the standard CLI with tracklet-Viterbi association enabled."""
 
+    filtered_argv, env_updates = _extract_tracklet_args(argv)
     _base_cli.RADAR_ASSOCIATION_MODES = enabled_radar_association_modes()
     _base_cli.run_async_cv_baseline_with_radar_association = (
         run_async_cv_baseline_with_radar_association
     )
-    return _base_cli.main(argv)
+    with _temporary_environment(env_updates):
+        return _base_cli.main(filtered_argv)
 
 
 if __name__ == "__main__":
