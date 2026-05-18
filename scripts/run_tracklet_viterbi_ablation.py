@@ -16,6 +16,7 @@ import ablation_common as common  # noqa: E402
 from raft_uav.tracklet_viterbi_cli import (  # noqa: E402
     _BELOW_CATPROB_PENALTY_ENV,
     _MAX_CANDIDATE_POOL_ENV,
+    _MAX_CANDIDATES_PER_FRAME_ENV,
     _MAX_CANDIDATES_PER_TRACK_ENV,
     _MAX_TRACK_SUPPORT_REWARD_ENV,
     _TRACK_SUPPORT_WEIGHT_ENV,
@@ -212,6 +213,7 @@ def _run_one(
 def _tracklet_environment(config: _Config) -> dict[str, str]:
     return {
         _TRACKLET_VARIANT_ENV: config.runner_variant,
+        _MAX_CANDIDATES_PER_FRAME_ENV: str(config.max_candidates_per_frame),
         _MAX_CANDIDATE_POOL_ENV: str(config.max_candidate_pool_per_frame),
         _MAX_CANDIDATES_PER_TRACK_ENV: str(config.max_candidates_per_track_id),
         _BELOW_CATPROB_PENALTY_ENV: str(config.below_catprob_threshold_penalty),
