@@ -319,8 +319,16 @@ def radar_measurements_to_enu(
     default_xy_std_m: float = 25.0,
     default_z_std_m: float = 35.0,
     default_velocity_std_mps: float = 12.0,
+    include_velocity: bool = False,
 ) -> list[TrackingMeasurement]:
-    """Convert radar track rows to ENU position or position-plus-velocity measurements."""
+    """Convert radar track rows to ENU measurements.
+
+    The default is position-only, even when Fortem velocity components are
+    present. This keeps the legacy radar-selection baseline and the radar
+    association baselines on the same 3D measurement model. Set
+    ``include_velocity=True`` only for deliberate 6D position-plus-velocity
+    ablations.
+    """
 
     frame = radar
     if "east_m" not in frame.columns:
@@ -331,15 +339,18 @@ def radar_measurements_to_enu(
     position_covariance = np.diag(
         [default_xy_std_m**2, default_xy_std_m**2, default_z_std_m**2]
     )
-    full_covariance = np.zeros((6, 6), dtype=float)
-    full_covariance[:3, :3] = position_covariance
-    full_covariance[3:, 3:] = np.diag([default_velocity_std_mps**2] * 3)
     measurements: list[TrackingMeasurement] = []
     for _, row in frame.iterrows():
         position = np.array([float(row["east_m"]), float(row["north_m"]), float(row["up_m"])])
-        velocity = _radar_velocity_vector_enu(row)
-        vector = position if velocity is None else np.concatenate([position, velocity])
-        covariance = position_covariance if velocity is None else full_covariance
+        velocity = _radar_velocity_vector_enu(row) if include_velocity else None
+        if velocity is None:
+            vector = position
+            covariance = position_covariance
+        else:
+            vector = np.concatenate([position, velocity])
+            covariance = np.zeros((6, 6), dtype=float)
+            covariance[:3, :3] = position_covariance
+            covariance[3:, 3:] = np.diag([default_velocity_std_mps**2] * 3)
         measurements.append(
             TrackingMeasurement(
                 time_s=float(row["time_s"]),
