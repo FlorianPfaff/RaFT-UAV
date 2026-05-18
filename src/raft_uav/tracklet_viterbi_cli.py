@@ -5,25 +5,52 @@ association dispatcher before argument parsing.  It keeps the default
 ``raft-uav`` entry point unchanged while exposing the experimental
 sequence-level association method through ``raft-uav-tracklet-viterbi`` or
 ``python -m raft_uav.tracklet_viterbi_cli``.
+
+Controlled ablation runs can select the base or retention-aware implementation
+through environment variables. This avoids invasive changes to the shared
+``raft_uav.cli`` parser while still letting experiment scripts isolate the
+effect of retention, soft class-probability handling, and track-support priors.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+import os
 
 import pandas as pd
 
 from raft_uav import cli as _base_cli
+from raft_uav.baselines import tracklet_viterbi as _base_tracklet_viterbi
+from raft_uav.baselines import tracklet_viterbi_retention as _retention_tracklet_viterbi
 from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.baselines.radar_association import (
     RADAR_ASSOCIATION_MODES as _BASE_RADAR_ASSOCIATION_MODES,
     run_async_cv_baseline_with_radar_association as _base_radar_association_runner,
 )
-from raft_uav.baselines.tracklet_viterbi_retention import (
-    run_async_cv_baseline_with_tracklet_viterbi_association,
-)
+from raft_uav.baselines.tracklet_viterbi import TrackletViterbiAssociationConfig
 
 _TRACKLET_MODE = "tracklet-viterbi"
+_TRACKLET_VARIANT_ENV = "RAFT_UAV_TRACKLET_VARIANT"
+_CATPROB_MODE_ENV = "RAFT_UAV_TRACKLET_CATPROB_RETENTION_MODE"
+_BELOW_CATPROB_PENALTY_ENV = "RAFT_UAV_TRACKLET_BELOW_CATPROB_THRESHOLD_PENALTY"
+_TRACK_SUPPORT_WEIGHT_ENV = "RAFT_UAV_TRACKLET_SUPPORT_WEIGHT"
+_MAX_TRACK_SUPPORT_REWARD_ENV = "RAFT_UAV_TRACKLET_MAX_SUPPORT_REWARD"
+_MAX_CANDIDATE_POOL_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATE_POOL_PER_FRAME"
+_MAX_CANDIDATES_PER_TRACK_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_TRACK_ID"
+_TRACKLET_VARIANTS = ("base", "retention")
+
+
+class _TrackletConfigOverlay:
+    """Expose base Viterbi config fields plus experiment-only extension fields."""
+
+    def __init__(self, base: TrackletViterbiAssociationConfig, **overrides: object) -> None:
+        self._base = base
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> object:
+        if name in self._overrides:
+            return self._overrides[name]
+        return getattr(self._base, name)
 
 
 def run_async_cv_baseline_with_radar_association(
@@ -69,7 +96,9 @@ def run_async_cv_baseline_with_radar_association(
         del track_bank_max_assignments, track_bank_max_candidates, track_bank_gate_probability
         del track_bank_detection_probability, track_bank_clutter_intensity
         del track_bank_prune_log_weight_delta, truth_gate_m, truth_time_gate_s
-        return run_async_cv_baseline_with_tracklet_viterbi_association(
+        runner = _tracklet_runner_from_environment()
+        config = _tracklet_config_from_environment()
+        return runner(
             rf_measurements=list(rf_measurements),
             radar=radar,
             acceleration_std_mps2=acceleration_std_mps2,
@@ -83,6 +112,7 @@ def run_async_cv_baseline_with_radar_association(
             inflation_alpha_by_source=inflation_alpha_by_source,
             max_residual_norms_by_source=max_residual_norms_by_source,
             candidate_catprob_threshold=candidate_catprob_threshold,
+            config=config,
         )
 
     return _base_radar_association_runner(
@@ -118,6 +148,50 @@ def run_async_cv_baseline_with_radar_association(
         truth_gate_m=truth_gate_m,
         truth_time_gate_s=truth_time_gate_s,
     )
+
+
+def _tracklet_runner_from_environment() -> Callable[
+    ..., tuple[list[dict[str, object]], pd.DataFrame]
+]:
+    variant = os.environ.get(_TRACKLET_VARIANT_ENV, "retention").strip().lower()
+    if variant == "base":
+        return _base_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
+    if variant == "retention":
+        return _retention_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
+    raise ValueError(
+        f"{_TRACKLET_VARIANT_ENV} must be one of {_TRACKLET_VARIANTS}; got {variant!r}"
+    )
+
+
+def _tracklet_config_from_environment() -> _TrackletConfigOverlay:
+    return _TrackletConfigOverlay(
+        TrackletViterbiAssociationConfig(),
+        catprob_retention_mode=_env_str(_CATPROB_MODE_ENV, "soft"),
+        below_catprob_threshold_penalty=_env_float(_BELOW_CATPROB_PENALTY_ENV, 3.0),
+        track_support_weight=_env_float(_TRACK_SUPPORT_WEIGHT_ENV, 0.45),
+        max_track_support_reward=_env_float(_MAX_TRACK_SUPPORT_REWARD_ENV, 4.0),
+        max_candidate_pool_per_frame=_env_int(_MAX_CANDIDATE_POOL_ENV, 24),
+        max_candidates_per_track_id=_env_int(_MAX_CANDIDATES_PER_TRACK_ENV, 1),
+    )
+
+
+def _env_str(name: str, default: str) -> str:
+    value = os.environ.get(name)
+    return default if value is None or value == "" else value
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return float(value)
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    return int(value)
 
 
 def main(argv: list[str] | None = None) -> int:
