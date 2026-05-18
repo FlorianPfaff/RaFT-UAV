@@ -1,9 +1,16 @@
 import numpy as np
 import pandas as pd
+import pytest
 
 from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.baselines.tracklet_viterbi import (
     run_async_cv_baseline_with_tracklet_viterbi_association,
+)
+from raft_uav.baselines.tracklet_viterbi_range_covariance import (
+    run_async_cv_baseline_with_tracklet_viterbi_association as run_range_covariance_tracklet_viterbi,
+)
+from raft_uav.baselines.tracklet_viterbi_retention import (
+    run_async_cv_baseline_with_tracklet_viterbi_association as run_retention_tracklet_viterbi,
 )
 
 
@@ -16,7 +23,15 @@ def _rf_measurement(time_s: float) -> TrackingMeasurement:
     )
 
 
-def test_tracklet_viterbi_skips_pre_rf_radar_bootstrap():
+@pytest.mark.parametrize(
+    "runner",
+    [
+        run_async_cv_baseline_with_tracklet_viterbi_association,
+        run_retention_tracklet_viterbi,
+        run_range_covariance_tracklet_viterbi,
+    ],
+)
+def test_tracklet_viterbi_skips_pre_rf_radar_bootstrap(runner):
     radar = pd.DataFrame(
         [
             {
@@ -40,7 +55,7 @@ def test_tracklet_viterbi_skips_pre_rf_radar_bootstrap():
         ]
     )
 
-    records, selected = run_async_cv_baseline_with_tracklet_viterbi_association(
+    records, selected = runner(
         rf_measurements=[_rf_measurement(1.0)],
         radar=radar,
         candidate_catprob_threshold=None,

@@ -59,6 +59,10 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     events = _events(list(rf_measurements), radar)
     if not events:
         return [], _empty_selected_radar(radar)
+    bootstrap_index = _base._first_rf_bootstrap_index(events)
+    if bootstrap_index is None:
+        return [], _empty_selected_radar(radar)
+    events = events[bootstrap_index:]
     initial = _initial_measurement(
         events[0],
         association="tracklet-viterbi",
