@@ -39,6 +39,11 @@ name: Stable radar segment ablation
         required: false
         type: string
         default: "0 2 5 10"
+      interpolation_max_speeds_mps:
+        description: "Space-separated max interpolation speeds in m/s; 0 disables the speed cap."
+        required: false
+        type: string
+        default: "0 65 100"
       min_segment_frames:
         description: "Space-separated stable-segment minimum frame counts."
         required: false
@@ -97,6 +102,7 @@ jobs:
       CATPROB_THRESHOLDS: ${{ inputs.catprob_thresholds }}
       RANGE_GATES_M: ${{ inputs.range_gates_m }}
       INTERPOLATION_MAX_GAPS_S: ${{ inputs.interpolation_max_gaps_s }}
+      INTERPOLATION_MAX_SPEEDS_MPS: ${{ inputs.interpolation_max_speeds_mps }}
       MIN_SEGMENT_FRAMES: ${{ inputs.min_segment_frames }}
       MAX_TRANSITION_SPEEDS_MPS: ${{ inputs.max_transition_speeds_mps }}
       RANKING_MIN_COVERAGE: ${{ inputs.ranking_min_coverage }}
@@ -168,6 +174,7 @@ jobs:
             --catprob-thresholds ${CATPROB_THRESHOLDS}
             --range-gates-m ${RANGE_GATES_M}
             --interpolation-max-gaps-s ${INTERPOLATION_MAX_GAPS_S}
+            --interpolation-max-speeds-mps ${INTERPOLATION_MAX_SPEEDS_MPS}
             --min-segment-frames ${MIN_SEGMENT_FRAMES}
             --max-transition-speeds-mps ${MAX_TRANSITION_SPEEDS_MPS}
             --ranking-min-coverage "${RANKING_MIN_COVERAGE}"
@@ -214,6 +221,7 @@ jobs:
                       "coverage",
                       "selected_interpolated_fraction",
                       "interpolation_dropped_frame_count",
+                      "interpolation_high_speed_dropped_count",
                       "error_3d_mean_m",
                       "error_3d_rmse_m",
                       "error_3d_p95_m",
@@ -241,6 +249,7 @@ jobs:
               "coverage",
               "selected_interpolated_fraction",
               "interpolation_dropped_frame_count",
+              "interpolation_high_speed_dropped_count",
               "error_3d_mean_m",
               "error_3d_p95_m",
               "track_switches",

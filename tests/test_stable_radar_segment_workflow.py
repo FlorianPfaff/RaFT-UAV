@@ -19,7 +19,9 @@ def test_stable_radar_segment_workflow_runs_dataset_backed_ablation() -> None:
     assert "scripts/run_stable_radar_segment_ablation.py" in workflow
     assert "--flights ${FLIGHTS}" in workflow
     assert "--interpolation-max-gaps-s ${INTERPOLATION_MAX_GAPS_S}" in workflow
+    assert "--interpolation-max-speeds-mps ${INTERPOLATION_MAX_SPEEDS_MPS}" in workflow
     assert "interpolation_dropped_frame_count" in workflow
+    assert "interpolation_high_speed_dropped_count" in workflow
     assert "--ranking-output" in workflow
     assert "--recommendation-output" in workflow
     assert "stable_radar_segment_ablation_recommendation.json" in workflow

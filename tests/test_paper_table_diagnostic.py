@@ -318,6 +318,58 @@ def test_interpolated_radar_selection_respects_max_anchor_gap():
     assert selected["association_interpolation_max_gap_s"].tolist() == [3.0, 3.0]
 
 
+def test_interpolated_radar_selection_respects_max_anchor_speed():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 0,
+                "track_id": 1,
+                "time_s": 0.0,
+                "east_m": 0.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 0.0,
+                "cat_prob_uav": 0.9,
+            },
+            {
+                "frame_index": 1,
+                "track_id": 2,
+                "time_s": 1.0,
+                "east_m": 500.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 500.0,
+                "cat_prob_uav": 0.9,
+            },
+            {
+                "frame_index": 2,
+                "track_id": 1,
+                "time_s": 2.0,
+                "east_m": 100.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 100.0,
+                "cat_prob_uav": 0.9,
+            },
+        ]
+    )
+
+    selected = select_radar_for_table(
+        radar=radar,
+        truth=_truth(),
+        selection="radar-longest-track-range-gated-interpolated",
+        catprob_threshold=0.4,
+        range_gate_m=800.0,
+        radar_interpolation_max_speed_mps=25.0,
+        max_time_delta_s=0.5,
+    )
+
+    assert selected["time_s"].tolist() == [0.0, 2.0]
+    assert selected["association_max_anchor_speed_mps"].tolist() == [50.0, 50.0]
+    assert selected["association_interpolation_high_speed_dropped_count"].tolist() == [1, 1]
+    assert selected["association_interpolation_max_speed_mps"].tolist() == [25.0, 25.0]
+
+
 def test_range_gated_longest_track_prefers_longest_continuous_segment():
     radar = pd.DataFrame(
         [
