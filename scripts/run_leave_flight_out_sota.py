@@ -115,6 +115,14 @@ METHODS: dict[str, MethodSpec] = {
     "imm_catprob_robust": MethodSpec(
         "imm_catprob_robust", "imm", "IMM catprob robust", robust=True
     ),
+    "imm_tracklet_viterbi_fixed_lag": MethodSpec(
+        "imm_tracklet_viterbi_fixed_lag",
+        "tracklet",
+        "IMM tracklet-Viterbi fixed-lag",
+        association="tracklet-viterbi",
+        fixed_lag=True,
+        robust=True,
+    ),
     "hetero_cv": MethodSpec("hetero_cv", "hetero", "Heteroscedastic CV"),
     "hetero_cv_fixed_lag": MethodSpec(
         "hetero_cv_fixed_lag", "hetero", "Heteroscedastic CV fixed-lag", fixed_lag=True
@@ -142,6 +150,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cv_stable_segments_hybrid_fixed_lag",
             "cv_stable_segments_interpolated_fixed_lag",
             "imm_catprob",
+            "imm_tracklet_viterbi_fixed_lag",
             "hetero_cv_fixed_lag",
         ],
     )
@@ -379,6 +388,29 @@ def _run_method(args: argparse.Namespace, method: MethodSpec, flight: str, run_d
             association=method.association,
             extra_options=options,
         )
+        return
+    if method.runner == "tracklet":
+        command = [
+            sys.executable,
+            "-m",
+            "raft_uav.tracklet_viterbi_cli",
+            "run-baseline",
+            str(args.dataset_root),
+            "--flight",
+            flight,
+            "--output-dir",
+            str(run_dir),
+            "--radar-association",
+            method.association,
+            "--radar-catprob-threshold",
+            str(args.candidate_threshold),
+            "--tracklet-variant",
+            "range-covariance",
+            "--tracklet-replay-tracker",
+            "imm",
+            *[str(option) for option in options],
+        ]
+        _run(command)
         return
     if method.runner == "imm":
         command = [
