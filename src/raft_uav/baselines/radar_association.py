@@ -33,7 +33,12 @@ RADAR_ASSOCIATION_MODES = (
     "pda-mixture",
     "track-bank",
     "stable-segments",
+    "stable-segments-interpolated",
 )
+_STABLE_SEGMENT_ASSOCIATION_MODES = {
+    "stable-segments",
+    "stable-segments-interpolated",
+}
 
 
 @dataclass(frozen=True)
@@ -86,6 +91,8 @@ def run_async_cv_baseline_with_radar_association(
     stable_segment_min_frames: int = 100,
     stable_segment_max_transition_speed_mps: float = 65.0,
     stable_segment_range_gate_m: float | None = 800.0,
+    stable_segment_interpolation_max_gap_s: float | None = 5.0,
+    stable_segment_interpolation_max_speed_mps: float | None = 65.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
@@ -103,7 +110,9 @@ def run_async_cv_baseline_with_radar_association(
     ``track-bank`` uses PyRecEst's track-oriented MHT to keep multiple
     single-target association hypotheses alive across radar frames.
     ``stable-segments`` preselects stitched high-confidence Fortem track
-    segments and skips all other radar frames.
+    segments and skips all other radar frames. ``stable-segments-interpolated``
+    uses the same anchors, then fills only radar frame times bracketed by
+    plausible stable anchors.
     """
 
     if association not in RADAR_ASSOCIATION_MODES:
@@ -145,6 +154,16 @@ def run_async_cv_baseline_with_radar_association(
         raise ValueError("stable_segment_max_transition_speed_mps must be positive")
     if stable_segment_range_gate_m is not None and stable_segment_range_gate_m <= 0.0:
         raise ValueError("stable_segment_range_gate_m must be positive or None")
+    if (
+        stable_segment_interpolation_max_gap_s is not None
+        and stable_segment_interpolation_max_gap_s <= 0.0
+    ):
+        raise ValueError("stable_segment_interpolation_max_gap_s must be positive or None")
+    if (
+        stable_segment_interpolation_max_speed_mps is not None
+        and stable_segment_interpolation_max_speed_mps <= 0.0
+    ):
+        raise ValueError("stable_segment_interpolation_max_speed_mps must be positive or None")
 
     covariance = np.diag([float(radar_xy_std_m) ** 2, float(radar_xy_std_m) ** 2, float(radar_z_std_m) ** 2])
     if association == "track-bank":
@@ -175,7 +194,7 @@ def run_async_cv_baseline_with_radar_association(
         return [], _empty_selected_radar(radar)
 
     stable_anchor_by_key: dict[object, pd.Series] | None = None
-    if association == "stable-segments":
+    if association in _STABLE_SEGMENT_ASSOCIATION_MODES:
         stable_anchors = _select_stable_radar_segments(
             radar,
             range_gate_m=stable_segment_range_gate_m,
@@ -183,13 +202,23 @@ def run_async_cv_baseline_with_radar_association(
             min_segment_frames=stable_segment_min_frames,
             max_transition_speed_mps=stable_segment_max_transition_speed_mps,
         )
+        if association == "stable-segments-interpolated":
+            stable_anchors = _interpolate_stable_radar_segments_to_frame_times(
+                radar,
+                stable_anchors,
+                association_mode=association,
+                max_gap_s=stable_segment_interpolation_max_gap_s,
+                max_speed_mps=stable_segment_interpolation_max_speed_mps,
+            )
         stable_anchor_by_key = {
             _radar_row_key(row): row for _, row in stable_anchors.iterrows()
         }
 
     start_index = 0
     initial_measurement = None
-    initial_events = enumerate(events) if association == "stable-segments" else [(0, events[0])]
+    initial_events = (
+        enumerate(events) if association in _STABLE_SEGMENT_ASSOCIATION_MODES else [(0, events[0])]
+    )
     for index, event in initial_events:
         initial_measurement = _initial_measurement(
             event,
@@ -822,6 +851,217 @@ def _select_stable_radar_segments(
     return selected.sort_values(sort_columns).reset_index(drop=True)
 
 
+def _interpolate_stable_radar_segments_to_frame_times(
+    radar: pd.DataFrame,
+    anchors: pd.DataFrame,
+    *,
+    association_mode: str,
+    max_gap_s: float | None,
+    max_speed_mps: float | None,
+) -> pd.DataFrame:
+    """Interpolate clean stable-segment anchors onto radar frame timestamps."""
+
+    if radar.empty or anchors.empty:
+        return _empty_selected_radar(radar)
+    frame_rows = _radar_frame_reference_rows(radar)
+    if frame_rows.empty:
+        return _empty_selected_radar(radar)
+
+    ordered_anchors = (
+        anchors.sort_values("time_s")
+        .drop_duplicates(subset=["time_s"], keep="last")
+        .reset_index(drop=True)
+    )
+    anchor_times = ordered_anchors["time_s"].to_numpy(dtype=float)
+    if anchor_times.size == 0:
+        return _empty_selected_radar(radar)
+    frame_times = frame_rows["time_s"].to_numpy(dtype=float)
+    keep = (frame_times >= anchor_times[0]) & (frame_times <= anchor_times[-1])
+    outside_anchor_dropped_count = int(np.count_nonzero(~keep))
+    long_gap_dropped_count = 0
+    high_speed_dropped_count = 0
+    if max_gap_s is not None:
+        gap_keep = _within_interpolation_gap(frame_times, anchor_times, max_gap_s=float(max_gap_s))
+        long_gap_dropped_count = int(np.count_nonzero(keep & ~gap_keep))
+        keep &= gap_keep
+
+    anchor_positions = ordered_anchors[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
+    anchor_speeds_mps = _anchor_speeds_mps(anchor_times, anchor_positions)
+    if max_speed_mps is not None:
+        speed_keep = _within_interpolation_speed(
+            frame_times,
+            anchor_times,
+            anchor_positions,
+            max_speed_mps=float(max_speed_mps),
+        )
+        high_speed_dropped_count = int(np.count_nonzero(keep & ~speed_keep))
+        keep &= speed_keep
+
+    kept_frames = frame_rows.loc[keep].reset_index(drop=True)
+    if kept_frames.empty:
+        return _empty_selected_radar(radar)
+
+    anchor_by_key = {_radar_row_key(row): row for _, row in anchors.iterrows()}
+    anchor_gaps_s = np.diff(anchor_times)
+    max_anchor_gap_s = float(np.max(anchor_gaps_s)) if anchor_gaps_s.size else 0.0
+    max_anchor_speed_mps = (
+        float(np.max(anchor_speeds_mps)) if anchor_speeds_mps.size else 0.0
+    )
+    metadata = {
+        "association_anchor_count": int(anchor_times.size),
+        "association_anchor_span_s": float(anchor_times[-1] - anchor_times[0]),
+        "association_max_anchor_gap_s": max_anchor_gap_s,
+        "association_max_anchor_speed_mps": max_anchor_speed_mps,
+        "association_interpolation_candidate_frame_count": int(len(frame_rows)),
+        "association_interpolation_dropped_frame_count": int(len(frame_rows) - len(kept_frames)),
+        "association_interpolation_outside_anchor_dropped_count": outside_anchor_dropped_count,
+        "association_interpolation_long_gap_dropped_count": long_gap_dropped_count,
+        "association_interpolation_high_speed_dropped_count": high_speed_dropped_count,
+    }
+    if max_gap_s is not None:
+        metadata["association_interpolation_max_gap_s"] = float(max_gap_s)
+    if max_speed_mps is not None:
+        metadata["association_interpolation_max_speed_mps"] = float(max_speed_mps)
+
+    interpolated_rows: list[pd.Series] = []
+    modal_track_id = _modal_track_id(ordered_anchors)
+    for _, frame_row in kept_frames.iterrows():
+        key = _radar_row_key(frame_row)
+        anchor = anchor_by_key.get(key)
+        if anchor is None:
+            row = _interpolated_radar_row(
+                frame_row,
+                anchor_times=anchor_times,
+                anchor_positions=anchor_positions,
+                modal_track_id=modal_track_id,
+            )
+            row["association_interpolated"] = True
+            row["association_action"] = "stable_segment_interpolated_anchor"
+        else:
+            row = anchor.copy()
+            row["association_interpolated"] = False
+            row["association_action"] = "stable_segment_anchor"
+        row["association_mode"] = association_mode
+        for name, value in metadata.items():
+            row[name] = value
+        interpolated_rows.append(row)
+
+    selected = pd.DataFrame(interpolated_rows)
+    sort_columns = [
+        column
+        for column in ("time_s", "frame_index", "track_id", "track_index")
+        if column in selected.columns
+    ]
+    return selected.sort_values(sort_columns).reset_index(drop=True)
+
+
+def _radar_frame_reference_rows(radar: pd.DataFrame) -> pd.DataFrame:
+    rows: list[pd.Series] = []
+    for group in _radar_frame_groups(radar):
+        row = group.iloc[0].copy()
+        row["time_s"] = float(group["time_s"].median())
+        if "frame_index" in group.columns:
+            values = pd.to_numeric(group["frame_index"], errors="coerce").dropna()
+            if not values.empty:
+                row["frame_index"] = int(values.iloc[0])
+        rows.append(row)
+    if not rows:
+        return radar.iloc[0:0].copy()
+    return pd.DataFrame(rows).reset_index(drop=True)
+
+
+def _interpolated_radar_row(
+    frame_row: pd.Series,
+    *,
+    anchor_times: np.ndarray,
+    anchor_positions: np.ndarray,
+    modal_track_id: int | None,
+) -> pd.Series:
+    time_s = float(frame_row["time_s"])
+    row = frame_row.copy()
+    row["time_s"] = time_s
+    for index, column in enumerate(("east_m", "north_m", "up_m")):
+        row[column] = float(np.interp(time_s, anchor_times, anchor_positions[:, index]))
+    if "range_m" in row.index:
+        row["range_m"] = float(np.linalg.norm(row[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)))
+    if modal_track_id is not None:
+        row["track_id"] = modal_track_id
+    return row
+
+
+def _modal_track_id(anchors: pd.DataFrame) -> int | None:
+    if "track_id" not in anchors.columns:
+        return None
+    values = pd.to_numeric(anchors["track_id"], errors="coerce").dropna()
+    if values.empty:
+        return None
+    return int(values.astype(int).mode().iloc[0])
+
+
+def _within_interpolation_gap(
+    frame_times: np.ndarray,
+    anchor_times: np.ndarray,
+    *,
+    max_gap_s: float,
+) -> np.ndarray:
+    """Return frames bracketed by anchors no farther apart than ``max_gap_s``."""
+
+    if frame_times.size == 0:
+        return np.zeros(0, dtype=bool)
+    if anchor_times.size <= 1:
+        return np.isin(frame_times, anchor_times)
+    insertion = np.searchsorted(anchor_times, frame_times, side="left")
+    on_anchor = insertion < anchor_times.size
+    on_anchor &= np.isclose(anchor_times[np.minimum(insertion, anchor_times.size - 1)], frame_times)
+    right = np.clip(insertion, 1, anchor_times.size - 1)
+    left = right - 1
+    bracket_gap_s = anchor_times[right] - anchor_times[left]
+    return on_anchor | (bracket_gap_s <= max_gap_s)
+
+
+def _within_interpolation_speed(
+    frame_times: np.ndarray,
+    anchor_times: np.ndarray,
+    anchor_positions: np.ndarray,
+    *,
+    max_speed_mps: float,
+) -> np.ndarray:
+    """Return frames bracketed by anchors no faster than ``max_speed_mps``."""
+
+    if frame_times.size == 0:
+        return np.zeros(0, dtype=bool)
+    if anchor_times.size <= 1:
+        return np.isin(frame_times, anchor_times)
+    insertion = np.searchsorted(anchor_times, frame_times, side="left")
+    on_anchor = insertion < anchor_times.size
+    on_anchor &= np.isclose(anchor_times[np.minimum(insertion, anchor_times.size - 1)], frame_times)
+    right = np.clip(insertion, 1, anchor_times.size - 1)
+    left = right - 1
+    dt_s = anchor_times[right] - anchor_times[left]
+    distance_m = np.linalg.norm(anchor_positions[right] - anchor_positions[left], axis=1)
+    speeds_mps = np.divide(
+        distance_m,
+        dt_s,
+        out=np.full_like(distance_m, np.inf, dtype=float),
+        where=dt_s > 0.0,
+    )
+    return on_anchor | (speeds_mps <= max_speed_mps)
+
+
+def _anchor_speeds_mps(anchor_times: np.ndarray, anchor_positions: np.ndarray) -> np.ndarray:
+    if anchor_times.size <= 1:
+        return np.empty(0)
+    dt_s = np.diff(anchor_times)
+    distance_m = np.linalg.norm(np.diff(anchor_positions, axis=0), axis=1)
+    speeds_mps = np.divide(
+        distance_m,
+        dt_s,
+        out=np.full_like(distance_m, np.inf, dtype=float),
+        where=dt_s > 0.0,
+    )
+    return speeds_mps[np.isfinite(speeds_mps)]
+
+
 def _stable_track_segments(
     radar: pd.DataFrame,
     *,
@@ -995,7 +1235,7 @@ def _initial_measurement(
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
-    elif association == "stable-segments":
+    elif association in _STABLE_SEGMENT_ASSOCIATION_MODES:
         selected = (
             None
             if stable_anchor_by_key is None
@@ -1037,15 +1277,18 @@ def _select_radar_candidate(
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
-    if association == "stable-segments":
+    if association in _STABLE_SEGMENT_ASSOCIATION_MODES:
         if stable_anchor_by_key is None:
             return None
         selected = stable_anchor_by_key.get(_radar_event_key({"candidates": candidates}))
         if selected is None:
             return None
         selected = selected.copy()
-        selected["association_mode"] = "stable-segments"
-        selected["association_action"] = "stable_segment_update"
+        selected["association_mode"] = association
+        if bool(selected.get("association_interpolated", False)):
+            selected["association_action"] = "stable_segment_interpolated_update"
+        else:
+            selected["association_action"] = "stable_segment_update"
         selected["association_candidate_rows"] = int(len(candidates))
         return selected
 
@@ -1471,6 +1714,9 @@ def _empty_selected_radar(radar: pd.DataFrame) -> pd.DataFrame:
         "association_effective_candidates",
         "association_weight_max",
         "association_position_spread_trace_m2",
+        "association_interpolated",
+        "association_anchor_count",
+        "association_interpolation_dropped_frame_count",
     ):
         selected[column] = []
     return selected
