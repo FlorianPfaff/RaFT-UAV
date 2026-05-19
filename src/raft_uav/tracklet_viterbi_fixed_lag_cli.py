@@ -63,6 +63,9 @@ def run_async_cv_baseline_with_radar_association(
     track_bank_detection_probability: float = 0.999,
     track_bank_clutter_intensity: float = 1.0e-12,
     track_bank_prune_log_weight_delta: float = 80.0,
+    stable_segment_min_frames: int = 100,
+    stable_segment_max_transition_speed_mps: float = 65.0,
+    stable_segment_range_gate_m: float | None = 800.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
@@ -74,7 +77,9 @@ def run_async_cv_baseline_with_radar_association(
         del pda_nis_temperature, pda_catprob_exponent, track_bank_max_hypotheses
         del track_bank_max_assignments, track_bank_max_candidates, track_bank_gate_probability
         del track_bank_detection_probability, track_bank_clutter_intensity
-        del track_bank_prune_log_weight_delta, truth_gate_m, truth_time_gate_s
+        del track_bank_prune_log_weight_delta, stable_segment_min_frames
+        del stable_segment_max_transition_speed_mps, stable_segment_range_gate_m
+        del truth_gate_m, truth_time_gate_s
         with _track_aware_node_builder(_track_support_by_id(radar)):
             records, accepted, _replayed = (
                 run_async_cv_baseline_with_fixed_lag_tracklet_viterbi_association_and_replay(
@@ -126,6 +131,9 @@ def run_async_cv_baseline_with_radar_association(
         track_bank_detection_probability=track_bank_detection_probability,
         track_bank_clutter_intensity=track_bank_clutter_intensity,
         track_bank_prune_log_weight_delta=track_bank_prune_log_weight_delta,
+        stable_segment_min_frames=stable_segment_min_frames,
+        stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
+        stable_segment_range_gate_m=stable_segment_range_gate_m,
         truth_gate_m=truth_gate_m,
         truth_time_gate_s=truth_time_gate_s,
     )

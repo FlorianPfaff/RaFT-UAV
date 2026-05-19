@@ -119,6 +119,24 @@ def main(argv: list[str] | None = None) -> int:
     baseline_parser.add_argument("--track-bank-clutter-intensity", type=float, default=1.0e-12)
     baseline_parser.add_argument("--track-bank-prune-delta", type=float, default=80.0)
     baseline_parser.add_argument(
+        "--stable-segment-min-frames",
+        type=int,
+        default=100,
+        help="minimum contiguous rows for --radar-association stable-segments",
+    )
+    baseline_parser.add_argument(
+        "--stable-segment-max-transition-speed-mps",
+        type=float,
+        default=65.0,
+        help="maximum stitched-segment transition speed for stable-segments",
+    )
+    baseline_parser.add_argument(
+        "--stable-segment-range-gate-m",
+        type=float,
+        default=800.0,
+        help="radar range gate for stable-segments; <=0 disables the range gate",
+    )
+    baseline_parser.add_argument(
         "--smoother",
         choices=SMOOTHER_MODES,
         default="none",
@@ -230,6 +248,9 @@ def main(argv: list[str] | None = None) -> int:
             args.track_bank_detection_prob,
             args.track_bank_clutter_intensity,
             args.track_bank_prune_delta,
+            args.stable_segment_min_frames,
+            args.stable_segment_max_transition_speed_mps,
+            args.stable_segment_range_gate_m,
             args.smoother,
             args.smoother_lag_s,
             args.max_eval_time_delta_s,
@@ -289,6 +310,9 @@ def _run_baseline(
     track_bank_detection_prob: float,
     track_bank_clutter_intensity: float,
     track_bank_prune_delta: float,
+    stable_segment_min_frames: int,
+    stable_segment_max_transition_speed_mps: float,
+    stable_segment_range_gate_m: float,
     smoother: str,
     smoother_lag_s: float,
     max_eval_time_delta_s: float,
@@ -320,6 +344,12 @@ def _run_baseline(
         raise ValueError("track_bank_max_assignments must be positive")
     if track_bank_max_candidates < 1:
         raise ValueError("track_bank_max_candidates must be positive")
+    if stable_segment_min_frames < 1:
+        raise ValueError("stable_segment_min_frames must be positive")
+    if stable_segment_max_transition_speed_mps <= 0.0:
+        raise ValueError("stable_segment_max_transition_speed_mps must be positive")
+    if stable_segment_range_gate_m < 0.0:
+        raise ValueError("stable_segment_range_gate_m must be nonnegative")
     if smoother == "fixed-lag" and smoother_lag_s < 0.0:
         raise ValueError("smoother_lag_s must be nonnegative for fixed-lag smoothing")
     radar_mode = legacy_radar_selection or radar_association
@@ -396,6 +426,11 @@ def _run_baseline(
             track_bank_detection_probability=track_bank_detection_prob,
             track_bank_clutter_intensity=track_bank_clutter_intensity,
             track_bank_prune_log_weight_delta=track_bank_prune_delta,
+            stable_segment_min_frames=stable_segment_min_frames,
+            stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
+            stable_segment_range_gate_m=(
+                None if stable_segment_range_gate_m <= 0.0 else stable_segment_range_gate_m
+            ),
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
@@ -487,6 +522,9 @@ def _run_baseline(
         track_bank_detection_prob=track_bank_detection_prob,
         track_bank_clutter_intensity=track_bank_clutter_intensity,
         track_bank_prune_delta=track_bank_prune_delta,
+        stable_segment_min_frames=stable_segment_min_frames,
+        stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
+        stable_segment_range_gate_m=stable_segment_range_gate_m,
         smoother=smoother,
         smoother_lag_s=smoother_lag_s,
         max_eval_time_delta_s=max_eval_time_delta_s,
@@ -634,6 +672,9 @@ def _baseline_metrics(
     track_bank_detection_prob: float,
     track_bank_clutter_intensity: float,
     track_bank_prune_delta: float,
+    stable_segment_min_frames: int,
+    stable_segment_max_transition_speed_mps: float,
+    stable_segment_range_gate_m: float,
     smoother: str,
     smoother_lag_s: float,
     max_eval_time_delta_s: float,
@@ -726,6 +767,13 @@ def _baseline_metrics(
             "detection_probability": float(track_bank_detection_prob),
             "clutter_intensity": float(track_bank_clutter_intensity),
             "prune_log_weight_delta": float(track_bank_prune_delta),
+        },
+        "stable_segment_association": {
+            "min_frames": int(stable_segment_min_frames),
+            "max_transition_speed_mps": float(stable_segment_max_transition_speed_mps),
+            "range_gate_m": None
+            if stable_segment_range_gate_m <= 0.0
+            else float(stable_segment_range_gate_m),
         },
         "smoother": {
             "method": smoother,

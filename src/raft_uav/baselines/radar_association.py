@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -31,7 +32,24 @@ RADAR_ASSOCIATION_MODES = (
     "geometry-score",
     "pda-mixture",
     "track-bank",
+    "stable-segments",
 )
+
+
+@dataclass(frozen=True)
+class _TrackSegment:
+    frame: pd.DataFrame
+    track_id: int
+    start_time_s: float
+    end_time_s: float
+    start_position_m: np.ndarray
+    end_position_m: np.ndarray
+    frames: int
+    mean_catprob: float
+
+    @property
+    def score(self) -> float:
+        return float(self.frames) * max(self.mean_catprob, 0.0)
 
 
 def run_async_cv_baseline_with_radar_association(
@@ -65,6 +83,9 @@ def run_async_cv_baseline_with_radar_association(
     track_bank_detection_probability: float = 0.999,
     track_bank_clutter_intensity: float = 1.0e-12,
     track_bank_prune_log_weight_delta: float = 80.0,
+    stable_segment_min_frames: int = 100,
+    stable_segment_max_transition_speed_mps: float = 65.0,
+    stable_segment_range_gate_m: float | None = 800.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
@@ -81,6 +102,8 @@ def run_async_cv_baseline_with_radar_association(
     candidate mixture and adds candidate spread to the radar covariance.
     ``track-bank`` uses PyRecEst's track-oriented MHT to keep multiple
     single-target association hypotheses alive across radar frames.
+    ``stable-segments`` preselects stitched high-confidence Fortem track
+    segments and skips all other radar frames.
     """
 
     if association not in RADAR_ASSOCIATION_MODES:
@@ -116,6 +139,12 @@ def run_async_cv_baseline_with_radar_association(
         raise ValueError("track_bank_clutter_intensity must be positive")
     if track_bank_prune_log_weight_delta <= 0.0:
         raise ValueError("track_bank_prune_log_weight_delta must be positive")
+    if stable_segment_min_frames < 1:
+        raise ValueError("stable_segment_min_frames must be positive")
+    if stable_segment_max_transition_speed_mps <= 0.0:
+        raise ValueError("stable_segment_max_transition_speed_mps must be positive")
+    if stable_segment_range_gate_m is not None and stable_segment_range_gate_m <= 0.0:
+        raise ValueError("stable_segment_range_gate_m must be positive or None")
 
     covariance = np.diag([float(radar_xy_std_m) ** 2, float(radar_xy_std_m) ** 2, float(radar_z_std_m) ** 2])
     if association == "track-bank":
@@ -145,14 +174,35 @@ def run_async_cv_baseline_with_radar_association(
     if not events:
         return [], _empty_selected_radar(radar)
 
-    initial_measurement = _initial_measurement(
-        events[0],
-        association=association,
-        covariance=covariance,
-        truth=truth,
-        truth_gate_m=truth_gate_m,
-        truth_time_gate_s=truth_time_gate_s,
-    )
+    stable_anchor_by_key: dict[object, pd.Series] | None = None
+    if association == "stable-segments":
+        stable_anchors = _select_stable_radar_segments(
+            radar,
+            range_gate_m=stable_segment_range_gate_m,
+            catprob_threshold=candidate_catprob_threshold,
+            min_segment_frames=stable_segment_min_frames,
+            max_transition_speed_mps=stable_segment_max_transition_speed_mps,
+        )
+        stable_anchor_by_key = {
+            _radar_row_key(row): row for _, row in stable_anchors.iterrows()
+        }
+
+    start_index = 0
+    initial_measurement = None
+    initial_events = enumerate(events) if association == "stable-segments" else [(0, events[0])]
+    for index, event in initial_events:
+        initial_measurement = _initial_measurement(
+            event,
+            association=association,
+            covariance=covariance,
+            stable_anchor_by_key=stable_anchor_by_key,
+            truth=truth,
+            truth_gate_m=truth_gate_m,
+            truth_time_gate_s=truth_time_gate_s,
+        )
+        if initial_measurement is not None:
+            start_index = int(index)
+            break
     if initial_measurement is None:
         return [], _empty_selected_radar(radar)
 
@@ -165,7 +215,7 @@ def run_async_cv_baseline_with_radar_association(
     selected_rows: list[pd.Series] = []
     current_track_id: int | None = None
 
-    for event in events:
+    for event in events[start_index:]:
         if event["kind"] == "rf":
             measurement = event["measurement"]
             assert isinstance(measurement, TrackingMeasurement)
@@ -216,6 +266,7 @@ def run_async_cv_baseline_with_radar_association(
             geometry_catprob_weight=geometry_catprob_weight,
             pda_nis_temperature=pda_nis_temperature,
             pda_catprob_exponent=pda_catprob_exponent,
+            stable_anchor_by_key=stable_anchor_by_key,
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
@@ -316,6 +367,7 @@ def _run_mht_track_bank(
         events[0],
         association="track-bank",
         covariance=covariance,
+        stable_anchor_by_key=None,
         truth=None,
         truth_gate_m=150.0,
         truth_time_gate_s=1.0,
@@ -733,11 +785,199 @@ def _radar_frame_groups(radar: pd.DataFrame) -> list[pd.DataFrame]:
     return [group.copy() for _, group in ordered.groupby(group_column, sort=True)]
 
 
+def _select_stable_radar_segments(
+    radar: pd.DataFrame,
+    *,
+    range_gate_m: float | None,
+    catprob_threshold: float | None,
+    min_segment_frames: int,
+    max_transition_speed_mps: float,
+) -> pd.DataFrame:
+    """Select stitched high-confidence Fortem track segments for sparse updates."""
+
+    pool = _range_candidate_pool(radar, range_gate_m)
+    pool = _catprob_candidate_pool(pool, catprob_threshold)
+    if pool.empty or "track_id" not in pool.columns:
+        return _empty_selected_radar(radar)
+
+    segments = _stable_track_segments(pool, min_segment_frames=min_segment_frames)
+    if not segments:
+        return _empty_selected_radar(radar)
+    selected_segments = _stitch_segments(
+        segments,
+        max_transition_speed_mps=max_transition_speed_mps,
+    )
+    if not selected_segments:
+        return _empty_selected_radar(radar)
+
+    selected = pd.concat([segment.frame for segment in selected_segments], ignore_index=True)
+    selected["association_mode"] = "stable-segments"
+    selected["association_action"] = "stable_segment_anchor"
+    selected["association_segment_count"] = int(len(selected_segments))
+    sort_columns = [
+        column
+        for column in ("time_s", "frame_index", "track_id", "track_index")
+        if column in selected.columns
+    ]
+    return selected.sort_values(sort_columns).reset_index(drop=True)
+
+
+def _stable_track_segments(
+    radar: pd.DataFrame,
+    *,
+    min_segment_frames: int,
+) -> list[_TrackSegment]:
+    segments: list[_TrackSegment] = []
+    for track_id, track_rows in radar.groupby("track_id", sort=True):
+        ordered = track_rows.sort_values(
+            ["frame_index" if "frame_index" in track_rows.columns else "time_s", "time_s"]
+        )
+        frame_values = (
+            pd.to_numeric(ordered["frame_index"], errors="coerce").to_numpy(dtype=float)
+            if "frame_index" in ordered.columns
+            else ordered["time_s"].to_numpy(dtype=float)
+        )
+        splits = np.r_[
+            0,
+            np.where(np.diff(frame_values) > _segment_gap_threshold(frame_values))[0] + 1,
+            len(ordered),
+        ]
+        for start, end in zip(splits[:-1], splits[1:]):
+            frame = ordered.iloc[int(start) : int(end)].copy()
+            if len(frame) < int(min_segment_frames):
+                continue
+            positions = frame[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
+            times = frame["time_s"].to_numpy(dtype=float)
+            catprob = (
+                pd.to_numeric(frame["cat_prob_uav"], errors="coerce").to_numpy(dtype=float)
+                if "cat_prob_uav" in frame.columns
+                else np.ones(len(frame), dtype=float)
+            )
+            mean_catprob = float(np.nanmean(catprob))
+            if not np.isfinite(mean_catprob):
+                mean_catprob = 0.0
+            segments.append(
+                _TrackSegment(
+                    frame=frame,
+                    track_id=int(track_id),
+                    start_time_s=float(times[0]),
+                    end_time_s=float(times[-1]),
+                    start_position_m=positions[0],
+                    end_position_m=positions[-1],
+                    frames=int(len(frame)),
+                    mean_catprob=mean_catprob,
+                )
+            )
+    return sorted(segments, key=lambda item: (item.start_time_s, -item.score))
+
+
+def _segment_gap_threshold(frame_values: np.ndarray) -> float:
+    values = np.sort(np.asarray(frame_values, dtype=float).reshape(-1))
+    values = values[np.isfinite(values)]
+    if values.size < 2:
+        return float("inf")
+    diffs = np.diff(values)
+    positive = diffs[diffs > 1.0e-9]
+    if positive.size == 0:
+        return float("inf")
+    if _integer_like(values):
+        return 1.5
+    return 1.5 * float(np.median(positive))
+
+
+def _stitch_segments(
+    segments: list[_TrackSegment],
+    *,
+    max_transition_speed_mps: float,
+) -> list[_TrackSegment]:
+    ordered = sorted(segments, key=lambda item: (item.start_time_s, item.end_time_s))
+    best_paths: list[list[_TrackSegment]] = []
+    best_scores: list[float] = []
+    for segment in ordered:
+        best_path = [segment]
+        best_score = segment.score
+        for index, previous in enumerate(ordered[: len(best_paths)]):
+            if not _segments_can_follow(
+                previous,
+                segment,
+                max_transition_speed_mps=max_transition_speed_mps,
+            ):
+                continue
+            score = best_scores[index] + segment.score
+            if score > best_score:
+                best_score = score
+                best_path = [*best_paths[index], segment]
+        best_paths.append(best_path)
+        best_scores.append(best_score)
+    if not best_paths:
+        return []
+    return best_paths[int(np.argmax(best_scores))]
+
+
+def _segments_can_follow(
+    previous: _TrackSegment,
+    current: _TrackSegment,
+    *,
+    max_transition_speed_mps: float,
+) -> bool:
+    if current.start_time_s <= previous.end_time_s:
+        return False
+    dt_s = current.start_time_s - previous.end_time_s
+    if dt_s <= 0.0:
+        return False
+    distance_m = float(np.linalg.norm(current.start_position_m - previous.end_position_m))
+    return distance_m / dt_s <= float(max_transition_speed_mps)
+
+
+def _range_candidate_pool(candidates: pd.DataFrame, range_gate_m: float | None) -> pd.DataFrame:
+    if candidates.empty or range_gate_m is None:
+        return candidates
+    ranges = _candidate_ranges_m(candidates)
+    pool = candidates.loc[np.isfinite(ranges) & (ranges <= float(range_gate_m))].copy()
+    pool["association_range_gate_m"] = float(range_gate_m)
+    return pool
+
+
+def _candidate_ranges_m(candidates: pd.DataFrame) -> np.ndarray:
+    if "range_m" in candidates.columns:
+        ranges = pd.to_numeric(candidates["range_m"], errors="coerce").to_numpy(dtype=float)
+        if np.isfinite(ranges).any():
+            return ranges
+    positions = candidates[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
+    return np.linalg.norm(positions, axis=1)
+
+
+def _radar_event_key(event: dict[str, object]) -> object:
+    candidates = event["candidates"]
+    assert isinstance(candidates, pd.DataFrame)
+    if "frame_index" in candidates.columns:
+        values = pd.to_numeric(candidates["frame_index"], errors="coerce").dropna()
+        if not values.empty:
+            return ("frame_index", int(values.iloc[0]))
+    time_s = event.get("time_s")
+    if time_s is None:
+        time_s = float(candidates["time_s"].median())
+    return ("time_s", round(float(time_s), 9))
+
+
+def _radar_row_key(row: pd.Series) -> object:
+    if "frame_index" in row.index and np.isfinite(float(row["frame_index"])):
+        return ("frame_index", int(row["frame_index"]))
+    return ("time_s", round(float(row["time_s"]), 9))
+
+
+def _integer_like(values: np.ndarray) -> bool:
+    finite = np.asarray(values, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    return bool(finite.size and np.allclose(finite, np.round(finite)))
+
+
 def _initial_measurement(
     event: dict[str, object],
     *,
     association: str,
     covariance: np.ndarray,
+    stable_anchor_by_key: dict[object, pd.Series] | None = None,
     truth: pd.DataFrame | None,
     truth_gate_m: float,
     truth_time_gate_s: float,
@@ -754,6 +994,12 @@ def _initial_measurement(
             truth=truth,
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
+        )
+    elif association == "stable-segments":
+        selected = (
+            None
+            if stable_anchor_by_key is None
+            else stable_anchor_by_key.get(_radar_event_key(event))
         )
     else:
         selected = _highest_catprob(candidates)
@@ -778,6 +1024,7 @@ def _select_radar_candidate(
     geometry_catprob_weight: float,
     pda_nis_temperature: float,
     pda_catprob_exponent: float,
+    stable_anchor_by_key: dict[object, pd.Series] | None = None,
     truth_gate_m: float,
     truth_time_gate_s: float,
 ) -> pd.Series | None:
@@ -790,6 +1037,17 @@ def _select_radar_candidate(
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
+    if association == "stable-segments":
+        if stable_anchor_by_key is None:
+            return None
+        selected = stable_anchor_by_key.get(_radar_event_key({"candidates": candidates}))
+        if selected is None:
+            return None
+        selected = selected.copy()
+        selected["association_mode"] = "stable-segments"
+        selected["association_action"] = "stable_segment_update"
+        selected["association_candidate_rows"] = int(len(candidates))
+        return selected
 
     candidates = _catprob_candidate_pool(candidates, candidate_catprob_threshold)
     if candidates.empty:

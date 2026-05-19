@@ -47,6 +47,7 @@ DEFAULT_METHODS = [
     "geometry-score",
     "pda-mixture",
     "track-bank",
+    "stable-segments",
     "tracklet-viterbi",
 ]
 ORACLE_METHODS = ["oracle-nearest-candidate-offset0", "oracle-nearest-candidate-best-offset"]

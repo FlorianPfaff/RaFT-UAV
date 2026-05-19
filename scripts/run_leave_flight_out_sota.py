@@ -71,6 +71,14 @@ METHODS: dict[str, MethodSpec] = {
         fixed_lag=True,
         robust=True,
     ),
+    "cv_stable_segments_fixed_lag": MethodSpec(
+        "cv_stable_segments_fixed_lag",
+        "baseline",
+        "CV stable radar segments fixed-lag",
+        association="stable-segments",
+        fixed_lag=True,
+        robust=True,
+    ),
     "imm_catprob": MethodSpec("imm_catprob", "imm", "IMM catprob"),
     "imm_catprob_robust": MethodSpec(
         "imm_catprob_robust", "imm", "IMM catprob robust", robust=True
@@ -93,7 +101,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--methods",
         nargs="+",
         choices=sorted(METHODS),
-        default=["cv_catprob", "cv_track_bank_fixed_lag", "imm_catprob", "hetero_cv_fixed_lag"],
+        default=[
+            "cv_catprob",
+            "cv_track_bank_fixed_lag",
+            "cv_stable_segments_fixed_lag",
+            "imm_catprob",
+            "hetero_cv_fixed_lag",
+        ],
     )
     parser.add_argument("--candidate-threshold", type=float, default=0.4)
     parser.add_argument("--fixed-lag-s", type=float, default=20.0)

@@ -373,3 +373,78 @@ def test_track_bank_uses_pyrecest_mht_and_records_hypotheses():
     assert int(records[-1]["hypothesis_count"]) >= 1
     assert records[-1]["hypotheses"]
     assert selected["track_id"].tolist() == [1]
+
+
+def test_stable_segments_updates_only_on_stitched_high_confidence_segments():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": frame,
+                "track_id": 1,
+                "time_s": float(frame),
+                "east_m": float(frame),
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": float(frame),
+                "cat_prob_uav": 0.9,
+            }
+            for frame in (1, 2, 3)
+        ]
+        + [
+            {
+                "frame_index": 4,
+                "track_id": 2,
+                "time_s": 4.0,
+                "east_m": 100.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 100.0,
+                "cat_prob_uav": 0.9,
+            }
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(0.0, 0.0)],
+        radar=radar,
+        association="stable-segments",
+        candidate_catprob_threshold=0.4,
+        stable_segment_min_frames=3,
+        stable_segment_max_transition_speed_mps=65.0,
+    )
+
+    assert [record["source"] for record in records] == ["rf", "radar", "radar", "radar"]
+    assert {record["association_mode"] for record in records if record["source"] == "radar"} == {
+        "stable-segments"
+    }
+    assert selected["track_id"].tolist() == [1, 1, 1]
+
+
+def test_stable_segments_respects_range_gate_and_min_frames():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": frame,
+                "track_id": 1,
+                "time_s": float(frame),
+                "east_m": float(frame),
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 900.0,
+                "cat_prob_uav": 0.9,
+            }
+            for frame in (1, 2, 3)
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(0.0, 0.0)],
+        radar=radar,
+        association="stable-segments",
+        candidate_catprob_threshold=0.4,
+        stable_segment_min_frames=3,
+        stable_segment_range_gate_m=800.0,
+    )
+
+    assert [record["source"] for record in records] == ["rf"]
+    assert selected.empty
