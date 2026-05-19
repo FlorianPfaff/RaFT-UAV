@@ -489,7 +489,7 @@ def _run_baseline(
         raise ValueError("stable_segment_rf_time_gate_s must be nonnegative")
     if stable_segment_rf_nis_cap <= 0.0:
         raise ValueError("stable_segment_rf_nis_cap must be positive")
-    if smoother == "fixed-lag" and smoother_lag_s < 0.0:
+    if smoother in {"fixed-lag", "fixed-lag-map"} and smoother_lag_s < 0.0:
         raise ValueError("smoother_lag_s must be nonnegative for fixed-lag smoothing")
     radar_mode = legacy_radar_selection or radar_association
     flight = select_flight(dataset_root, flight_name)
@@ -620,6 +620,7 @@ def _run_baseline(
         method=smoother,
         acceleration_std_mps2=acceleration_std,
         lag_s=smoother_lag_s,
+        measurements=measurements,
     )
 
     estimate_frame = _records_to_frame(records)
