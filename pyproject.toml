@@ -26,7 +26,7 @@ dev = [
 [project.scripts]
 raft-uav = "raft_uav.tracklet_viterbi_cli:main"
 raft-uav-legacy = "raft_uav.cli:main"
-raft-uav-heteroscedastic = "raft_uav.heteroscedastic_cli:main"
+raft-uav-heteroscedastic = "raft_uav.heteroscedastic_console:main"
 raft-uav-imm = "raft_uav.imm_cli:main"
 raft-uav-train-radar-association = "raft_uav.train_radar_association_cli:main"
 raft-uav-run-learned-radar-association = "raft_uav.run_learned_radar_association_cli:main"
