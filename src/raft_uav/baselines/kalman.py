@@ -22,6 +22,7 @@ from raft_uav.baselines.update_logic import (
     student_t_dof_for_measurement,
     symmetrized,
 )
+from raft_uav.calibration.nis_covariance import scale_covariance_for_calibrated_source
 
 __all__ = [
     "AsyncConstantVelocityKalmanTracker",
@@ -50,6 +51,7 @@ class TrackingMeasurement:
     def __post_init__(self) -> None:
         vector = np.asarray(self.vector, dtype=float).reshape(-1)
         covariance = np.asarray(self.covariance, dtype=float)
+        source = str(self.source)
         if vector.size not in (2, 3, 6):
             raise ValueError("measurement vector must have 2, 3, or 6 elements")
         if covariance.shape != (vector.size, vector.size):
@@ -58,10 +60,15 @@ class TrackingMeasurement:
             raise ValueError("measurement vector must be finite")
         if not np.isfinite(covariance).all():
             raise ValueError("measurement covariance must be finite")
+        covariance = scale_covariance_for_calibrated_source(source, vector.size, covariance)
+        if covariance.shape != (vector.size, vector.size):
+            raise ValueError("calibrated measurement covariance must match vector dimension")
+        if not np.isfinite(covariance).all():
+            raise ValueError("calibrated measurement covariance must be finite")
         object.__setattr__(self, "time_s", float(self.time_s))
         object.__setattr__(self, "vector", vector)
         object.__setattr__(self, "covariance", covariance)
-        object.__setattr__(self, "source", str(self.source))
+        object.__setattr__(self, "source", source)
 
 
 @dataclass(frozen=True)
