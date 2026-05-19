@@ -28,6 +28,7 @@ from raft_uav.baselines.update_logic import (
 RADAR_ASSOCIATION_MODES = (
     "oracle-nearest-truth",
     "prediction-nis",
+    "rf-anchored-nis",
     "track-continuity",
     "geometry-score",
     "pda-mixture",
@@ -84,6 +85,9 @@ def run_async_cv_baseline_with_radar_association(
     geometry_velocity_weight: float = 0.25,
     geometry_switch_penalty: float = 4.0,
     geometry_catprob_weight: float = 2.0,
+    rf_anchor_weight: float = 0.35,
+    rf_anchor_time_gate_s: float = 2.0,
+    rf_anchor_nis_cap: float = 25.0,
     pda_nis_temperature: float = 1.0,
     pda_catprob_exponent: float = 1.0,
     track_bank_max_hypotheses: int = 16,
@@ -111,6 +115,8 @@ def run_async_cv_baseline_with_radar_association(
     ``oracle-nearest-truth`` uses ground truth and is only a diagnostic upper
     bound. ``prediction-nis`` picks the radar candidate with the lowest
     normalized innovation squared against the current predicted state.
+    ``rf-anchored-nis`` adds a capped RF-position penalty from the most recent
+    nearby RF update, which helps recover when the prediction has drifted.
     ``track-continuity`` prefers the current Fortem track ID and switches only
     when another candidate has a substantially lower NIS. ``geometry-score``
     is an online score that augments NIS with radar velocity consistency,
@@ -133,6 +139,12 @@ def run_async_cv_baseline_with_radar_association(
         raise ValueError("track_switch_nis_ratio must be positive")
     if geometry_velocity_std_mps <= 0.0:
         raise ValueError("geometry_velocity_std_mps must be positive")
+    if rf_anchor_weight < 0.0:
+        raise ValueError("rf_anchor_weight must be nonnegative")
+    if rf_anchor_time_gate_s < 0.0:
+        raise ValueError("rf_anchor_time_gate_s must be nonnegative")
+    if rf_anchor_nis_cap <= 0.0:
+        raise ValueError("rf_anchor_nis_cap must be positive")
     for name, value in {
         "geometry_velocity_weight": geometry_velocity_weight,
         "geometry_switch_penalty": geometry_switch_penalty,
@@ -321,6 +333,10 @@ def run_async_cv_baseline_with_radar_association(
             geometry_velocity_weight=geometry_velocity_weight,
             geometry_switch_penalty=geometry_switch_penalty,
             geometry_catprob_weight=geometry_catprob_weight,
+            rf_measurements=rf_measurement_list,
+            rf_anchor_weight=rf_anchor_weight,
+            rf_anchor_time_gate_s=rf_anchor_time_gate_s,
+            rf_anchor_nis_cap=rf_anchor_nis_cap,
             pda_nis_temperature=pda_nis_temperature,
             pda_catprob_exponent=pda_catprob_exponent,
             stable_anchor_by_key=stable_anchor_by_key,
@@ -1471,6 +1487,10 @@ def _select_radar_candidate(
     geometry_velocity_weight: float,
     geometry_switch_penalty: float,
     geometry_catprob_weight: float,
+    rf_measurements: list[TrackingMeasurement] | None = None,
+    rf_anchor_weight: float = 0.35,
+    rf_anchor_time_gate_s: float = 2.0,
+    rf_anchor_nis_cap: float = 25.0,
     pda_nis_temperature: float,
     pda_catprob_exponent: float,
     stable_anchor_by_key: dict[object, pd.Series] | None = None,
@@ -1519,6 +1539,17 @@ def _select_radar_candidate(
         )
         best = geometry_scored.loc[geometry_scored["association_score"].idxmin()].copy()
         best["association_action"] = "geometry_score"
+        return best
+    if association == "rf-anchored-nis":
+        rf_scored = _rf_anchor_scored_candidates(
+            scored,
+            rf_measurements=rf_measurements,
+            anchor_weight=rf_anchor_weight,
+            time_gate_s=rf_anchor_time_gate_s,
+            nis_cap=rf_anchor_nis_cap,
+        )
+        best = rf_scored.loc[rf_scored["association_score"].idxmin()].copy()
+        best["association_action"] = "rf_anchored_nis"
         return best
     if association == "pda-mixture":
         return _pda_mixture_candidate(
@@ -1654,6 +1685,74 @@ def _geometry_scored_candidates(
         + scored["association_catprob_penalty"]
     )
     return scored
+
+
+def _rf_anchor_scored_candidates(
+    candidates: pd.DataFrame,
+    *,
+    rf_measurements: list[TrackingMeasurement] | None,
+    anchor_weight: float,
+    time_gate_s: float,
+    nis_cap: float,
+) -> pd.DataFrame:
+    scored = candidates.copy()
+    scored["association_score"] = scored["association_nis"].to_numpy(dtype=float)
+    scored["association_anchor_penalty"] = 0.0
+    if anchor_weight <= 0.0 or not rf_measurements:
+        return scored
+
+    time_s = float(candidates["time_s"].median())
+    anchor = _latest_rf_anchor(
+        rf_measurements,
+        time_s=time_s,
+        time_gate_s=time_gate_s,
+    )
+    if anchor is None:
+        return scored
+    if anchor.vector.size < 2 or anchor.covariance.shape[0] < 2:
+        return scored
+
+    covariance = np.asarray(anchor.covariance[:2, :2], dtype=float)
+    if not np.isfinite(covariance).all():
+        return scored
+    try:
+        precision = np.linalg.inv(covariance)
+    except np.linalg.LinAlgError:
+        precision = np.linalg.pinv(covariance)
+
+    vectors = candidates[["east_m", "north_m"]].to_numpy(dtype=float)
+    residuals = vectors - np.asarray(anchor.vector[:2], dtype=float)
+    anchor_nis = np.einsum("ij,jk,ik->i", residuals, precision, residuals)
+    anchor_nis = np.where(np.isfinite(anchor_nis), anchor_nis, np.inf)
+    capped_nis = np.minimum(anchor_nis, float(nis_cap))
+    penalty = float(anchor_weight) * capped_nis
+    scored["association_anchor_nis"] = anchor_nis
+    scored["association_anchor_penalty"] = penalty
+    scored["association_anchor_time_delta_s"] = float(time_s - anchor.time_s)
+    scored["association_anchor_weight"] = float(anchor_weight)
+    scored["association_anchor_nis_cap"] = float(nis_cap)
+    scored["association_score"] = scored["association_score"].to_numpy(dtype=float) + penalty
+    return scored
+
+
+def _latest_rf_anchor(
+    rf_measurements: list[TrackingMeasurement],
+    *,
+    time_s: float,
+    time_gate_s: float,
+) -> TrackingMeasurement | None:
+    best: TrackingMeasurement | None = None
+    best_dt_s = float("inf")
+    for measurement in rf_measurements:
+        if measurement.source != "rf":
+            continue
+        dt_s = float(time_s) - float(measurement.time_s)
+        if dt_s < -1.0e-9 or dt_s > float(time_gate_s):
+            continue
+        if dt_s < best_dt_s:
+            best = measurement
+            best_dt_s = dt_s
+    return best
 
 
 def _candidate_velocity_nis(
@@ -1920,6 +2019,11 @@ def _empty_selected_radar(radar: pd.DataFrame) -> pd.DataFrame:
         "association_nis",
         "association_score",
         "association_candidate_rows",
+        "association_anchor_nis",
+        "association_anchor_penalty",
+        "association_anchor_time_delta_s",
+        "association_anchor_weight",
+        "association_anchor_nis_cap",
         "association_effective_candidates",
         "association_weight_max",
         "association_position_spread_trace_m2",

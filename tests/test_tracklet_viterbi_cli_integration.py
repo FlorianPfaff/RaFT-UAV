@@ -13,6 +13,7 @@ def test_enabled_radar_association_modes_include_tracklet_viterbi() -> None:
     modes = tracklet_viterbi_cli.enabled_radar_association_modes()
 
     assert "tracklet-viterbi" in modes
+    assert "rf-anchored-nis" in modes
     assert "stable-segments" in modes
     assert "stable-segments-interpolated" in modes
     assert len(modes) == len(set(modes))

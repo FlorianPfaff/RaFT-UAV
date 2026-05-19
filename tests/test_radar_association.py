@@ -288,6 +288,84 @@ def test_geometry_score_prefers_velocity_consistent_candidate():
     assert float(selected["association_score"]) < float("inf")
 
 
+def test_rf_anchored_nis_recovers_from_prediction_drift():
+    tracker = AsyncConstantVelocityKalmanTracker(
+        initial_position=np.array([20.0, 0.0, 0.0]),
+        initial_time_s=0.0,
+    )
+    tracker.predict_to(2.0)
+    candidates = pd.DataFrame(
+        [
+            {
+                "track_id": 1,
+                "time_s": 2.0,
+                "east_m": 0.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.8,
+            },
+            {
+                "track_id": 2,
+                "time_s": 2.0,
+                "east_m": 20.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.8,
+            },
+        ]
+    )
+    covariance = np.diag([25.0**2, 25.0**2, 35.0**2])
+
+    prediction_selected = _select_radar_candidate(
+        candidates,
+        association="prediction-nis",
+        tracker=tracker,
+        covariance=covariance,
+        truth=None,
+        current_track_id=None,
+        track_switch_nis_ratio=0.5,
+        candidate_catprob_threshold=None,
+        geometry_velocity_std_mps=12.0,
+        geometry_velocity_weight=0.25,
+        geometry_switch_penalty=4.0,
+        geometry_catprob_weight=2.0,
+        pda_nis_temperature=1.0,
+        pda_catprob_exponent=1.0,
+        truth_gate_m=150.0,
+        truth_time_gate_s=1.0,
+    )
+    anchored_selected = _select_radar_candidate(
+        candidates,
+        association="rf-anchored-nis",
+        tracker=tracker,
+        covariance=covariance,
+        truth=None,
+        current_track_id=None,
+        track_switch_nis_ratio=0.5,
+        candidate_catprob_threshold=None,
+        geometry_velocity_std_mps=12.0,
+        geometry_velocity_weight=0.25,
+        geometry_switch_penalty=4.0,
+        geometry_catprob_weight=2.0,
+        rf_measurements=[_rf_measurement(1.9, 0.0)],
+        rf_anchor_weight=1.0,
+        rf_anchor_time_gate_s=0.2,
+        rf_anchor_nis_cap=1_000.0,
+        pda_nis_temperature=1.0,
+        pda_catprob_exponent=1.0,
+        truth_gate_m=150.0,
+        truth_time_gate_s=1.0,
+    )
+
+    assert prediction_selected is not None
+    assert anchored_selected is not None
+    assert int(prediction_selected["track_id"]) == 2
+    assert int(anchored_selected["track_id"]) == 1
+    assert anchored_selected["association_action"] == "rf_anchored_nis"
+    assert anchored_selected["association_anchor_nis"] == 0.0
+    assert np.isclose(anchored_selected["association_anchor_time_delta_s"], 0.1)
+
+
 def test_pda_mixture_returns_weighted_position_and_spread_covariance():
     tracker = AsyncConstantVelocityKalmanTracker(initial_position=np.array([5.0, 0.0, 0.0]), initial_time_s=0.0)
     candidates = pd.DataFrame(

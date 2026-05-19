@@ -55,6 +55,14 @@ METHODS: dict[str, MethodSpec] = {
         fixed_lag=True,
         robust=True,
     ),
+    "cv_rf_anchored_nis_fixed_lag": MethodSpec(
+        "cv_rf_anchored_nis_fixed_lag",
+        "baseline",
+        "CV RF-anchored NIS fixed-lag",
+        association="rf-anchored-nis",
+        fixed_lag=True,
+        robust=True,
+    ),
     "cv_pda_fixed_lag": MethodSpec(
         "cv_pda_fixed_lag",
         "baseline",
@@ -111,6 +119,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         choices=sorted(METHODS),
         default=[
             "cv_catprob",
+            "cv_rf_anchored_nis_fixed_lag",
             "cv_track_bank_fixed_lag",
             "cv_stable_segments_fixed_lag",
             "cv_stable_segments_interpolated_fixed_lag",

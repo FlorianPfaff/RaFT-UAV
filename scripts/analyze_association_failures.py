@@ -25,7 +25,7 @@ def main() -> int:
     parser.add_argument("--flight", default="Opt1")
     parser.add_argument(
         "--online-association",
-        choices=["prediction-nis", "track-continuity", "geometry-score"],
+        choices=["prediction-nis", "rf-anchored-nis", "track-continuity", "geometry-score"],
         default="prediction-nis",
     )
     parser.add_argument(

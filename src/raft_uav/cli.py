@@ -100,6 +100,24 @@ def main(argv: list[str] | None = None) -> int:
         help="weight for low UAV class-probability penalty in geometry-score",
     )
     baseline_parser.add_argument(
+        "--rf-anchor-weight",
+        type=float,
+        default=0.35,
+        help="RF anchor penalty weight for --radar-association rf-anchored-nis",
+    )
+    baseline_parser.add_argument(
+        "--rf-anchor-time-gate-s",
+        type=float,
+        default=2.0,
+        help="maximum age of latest RF update used by rf-anchored-nis",
+    )
+    baseline_parser.add_argument(
+        "--rf-anchor-nis-cap",
+        type=float,
+        default=25.0,
+        help="per-candidate RF anchor NIS cap used by rf-anchored-nis",
+    )
+    baseline_parser.add_argument(
         "--pda-nis-temperature",
         type=float,
         default=1.0,
@@ -293,6 +311,9 @@ def main(argv: list[str] | None = None) -> int:
             args.geometry_velocity_weight,
             args.geometry_switch_penalty,
             args.geometry_catprob_weight,
+            args.rf_anchor_weight,
+            args.rf_anchor_time_gate_s,
+            args.rf_anchor_nis_cap,
             args.pda_nis_temperature,
             args.pda_catprob_exponent,
             args.track_bank_max_hypotheses,
@@ -362,6 +383,9 @@ def _run_baseline(
     geometry_velocity_weight: float,
     geometry_switch_penalty: float,
     geometry_catprob_weight: float,
+    rf_anchor_weight: float,
+    rf_anchor_time_gate_s: float,
+    rf_anchor_nis_cap: float,
     pda_nis_temperature: float,
     pda_catprob_exponent: float,
     track_bank_max_hypotheses: int,
@@ -402,6 +426,12 @@ def _run_baseline(
         raise ValueError("inflation alphas must be positive")
     if track_switch_nis_ratio <= 0.0:
         raise ValueError("track_switch_nis_ratio must be positive")
+    if rf_anchor_weight < 0.0:
+        raise ValueError("rf_anchor_weight must be nonnegative")
+    if rf_anchor_time_gate_s < 0.0:
+        raise ValueError("rf_anchor_time_gate_s must be nonnegative")
+    if rf_anchor_nis_cap <= 0.0:
+        raise ValueError("rf_anchor_nis_cap must be positive")
     if pda_nis_temperature <= 0.0:
         raise ValueError("pda_nis_temperature must be positive")
     if pda_catprob_exponent < 0.0:
@@ -499,6 +529,9 @@ def _run_baseline(
             geometry_velocity_weight=geometry_velocity_weight,
             geometry_switch_penalty=geometry_switch_penalty,
             geometry_catprob_weight=geometry_catprob_weight,
+            rf_anchor_weight=rf_anchor_weight,
+            rf_anchor_time_gate_s=rf_anchor_time_gate_s,
+            rf_anchor_nis_cap=rf_anchor_nis_cap,
             pda_nis_temperature=pda_nis_temperature,
             pda_catprob_exponent=pda_catprob_exponent,
             track_bank_max_hypotheses=track_bank_max_hypotheses,
@@ -610,6 +643,9 @@ def _run_baseline(
         geometry_velocity_weight=geometry_velocity_weight,
         geometry_switch_penalty=geometry_switch_penalty,
         geometry_catprob_weight=geometry_catprob_weight,
+        rf_anchor_weight=rf_anchor_weight,
+        rf_anchor_time_gate_s=rf_anchor_time_gate_s,
+        rf_anchor_nis_cap=rf_anchor_nis_cap,
         pda_nis_temperature=pda_nis_temperature,
         pda_catprob_exponent=pda_catprob_exponent,
         track_bank_max_hypotheses=track_bank_max_hypotheses,
@@ -767,6 +803,9 @@ def _baseline_metrics(
     geometry_velocity_weight: float,
     geometry_switch_penalty: float,
     geometry_catprob_weight: float,
+    rf_anchor_weight: float,
+    rf_anchor_time_gate_s: float,
+    rf_anchor_nis_cap: float,
     pda_nis_temperature: float,
     pda_catprob_exponent: float,
     track_bank_max_hypotheses: int,
@@ -865,6 +904,11 @@ def _baseline_metrics(
             "velocity_weight": float(geometry_velocity_weight),
             "switch_penalty": float(geometry_switch_penalty),
             "catprob_weight": float(geometry_catprob_weight),
+        },
+        "rf_anchor_association": {
+            "weight": float(rf_anchor_weight),
+            "time_gate_s": float(rf_anchor_time_gate_s),
+            "nis_cap": float(rf_anchor_nis_cap),
         },
         "pda_association": {
             "nis_temperature": float(pda_nis_temperature),

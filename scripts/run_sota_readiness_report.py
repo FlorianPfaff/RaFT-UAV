@@ -43,6 +43,7 @@ DEFAULT_FLIGHTS = ["Opt1", "Opt2", "Opt3"]
 DEFAULT_METHODS = [
     "catprob",
     "prediction-nis",
+    "rf-anchored-nis",
     "track-continuity",
     "geometry-score",
     "pda-mixture",
