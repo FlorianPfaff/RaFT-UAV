@@ -42,6 +42,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    replay_tracker_kind: str = "cv",
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
     """Run tracklet-Viterbi with native retention-aware node construction."""
 
@@ -106,6 +107,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         robust_update_by_source=robust_update_by_source,
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
+        replay_tracker_kind=replay_tracker_kind,
     )
     return records, _selected_rows_frame(radar, accepted)
 

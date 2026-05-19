@@ -47,8 +47,10 @@ _MAX_CANDIDATES_PER_FRAME_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_FRAME"
 _MAX_CANDIDATE_POOL_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATE_POOL_PER_FRAME"
 _MAX_CANDIDATES_PER_TRACK_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_TRACK_ID"
 _VITERBI_LAG_S_ENV = "RAFT_UAV_TRACKLET_VITERBI_LAG_S"
+_REPLAY_TRACKER_ENV = "RAFT_UAV_TRACKLET_REPLAY_TRACKER"
 _TRACKLET_VARIANTS = ("base", "retention", "range-covariance", "fixed-lag")
 _CATPROB_RETENTION_MODES = ("soft", "hard")
+_TRACKLET_REPLAY_TRACKERS = _base_tracklet_viterbi.TRACKLET_REPLAY_TRACKER_KINDS
 
 
 class _TrackletConfigOverlay:
@@ -133,6 +135,7 @@ def run_async_cv_baseline_with_radar_association(
         del truth_gate_m, truth_time_gate_s
         runner = _tracklet_runner_from_environment()
         config = _tracklet_config_from_environment()
+        replay_tracker_kind = _tracklet_replay_tracker_from_environment()
         return runner(
             rf_measurements=list(rf_measurements),
             radar=radar,
@@ -148,6 +151,7 @@ def run_async_cv_baseline_with_radar_association(
             max_residual_norms_by_source=max_residual_norms_by_source,
             candidate_catprob_threshold=candidate_catprob_threshold,
             config=config,
+            replay_tracker_kind=replay_tracker_kind,
         )
 
     return _base_radar_association_runner(
@@ -242,6 +246,16 @@ def _tracklet_config_from_environment() -> _TrackletConfigOverlay:
     )
 
 
+def _tracklet_replay_tracker_from_environment() -> str:
+    tracker = _env_str(_REPLAY_TRACKER_ENV, "cv").strip().lower()
+    if tracker not in _TRACKLET_REPLAY_TRACKERS:
+        valid = ", ".join(_TRACKLET_REPLAY_TRACKERS)
+        raise ValueError(
+            f"{_REPLAY_TRACKER_ENV} must be one of {valid}; got {tracker!r}"
+        )
+    return tracker
+
+
 def _tracklet_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--tracklet-variant", choices=_TRACKLET_VARIANTS)
@@ -256,6 +270,7 @@ def _tracklet_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tracklet-max-candidate-pool-per-frame", type=_positive_int)
     parser.add_argument("--tracklet-max-candidates-per-track-id", type=_positive_int)
     parser.add_argument("--tracklet-viterbi-lag-s", type=_positive_float)
+    parser.add_argument("--tracklet-replay-tracker", choices=_TRACKLET_REPLAY_TRACKERS)
     return parser
 
 
@@ -281,6 +296,7 @@ def _environment_updates_from_namespace(namespace: argparse.Namespace) -> dict[s
     _maybe_add(updates, _MAX_CANDIDATE_POOL_ENV, namespace.tracklet_max_candidate_pool_per_frame)
     _maybe_add(updates, _MAX_CANDIDATES_PER_TRACK_ENV, namespace.tracklet_max_candidates_per_track_id)
     _maybe_add(updates, _VITERBI_LAG_S_ENV, namespace.tracklet_viterbi_lag_s)
+    _maybe_add(updates, _REPLAY_TRACKER_ENV, namespace.tracklet_replay_tracker)
     return updates
 
 

@@ -106,3 +106,45 @@ def test_tracklet_viterbi_result_preserves_rejected_viterbi_choices():
     assert result.viterbi_selected_radar["track_id"].tolist() == [99]
     assert result.viterbi_selected_radar["association_replay_accepted"].tolist() == [False]
     assert result.viterbi_selected_radar["association_replay_update_action"].tolist() == ["missed_detection"]
+
+
+def test_tracklet_viterbi_result_can_replay_selected_path_with_imm():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 0,
+                "track_id": 7,
+                "time_s": 1.0,
+                "east_m": 1.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.9,
+            },
+            {
+                "frame_index": 1,
+                "track_id": 7,
+                "time_s": 2.0,
+                "east_m": 2.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.9,
+            },
+        ]
+    )
+
+    result = run_async_cv_baseline_with_tracklet_viterbi_result(
+        rf_measurements=[
+            _rf_measurement(0.0, 0.0),
+            _rf_measurement(1.0, 1.0),
+            _rf_measurement(2.0, 2.0),
+        ],
+        radar=radar,
+        replay_tracker_kind="imm",
+        candidate_catprob_threshold=None,
+    )
+
+    assert result.viterbi_selected_radar["association_replay_tracker"].tolist() == ["imm", "imm"]
+    assert result.viterbi_selected_radar["association_replay_most_likely_mode"].notna().all()
+    assert all(record["tracklet_replay_tracker"] == "imm" for record in result.records)
+    assert "mode_probability_map" in result.records[-1]
+    assert result.records[-1]["most_likely_mode"] in result.records[-1]["mode_probability_map"]

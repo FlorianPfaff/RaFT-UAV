@@ -44,6 +44,7 @@ def radar_measurements_to_enu_with_uncertainty(
     default_xy_std_m: float = 25.0,
     default_z_std_m: float = 35.0,
     default_velocity_std_mps: float = 12.0,
+    include_velocity: bool = True,
 ) -> list[TrackingMeasurement]:
     """Convert normalized radar rows to measurements using row-wise covariance.
 
@@ -51,6 +52,9 @@ def radar_measurements_to_enu_with_uncertainty(
     six-dimensional.  The learned covariance is applied to the position block
     and the historical fixed velocity covariance is retained for the velocity
     block.
+
+    Set ``include_velocity=False`` to preserve the canonical position-only
+    radar update while still consuming learned position covariance.
     """
 
     position_fallback = np.diag(
@@ -60,7 +64,7 @@ def radar_measurements_to_enu_with_uncertainty(
     for _, row in radar.iterrows():
         position = np.array([float(row["east_m"]), float(row["north_m"]), float(row["up_m"])])
         position_covariance = covariance_from_row(row, 3, position_fallback)
-        velocity = _radar_velocity_vector_enu(row)
+        velocity = _radar_velocity_vector_enu(row) if include_velocity else None
         if velocity is None:
             vector = position
             covariance = position_covariance

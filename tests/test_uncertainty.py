@@ -1,6 +1,11 @@
 import numpy as np
 import pandas as pd
 
+from raft_uav.baselines.kalman import AsyncConstantVelocityKalmanTracker
+from raft_uav.baselines.radar_association import (
+    _nis_scored_candidates,
+    _radar_row_to_measurement,
+)
 from raft_uav.heteroscedastic_measurements import (
     radar_measurements_to_enu_with_uncertainty,
     rf_measurements_to_enu_with_uncertainty,
@@ -110,6 +115,30 @@ def test_heteroscedastic_measurement_converters_consume_covariance_columns():
     )
 
 
+def test_radar_association_uses_rowwise_covariance_columns():
+    tracker = AsyncConstantVelocityKalmanTracker(
+        initial_position=np.array([0.0, 0.0, 0.0]),
+        initial_time_s=0.0,
+        initial_position_std_m=1.0,
+        initial_velocity_std_mps=1.0,
+    )
+    candidates = pd.DataFrame(
+        {
+            "time_s": [0.0, 0.0],
+            "east_m": [100.0, 100.0],
+            "north_m": [0.0, 0.0],
+            "up_m": [0.0, 0.0],
+            "cov_ee": [10000.0, 1.0],
+            "cov_nn": [1.0, 1.0],
+            "cov_uu": [1.0, 1.0],
+        }
+    )
+
+    scored = _nis_scored_candidates(candidates, tracker, np.eye(3))
+
+    assert scored["association_nis"].iloc[0] < scored["association_nis"].iloc[1]
+
+
 def test_radar_converter_keeps_velocity_block_when_velocity_is_available():
     radar = pd.DataFrame(
         {
@@ -135,3 +164,22 @@ def test_radar_converter_keeps_velocity_block_when_velocity_is_available():
     assert np.allclose(measurement.vector[3:], [1.0, 2.0, 3.0])
     assert np.allclose(np.diag(measurement.covariance)[:3], [16.0, 25.0, 36.0])
     assert np.allclose(np.diag(measurement.covariance)[3:], [49.0, 49.0, 49.0])
+
+
+def test_radar_row_to_measurement_prefers_model_covariance():
+    row = pd.Series(
+        {
+            "time_s": 1.0,
+            "east_m": 10.0,
+            "north_m": 20.0,
+            "up_m": 30.0,
+            "cov_ee": 16.0,
+            "cov_nn": 25.0,
+            "cov_uu": 36.0,
+        }
+    )
+
+    measurement = _radar_row_to_measurement(row, np.diag([1.0, 2.0, 3.0]))
+
+    assert np.allclose(measurement.vector, [10.0, 20.0, 30.0])
+    assert np.allclose(np.diag(measurement.covariance), [16.0, 25.0, 36.0])

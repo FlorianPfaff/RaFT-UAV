@@ -46,6 +46,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    replay_tracker_kind: str = "cv",
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
     """Run retention-aware Viterbi with range-adaptive radar covariance."""
 
@@ -66,6 +67,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
             max_residual_norms_by_source=max_residual_norms_by_source,
             candidate_catprob_threshold=candidate_catprob_threshold,
             config=cfg,
+            replay_tracker_kind=replay_tracker_kind,
         )
 
 

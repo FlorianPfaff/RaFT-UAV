@@ -14,7 +14,24 @@ python scripts/train_heteroscedastic_uncertainty.py data/raw/AADM2025Dryad \
 
 The trainer aligns normalized RF and radar rows with the nearest truth sample and fits ridge-regularized log-linear variance heads for each measured axis.
 
-## Evaluate
+## Evaluate through the canonical baseline CLI
+
+The regular `raft-uav run-baseline` command can consume a fitted model directly:
+
+```bash
+raft-uav run-baseline data/raw/AADM2025Dryad \
+  --flight Opt3 \
+  --uncertainty-model outputs/uncertainty/no_opt3_uncertainty.json \
+  --radar-association geometry-score \
+  --smoother fixed-lag
+```
+
+This applies the learned row-wise covariance before RF/radar measurement conversion.
+The canonical CLI preserves the historical position-only radar measurement model.
+Radar association also uses those covariances for candidate NIS scoring, PDA
+mixture covariance, and track-bank assignment.
+
+The standalone runner remains useful for compact ablation scripts:
 
 ```bash
 python scripts/run_heteroscedastic_baseline.py data/raw/AADM2025Dryad \
@@ -23,8 +40,6 @@ python scripts/run_heteroscedastic_baseline.py data/raw/AADM2025Dryad \
   --radar-selection catprob \
   --smoother fixed-lag
 ```
-
-The runner keeps the existing constant-velocity Kalman baseline and replaces static measurement covariance with per-row covariance columns predicted by the model.
 
 ## Programmatic measurement conversion
 

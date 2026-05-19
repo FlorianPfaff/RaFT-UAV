@@ -8,16 +8,21 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-from raft_uav.baselines.kalman import AsyncConstantVelocityKalmanTracker, TrackingMeasurement
+from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.baselines.tracklet_viterbi import (
     TrackletViterbiAssociationConfig,
+    _annotate_replayed_row_with_tracker,
     _build_rf_anchor_states,
+    _first_rf_bootstrap_index,
+    _make_tracklet_replay_tracker,
     _nodes_for_radar_frame,
+    _normalize_tracklet_replay_tracker_kind,
     _optional_float,
     _optional_track_id,
     _radar_event_key,
     _select_tracklet_viterbi_path,
     _selected_row_event_key,
+    _tracklet_replay_record,
 )
 
 
@@ -47,6 +52,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_result(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    replay_tracker_kind: str = "cv",
 ) -> TrackletViterbiResult:
     """Run CV fusion and return accepted plus all non-miss Viterbi choices.
 
@@ -77,6 +83,17 @@ def run_async_cv_baseline_with_tracklet_viterbi_result(
             _empty_replayed_rows(empty),
             _empty_candidate_ledger(radar),
         )
+
+    bootstrap_index = _first_rf_bootstrap_index(events)
+    if bootstrap_index is None:
+        empty = _empty_selected_radar(radar)
+        return TrackletViterbiResult(
+            [],
+            empty,
+            _empty_replayed_rows(empty),
+            _empty_candidate_ledger(radar),
+        )
+    events = events[bootstrap_index:]
 
     initial = _initial_measurement(
         events[0],
@@ -134,6 +151,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_result(
         robust_update_by_source=robust_update_by_source,
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
+        replay_tracker_kind=replay_tracker_kind,
     )
     accepted_frame = _selected_rows_frame(radar, accepted)
     replayed_frame = _selected_rows_frame(radar, replayed)
@@ -230,20 +248,21 @@ def _replay_selected_tracklet_path_with_replay(
     robust_update_by_source: Mapping[str, str | None] | None,
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
+    replay_tracker_kind: str = "cv",
 ) -> tuple[list[dict[str, object]], list[pd.Series], list[pd.Series]]:
     from raft_uav.baselines.radar_association import (
         _gate_threshold_for_measurement,
         _inflation_alpha_for_measurement,
         _max_residual_norm_for_measurement,
         _radar_row_to_measurement,
-        _record,
         _robust_update_for_measurement,
     )
 
     selected_by_key = {_selected_row_event_key(row): row for row in selected_rows}
-    tracker = AsyncConstantVelocityKalmanTracker(
-        initial_position=initial_measurement.vector,
-        initial_time_s=initial_measurement.time_s,
+    tracker_kind = _normalize_tracklet_replay_tracker_kind(replay_tracker_kind)
+    tracker = _make_tracklet_replay_tracker(
+        tracker_kind,
+        initial_measurement=initial_measurement,
         acceleration_std_mps2=acceleration_std_mps2,
     )
     records: list[dict[str, object]] = []
@@ -278,7 +297,14 @@ def _replay_selected_tracklet_path_with_replay(
                     inflation_alpha_by_source=inflation_alpha_by_source,
                 ),
             )
-            records.append(_record(measurement, tracker, diagnostics))
+            records.append(
+                _tracklet_replay_record(
+                    measurement,
+                    tracker,
+                    diagnostics,
+                    replay_tracker_kind=tracker_kind,
+                )
+            )
             continue
 
         candidates = event["candidates"]
@@ -320,14 +346,20 @@ def _replay_selected_tracklet_path_with_replay(
         replayed["association_replay_covariance_scale"] = float(diagnostics.covariance_scale)
         replayed["association_replay_gate_threshold"] = diagnostics.gate_threshold
         replayed["association_replay_safety_gate_threshold"] = diagnostics.safety_gate_threshold
+        _annotate_replayed_row_with_tracker(
+            replayed,
+            tracker=tracker,
+            replay_tracker_kind=tracker_kind,
+        )
         replayed_rows.append(replayed)
         if diagnostics.accepted:
             accepted_rows.append(replayed)
         records.append(
-            _record(
+            _tracklet_replay_record(
                 measurement,
                 tracker,
                 diagnostics,
+                replay_tracker_kind=tracker_kind,
                 track_id=_optional_track_id(selected.get("track_id")),
                 association_nis=_optional_float(selected.get("association_nis")),
                 association_score=_optional_float(selected.get("association_score")),
@@ -347,6 +379,8 @@ def _empty_replayed_rows(frame: pd.DataFrame) -> pd.DataFrame:
         "association_replay_covariance_scale",
         "association_replay_gate_threshold",
         "association_replay_safety_gate_threshold",
+        "association_replay_tracker",
+        "association_replay_most_likely_mode",
     ):
         if column not in replayed.columns:
             replayed[column] = []

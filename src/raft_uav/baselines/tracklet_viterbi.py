@@ -12,6 +12,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 import math
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -99,6 +100,9 @@ class _ViterbiNode:
     is_miss: bool = False
 
 
+TRACKLET_REPLAY_TRACKER_KINDS = ("cv", "imm")
+
+
 def run_async_cv_baseline_with_tracklet_viterbi_association(
     *,
     rf_measurements: Iterable[TrackingMeasurement],
@@ -115,6 +119,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    replay_tracker_kind: str = "cv",
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
     """Run CV fusion after Viterbi radar-tracklet selection."""
 
@@ -178,6 +183,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         robust_update_by_source=robust_update_by_source,
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
+        replay_tracker_kind=replay_tracker_kind,
     )
     return records, _selected_rows_frame(radar, accepted)
 
@@ -197,6 +203,105 @@ def _first_rf_bootstrap_index(events: list[dict[str, object]]) -> int | None:
         if event.get("kind") == "rf":
             return index
     return 0
+
+
+def _normalize_tracklet_replay_tracker_kind(kind: str) -> str:
+    """Return a normalized replay tracker identifier or raise a clear error."""
+
+    normalized = str(kind).strip().lower()
+    if normalized not in TRACKLET_REPLAY_TRACKER_KINDS:
+        valid = ", ".join(TRACKLET_REPLAY_TRACKER_KINDS)
+        raise ValueError(f"replay_tracker_kind must be one of {valid}; got {kind!r}")
+    return normalized
+
+
+def _make_tracklet_replay_tracker(
+    replay_tracker_kind: str,
+    *,
+    initial_measurement: TrackingMeasurement,
+    acceleration_std_mps2: float,
+):
+    """Create the tracker used to replay the selected tracklet-Viterbi path."""
+
+    kind = _normalize_tracklet_replay_tracker_kind(replay_tracker_kind)
+    if kind == "cv":
+        return AsyncConstantVelocityKalmanTracker(
+            initial_position=initial_measurement.vector,
+            initial_time_s=initial_measurement.time_s,
+            acceleration_std_mps2=acceleration_std_mps2,
+        )
+    if kind == "imm":
+        from raft_uav.baselines.imm import AsyncInteractingMultipleModelTracker
+
+        return AsyncInteractingMultipleModelTracker(
+            initial_position=initial_measurement.vector,
+            initial_time_s=initial_measurement.time_s,
+            acceleration_std_mps2=acceleration_std_mps2,
+        )
+    raise AssertionError(f"unhandled replay tracker kind {kind!r}")
+
+
+def _tracklet_replay_record(
+    measurement: TrackingMeasurement,
+    tracker: object,
+    diagnostics: Any,
+    *,
+    replay_tracker_kind: str,
+    track_id: int | None = None,
+    association_nis: float | None = None,
+    association_score: float | None = None,
+    association_mode: str | None = None,
+) -> dict[str, object]:
+    """Return a standard tracking record plus replay-tracker diagnostics."""
+
+    from raft_uav.baselines.radar_association import _record
+
+    record = _record(
+        measurement,
+        tracker,
+        diagnostics,
+        track_id=track_id,
+        association_nis=association_nis,
+        association_score=association_score,
+        association_mode=association_mode,
+    )
+    record["tracklet_replay_tracker"] = replay_tracker_kind
+    _attach_imm_record_diagnostics(record, tracker)
+    return record
+
+
+def _attach_imm_record_diagnostics(record: dict[str, object], tracker: object) -> None:
+    """Add IMM mode diagnostics when the replay tracker exposes them."""
+
+    mode_names = getattr(tracker, "mode_names", None)
+    if mode_names is None:
+        return
+    try:
+        mode_probabilities = np.asarray(getattr(tracker, "mode_probabilities"), dtype=float)
+    except (AttributeError, TypeError, ValueError):
+        return
+    record["mode_names"] = tuple(str(name) for name in mode_names)
+    record["mode_probabilities"] = mode_probabilities.copy()
+    mode_probability_map = getattr(tracker, "mode_probability_map", None)
+    if mode_probability_map is not None:
+        record["mode_probability_map"] = dict(mode_probability_map)
+    most_likely = getattr(tracker, "most_likely_mode_name", None)
+    if most_likely is not None:
+        record["most_likely_mode"] = str(most_likely)
+
+
+def _annotate_replayed_row_with_tracker(
+    row: pd.Series,
+    *,
+    tracker: object,
+    replay_tracker_kind: str,
+) -> None:
+    """Attach replay-tracker metadata to a selected radar row."""
+
+    row["association_replay_tracker"] = replay_tracker_kind
+    most_likely = getattr(tracker, "most_likely_mode_name", None)
+    if most_likely is not None:
+        row["association_replay_most_likely_mode"] = str(most_likely)
 
 
 def _build_rf_anchor_states(
@@ -469,20 +574,21 @@ def _replay_selected_tracklet_path(
     robust_update_by_source: Mapping[str, str | None] | None,
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
+    replay_tracker_kind: str = "cv",
 ) -> tuple[list[dict[str, object]], list[pd.Series]]:
     from raft_uav.baselines.radar_association import (
         _gate_threshold_for_measurement,
         _inflation_alpha_for_measurement,
         _max_residual_norm_for_measurement,
         _radar_row_to_measurement,
-        _record,
         _robust_update_for_measurement,
     )
 
     selected_by_key = {_selected_row_event_key(row): row for row in selected_rows}
-    tracker = AsyncConstantVelocityKalmanTracker(
-        initial_position=initial_measurement.vector,
-        initial_time_s=initial_measurement.time_s,
+    tracker_kind = _normalize_tracklet_replay_tracker_kind(replay_tracker_kind)
+    tracker = _make_tracklet_replay_tracker(
+        tracker_kind,
+        initial_measurement=initial_measurement,
         acceleration_std_mps2=acceleration_std_mps2,
     )
     records: list[dict[str, object]] = []
@@ -516,7 +622,14 @@ def _replay_selected_tracklet_path(
                     inflation_alpha_by_source=inflation_alpha_by_source,
                 ),
             )
-            records.append(_record(measurement, tracker, diagnostics))
+            records.append(
+                _tracklet_replay_record(
+                    measurement,
+                    tracker,
+                    diagnostics,
+                    replay_tracker_kind=tracker_kind,
+                )
+            )
             continue
         candidates = event["candidates"]
         assert isinstance(candidates, pd.DataFrame)
@@ -552,13 +665,19 @@ def _replay_selected_tracklet_path(
         replayed = selected.copy()
         replayed["association_replay_accepted"] = bool(diagnostics.accepted)
         replayed["association_replay_nis"] = float(diagnostics.nis)
+        _annotate_replayed_row_with_tracker(
+            replayed,
+            tracker=tracker,
+            replay_tracker_kind=tracker_kind,
+        )
         if diagnostics.accepted:
             accepted_rows.append(replayed)
         records.append(
-            _record(
+            _tracklet_replay_record(
                 measurement,
                 tracker,
                 diagnostics,
+                replay_tracker_kind=tracker_kind,
                 track_id=_optional_track_id(selected.get("track_id")),
                 association_nis=_optional_float(selected.get("association_nis")),
                 association_score=_optional_float(selected.get("association_score")),

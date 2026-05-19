@@ -25,6 +25,14 @@ RADAR_COVARIANCE_COLUMNS = (
     "association_cov_eu",
     "association_cov_nu",
 )
+GENERIC_RADAR_COVARIANCE_COLUMNS = (
+    "cov_ee",
+    "cov_nn",
+    "cov_uu",
+    "cov_en",
+    "cov_eu",
+    "cov_nu",
+)
 BIAS_RESIDUAL_COVARIANCE_COLUMNS = (
     f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}east_m",
     f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}north_m",
@@ -244,6 +252,17 @@ def row_radar_covariance(
     """
 
     fallback = None if fallback_covariance is None else np.asarray(fallback_covariance, dtype=float)
+    generic_covariance = _generic_row_covariance(row)
+    if generic_covariance is not None:
+        if _truthy(row.get(BIAS_RESIDUAL_INCLUDED_COLUMN, False)):
+            return generic_covariance
+        covariance, _ = _add_bias_residual_uncertainty(
+            row,
+            generic_covariance,
+            min_std_m=1.0e-6,
+            max_std_m=1.0e9,
+        )
+        return covariance
     if not all(column in row for column in RADAR_COVARIANCE_COLUMNS):
         if fallback is None:
             return fallback
@@ -290,6 +309,19 @@ def row_radar_covariance(
     return covariance
 
 
+def _generic_row_covariance(row: pd.Series) -> np.ndarray | None:
+    diagonal = [_positive_float(row.get(column)) for column in GENERIC_RADAR_COVARIANCE_COLUMNS[:3]]
+    if not all(value is not None for value in diagonal):
+        return None
+    ee, nn, uu = [float(value) for value in diagonal]
+    en, eu, nu = [
+        _finite_float(row.get(column), default=0.0)
+        for column in GENERIC_RADAR_COVARIANCE_COLUMNS[3:]
+    ]
+    covariance = np.array([[ee, en, eu], [en, nn, nu], [eu, nu, uu]], dtype=float)
+    return _regularized_covariance(covariance, min_std_m=1.0e-6, max_std_m=1.0e9)
+
+
 def candidate_radar_covariances(
     candidates: pd.DataFrame,
     fallback_covariance: np.ndarray,
@@ -320,6 +352,14 @@ def _positive_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if np.isfinite(number) and number > 0.0 else None
+
+
+def _finite_float(value: object, *, default: float) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float(default)
+    return number if np.isfinite(number) else float(default)
 
 
 def _env_float(name: str, default: float) -> float:

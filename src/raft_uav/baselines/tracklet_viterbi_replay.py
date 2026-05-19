@@ -35,6 +35,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association_and_replay(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    replay_tracker_kind: str = "cv",
 ) -> tuple[list[dict[str, object]], pd.DataFrame, pd.DataFrame]:
     """Return legacy tuple outputs from the canonical result-object API."""
 
@@ -60,5 +61,6 @@ def run_async_cv_baseline_with_tracklet_viterbi_association_and_replay(
         max_residual_norms_by_source=max_residual_norms_by_source,
         candidate_catprob_threshold=candidate_catprob_threshold,
         config=config,
+        replay_tracker_kind=replay_tracker_kind,
     )
     return result.records, result.accepted_radar, result.viterbi_selected_radar

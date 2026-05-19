@@ -85,6 +85,11 @@ class HeteroscedasticUncertaintyModel:
     heads: tuple[VarianceHead, ...]
     metadata: Mapping[str, Any]
 
+    def has_source(self, source: str) -> bool:
+        """Return whether the model contains at least one head for a source."""
+
+        return any(head.source == source for head in self.heads)
+
     def apply_rf(self, rf: pd.DataFrame) -> pd.DataFrame:
         return self.apply(rf, source="rf")
 

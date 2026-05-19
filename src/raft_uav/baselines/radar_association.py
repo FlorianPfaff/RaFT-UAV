@@ -24,6 +24,7 @@ from raft_uav.baselines.update_logic import (
     max_residual_norm_for_measurement,
     plan_linear_measurement_update,
 )
+from raft_uav.uncertainty import covariance_from_row
 
 RADAR_ASSOCIATION_MODES = (
     "oracle-nearest-truth",
@@ -244,9 +245,7 @@ def run_async_cv_baseline_with_radar_association(
 
     start_index = 0
     initial_measurement = None
-    initial_events = (
-        enumerate(events) if association in _STABLE_SEGMENT_ASSOCIATION_MODES else [(0, events[0])]
-    )
+    initial_events = _bootstrap_event_candidates(events, association)
     for index, event in initial_events:
         initial_measurement = _initial_measurement(
             event,
@@ -420,8 +419,12 @@ def _run_mht_track_bank(
     if not events:
         return [], _empty_selected_radar(radar)
 
+    start_index = _first_rf_event_index(events)
+    if start_index is None:
+        start_index = 0
+
     initial_measurement = _initial_measurement(
-        events[0],
+        events[start_index],
         association="track-bank",
         covariance=covariance,
         stable_anchor_by_key=None,
@@ -446,7 +449,7 @@ def _run_mht_track_bank(
     records: list[dict[str, object]] = []
     selected_rows: list[pd.Series] = []
 
-    for event in events:
+    for event in events[start_index:]:
         time_s = float(event["time_s"])
         _predict_mht_to(
             tracker,
@@ -507,7 +510,7 @@ def _run_mht_track_bank(
             covariance,
         )
         measurements = candidates[["east_m", "north_m", "up_m"]].to_numpy(dtype=float).T
-        covariances = np.repeat(covariance[:, :, None], measurements.shape[1], axis=2)
+        covariances = _candidate_covariances(candidates, covariance)
         tracker.update_linear(measurements, measurement_matrix(3), covariances)
 
         selected = _selected_row_from_best_mht_assignment(
@@ -840,6 +843,35 @@ def _radar_frame_groups(radar: pd.DataFrame) -> list[pd.DataFrame]:
     ordered = radar.sort_values(sort_columns).reset_index(drop=True)
     group_column = "frame_index" if "frame_index" in ordered.columns else "time_s"
     return [group.copy() for _, group in ordered.groupby(group_column, sort=True)]
+
+
+def _bootstrap_event_candidates(
+    events: list[dict[str, object]],
+    association: str,
+) -> list[tuple[int, dict[str, object]]]:
+    """Return candidate events that may initialize an online association run.
+
+    Online association modes should not let a pre-RF radar frame choose the
+    initial state when an RF anchor is available later in the sequence.  Such a
+    bootstrap is especially brittle because it uses class probability only,
+    before prediction-NIS, track-continuity, PDA, MHT, or geometry scoring have
+    a state to condition on.  The oracle mode remains an explicit diagnostic
+    upper bound and may still initialize from the first event using truth.
+    """
+
+    first_rf_index = _first_rf_event_index(events)
+    if first_rf_index is not None and association != "oracle-nearest-truth":
+        return [(first_rf_index, events[first_rf_index])]
+    if association in _STABLE_SEGMENT_ASSOCIATION_MODES:
+        return list(enumerate(events))
+    return [(0, events[0])]
+
+
+def _first_rf_event_index(events: list[dict[str, object]]) -> int | None:
+    for index, event in enumerate(events):
+        if event["kind"] == "rf":
+            return int(index)
+    return None
 
 
 def _select_stable_radar_segments(
@@ -1614,15 +1646,21 @@ def _nis_scored_candidates(
         return candidates.iloc[0:0].copy()
     observation = measurement_matrix(3)
     state_position = observation @ tracker.state
-    innovation_covariance = observation @ tracker.covariance_matrix @ observation.T + covariance
-    try:
-        precision = np.linalg.inv(innovation_covariance)
-    except np.linalg.LinAlgError:
-        precision = np.linalg.pinv(innovation_covariance)
+    state_innovation_covariance = observation @ tracker.covariance_matrix @ observation.T
     vectors = candidates[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
     residuals = vectors - state_position
+    nis: list[float] = []
+    for (_, row), residual in zip(candidates.iterrows(), residuals):
+        innovation_covariance = state_innovation_covariance + covariance_from_row(
+            row, 3, covariance
+        )
+        try:
+            precision = np.linalg.inv(innovation_covariance)
+        except np.linalg.LinAlgError:
+            precision = np.linalg.pinv(innovation_covariance)
+        nis.append(float(residual @ precision @ residual))
     scored = candidates.copy()
-    scored["association_nis"] = np.einsum("ij,jk,ik->i", residuals, precision, residuals)
+    scored["association_nis"] = nis
     scored["association_candidate_rows"] = int(len(candidates))
     return scored
 
@@ -1716,7 +1754,8 @@ def _pda_mixture_candidate(
     mean = weights @ vectors
     residuals = vectors - mean
     spread = residuals.T @ (residuals * weights[:, None])
-    covariance = np.asarray(base_covariance, dtype=float) + spread
+    measurement_covariance = _weighted_candidate_covariance(candidates, weights, base_covariance)
+    covariance = measurement_covariance + spread
 
     best_index = int(np.argmax(weights))
     selected = candidates.iloc[best_index].copy()
@@ -1772,39 +1811,36 @@ def _weight_entropy(weights: np.ndarray) -> float:
     return float(-np.sum(clipped * np.log(clipped)))
 
 
+def _candidate_covariances(candidates: pd.DataFrame, fallback: np.ndarray) -> np.ndarray:
+    if candidates.empty:
+        return np.zeros((3, 3, 0), dtype=float)
+    return np.stack(
+        [covariance_from_row(row, 3, fallback) for _, row in candidates.iterrows()],
+        axis=2,
+    )
+
+
+def _weighted_candidate_covariance(
+    candidates: pd.DataFrame,
+    weights: np.ndarray,
+    fallback: np.ndarray,
+) -> np.ndarray:
+    covariances = _candidate_covariances(candidates, fallback)
+    return np.tensordot(covariances, np.asarray(weights, dtype=float), axes=([2], [0]))
+
+
 def _radar_row_to_measurement(row: pd.Series, covariance: np.ndarray) -> TrackingMeasurement:
-    row_covariance = _row_covariance(row)
+    row_covariance = _row_covariance(row, covariance)
     return TrackingMeasurement(
         time_s=float(row["time_s"]),
         vector=np.array([float(row["east_m"]), float(row["north_m"]), float(row["up_m"])]),
-        covariance=covariance if row_covariance is None else row_covariance,
+        covariance=row_covariance,
         source="radar",
     )
 
 
-def _row_covariance(row: pd.Series) -> np.ndarray | None:
-    columns = [
-        "association_cov_ee",
-        "association_cov_nn",
-        "association_cov_uu",
-        "association_cov_en",
-        "association_cov_eu",
-        "association_cov_nu",
-    ]
-    if not all(column in row for column in columns):
-        return None
-    values = [float(row[column]) for column in columns]
-    if not np.isfinite(values).all():
-        return None
-    ee, nn, uu, en, eu, nu = values
-    return np.array(
-        [
-            [ee, en, eu],
-            [en, nn, nu],
-            [eu, nu, uu],
-        ],
-        dtype=float,
-    )
+def _row_covariance(row: pd.Series, fallback: np.ndarray) -> np.ndarray:
+    return covariance_from_row(row, 3, fallback)
 
 
 def _nearest_truth_position(

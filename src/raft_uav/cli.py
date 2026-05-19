@@ -17,9 +17,16 @@ from raft_uav.baselines.radar_association import (
     run_async_cv_baseline_with_radar_association,
 )
 from raft_uav.baselines.smoothing import SMOOTHER_MODES, smooth_tracking_records
+from raft_uav.baselines.update_logic import ROBUST_UPDATE_MODES
 from raft_uav.evaluation.diagnostics import build_diagnostic_summary
 from raft_uav.evaluation.metrics import position_errors_m, summarize_errors
+from raft_uav.heteroscedastic_measurements import (
+    radar_measurements_to_enu_with_uncertainty,
+    rf_measurements_to_enu_with_uncertainty,
+)
 from raft_uav.io.aerpaw import (
+    DEFAULT_RADAR_CLOCK_OFFSET_S,
+    DEFAULT_RF_CLOCK_OFFSET_S,
     discover_flights,
     normalize_radar,
     normalize_rf,
@@ -33,6 +40,7 @@ from raft_uav.io.aerpaw import (
     select_radar_measurement_rows,
     summarize_flight_schema,
 )
+from raft_uav.uncertainty import load_uncertainty_model
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -46,6 +54,18 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="inspect only this flight; can be passed multiple times",
     )
+    inspect_parser.add_argument(
+        "--rf-clock-offset-s",
+        type=float,
+        default=DEFAULT_RF_CLOCK_OFFSET_S,
+        help="seconds added to raw RF timestamps before truth-relative normalization",
+    )
+    inspect_parser.add_argument(
+        "--radar-clock-offset-s",
+        type=float,
+        default=DEFAULT_RADAR_CLOCK_OFFSET_S,
+        help="seconds added to raw radar globalTime values before truth-relative normalization",
+    )
 
     baseline_parser = subparsers.add_parser(
         "run-baseline", help="run the initial CV fusion baseline"
@@ -55,14 +75,39 @@ def main(argv: list[str] | None = None) -> int:
     baseline_parser.add_argument("--output-dir", type=Path, default=Path("outputs/baseline"))
     baseline_parser.add_argument("--acceleration-std", type=float, default=4.0)
     baseline_parser.add_argument(
+        "--uncertainty-model",
+        type=Path,
+        default=None,
+        help=(
+            "path to a fitted heteroscedastic uncertainty JSON; when set, "
+            "learned row-wise covariance columns are used for RF/radar updates"
+        ),
+    )
+    baseline_parser.add_argument(
+        "--rf-clock-offset-s",
+        type=float,
+        default=DEFAULT_RF_CLOCK_OFFSET_S,
+        help="seconds added to raw RF timestamps before truth-relative normalization",
+    )
+    baseline_parser.add_argument(
+        "--radar-clock-offset-s",
+        type=float,
+        default=DEFAULT_RADAR_CLOCK_OFFSET_S,
+        help="seconds added to raw radar globalTime values before truth-relative normalization",
+    )
+    baseline_parser.add_argument(
         "--radar-association",
-        choices=["catprob", *RADAR_ASSOCIATION_MODES],
+        choices=["catprob", "catprob-all", *RADAR_ASSOCIATION_MODES],
         default="catprob",
-        help="radar association mode for choosing trackData rows before radar updates",
+        help=(
+            "radar association mode for choosing trackData rows before radar updates; "
+            "catprob keeps at most one highest-probability UAV candidate per frame, "
+            "while catprob-all reproduces the legacy all-above-threshold behavior"
+        ),
     )
     baseline_parser.add_argument(
         "--radar-selection",
-        choices=["catprob", "truth-gated", "all", "none"],
+        choices=["catprob", "catprob-all", "truth-gated", "all", "none"],
         default=None,
         help="legacy radar row selection; overrides --radar-association when provided",
     )
@@ -210,9 +255,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     baseline_parser.add_argument(
         "--robust-update",
-        choices=["none", "nis-inflate"],
+        choices=("none", *ROBUST_UPDATE_MODES),
         default="none",
-        help="robust update rule; nis-inflate keeps plausible high-NIS updates with inflated covariance",
+        help=(
+            "robust update rule; nis-inflate keeps plausible high-NIS updates with "
+            "inflated covariance, student-t applies Student-t covariance scaling, "
+            "and huber applies multivariate Huber covariance scaling"
+        ),
     )
     baseline_parser.add_argument(
         "--rf-gate-prob",
@@ -276,13 +325,19 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "inspect":
-        return _inspect(args.dataset_root, args.flight)
+        return _inspect(
+            args.dataset_root,
+            args.flight,
+            args.rf_clock_offset_s,
+            args.radar_clock_offset_s,
+        )
     if args.command == "run-baseline":
         return _run_baseline(
             args.dataset_root,
             args.flight,
             args.output_dir,
             args.acceleration_std,
+            args.uncertainty_model,
             args.radar_association,
             args.radar_selection,
             args.radar_catprob_threshold,
@@ -326,11 +381,18 @@ def main(argv: list[str] | None = None) -> int:
             args.radar_max_residual_m,
             args.rf_inflation_alpha,
             args.radar_inflation_alpha,
+            args.rf_clock_offset_s,
+            args.radar_clock_offset_s,
         )
     raise ValueError(args.command)
 
 
-def _inspect(dataset_root: Path, requested_flights: list[str] | None) -> int:
+def _inspect(
+    dataset_root: Path,
+    requested_flights: list[str] | None,
+    rf_clock_offset_s: float = DEFAULT_RF_CLOCK_OFFSET_S,
+    radar_clock_offset_s: float = DEFAULT_RADAR_CLOCK_OFFSET_S,
+) -> int:
     if requested_flights:
         flights = [select_flight(dataset_root, name) for name in requested_flights]
         discovered_count = len(discover_flights(dataset_root))
@@ -340,7 +402,11 @@ def _inspect(dataset_root: Path, requested_flights: list[str] | None) -> int:
 
     print(f"discovered_flights={discovered_count}")
     for flight in flights:
-        summary = summarize_flight_schema(flight)
+        summary = summarize_flight_schema(
+            flight,
+            rf_clock_offset_s=rf_clock_offset_s,
+            radar_clock_offset_s=radar_clock_offset_s,
+        )
         print(f"\nflight={summary['flight']}")
         for modality in ("truth", "rf", "radar"):
             _print_modality_summary(modality, summary.get(modality))
@@ -351,50 +417,53 @@ def _run_baseline(
     dataset_root: Path,
     flight_name: str,
     output_dir: Path,
-    acceleration_std: float,
-    radar_association: str,
-    legacy_radar_selection: str | None,
-    radar_catprob_threshold: float,
-    truth_gate_m: float,
-    truth_time_gate_s: float,
-    track_switch_nis_ratio: float,
-    geometry_velocity_std: float,
-    geometry_velocity_weight: float,
-    geometry_switch_penalty: float,
-    geometry_catprob_weight: float,
-    pda_nis_temperature: float,
-    pda_catprob_exponent: float,
-    track_bank_max_hypotheses: int,
-    track_bank_max_assignments: int,
-    track_bank_max_candidates: int,
-    track_bank_gate_prob: float,
-    track_bank_detection_prob: float,
-    track_bank_clutter_intensity: float,
-    track_bank_prune_delta: float,
-    stable_segment_min_frames: int,
-    stable_segment_max_transition_speed_mps: float,
-    stable_segment_range_gate_m: float,
-    stable_segment_interpolation_max_gap_s: float,
-    stable_segment_interpolation_max_speed_mps: float,
-    stable_segment_interpolation_std_scale: float,
-    stable_segment_interpolation_gap_std_mps: float,
-    stable_segment_rf_score_weight: float,
-    stable_segment_rf_time_gate_s: float,
-    stable_segment_rf_nis_cap: float,
-    smoother: str,
-    smoother_lag_s: float,
-    max_eval_time_delta_s: float,
-    enable_gating: bool,
-    robust_update: str,
-    rf_gate_prob: float,
-    radar_gate_prob: float,
-    enable_association_safety_gate: bool,
-    rf_safety_gate_prob: float,
-    radar_safety_gate_prob: float,
-    rf_max_residual_m: float,
-    radar_max_residual_m: float,
-    rf_inflation_alpha: float,
-    radar_inflation_alpha: float,
+    acceleration_std: float = 4.0,
+    uncertainty_model_path: Path | None = None,
+    radar_association: str = "catprob",
+    legacy_radar_selection: str | None = None,
+    radar_catprob_threshold: float = 0.5,
+    truth_gate_m: float = 150.0,
+    truth_time_gate_s: float = 1.0,
+    track_switch_nis_ratio: float = 0.5,
+    geometry_velocity_std: float = 12.0,
+    geometry_velocity_weight: float = 0.25,
+    geometry_switch_penalty: float = 4.0,
+    geometry_catprob_weight: float = 2.0,
+    pda_nis_temperature: float = 1.0,
+    pda_catprob_exponent: float = 1.0,
+    track_bank_max_hypotheses: int = 16,
+    track_bank_max_assignments: int = 16,
+    track_bank_max_candidates: int = 16,
+    track_bank_gate_prob: float = 0.9999999,
+    track_bank_detection_prob: float = 0.999,
+    track_bank_clutter_intensity: float = 1.0e-12,
+    track_bank_prune_delta: float = 80.0,
+    stable_segment_min_frames: int = 100,
+    stable_segment_max_transition_speed_mps: float = 65.0,
+    stable_segment_range_gate_m: float = 800.0,
+    stable_segment_interpolation_max_gap_s: float = 5.0,
+    stable_segment_interpolation_max_speed_mps: float = 65.0,
+    stable_segment_interpolation_std_scale: float = 2.0,
+    stable_segment_interpolation_gap_std_mps: float = 12.0,
+    stable_segment_rf_score_weight: float = 1.0,
+    stable_segment_rf_time_gate_s: float = 2.0,
+    stable_segment_rf_nis_cap: float = 25.0,
+    smoother: str = "none",
+    smoother_lag_s: float = 20.0,
+    max_eval_time_delta_s: float = 2.0,
+    enable_gating: bool = False,
+    robust_update: str = "none",
+    rf_gate_prob: float = 0.99,
+    radar_gate_prob: float = 0.99,
+    enable_association_safety_gate: bool = True,
+    rf_safety_gate_prob: float = 0.9999999,
+    radar_safety_gate_prob: float = 0.9999999,
+    rf_max_residual_m: float = 750.0,
+    radar_max_residual_m: float = 0.0,
+    rf_inflation_alpha: float = 1.0,
+    radar_inflation_alpha: float = 1.0,
+    rf_clock_offset_s: float = DEFAULT_RF_CLOCK_OFFSET_S,
+    radar_clock_offset_s: float = DEFAULT_RADAR_CLOCK_OFFSET_S,
 ) -> int:
     if enable_gating and robust_update != "none":
         raise ValueError("--enable-gating and --robust-update are mutually exclusive")
@@ -434,6 +503,15 @@ def _run_baseline(
         raise ValueError("stable_segment_rf_nis_cap must be positive")
     if smoother == "fixed-lag" and smoother_lag_s < 0.0:
         raise ValueError("smoother_lag_s must be nonnegative for fixed-lag smoothing")
+    uncertainty_model = (
+        None
+        if uncertainty_model_path is None
+        else load_uncertainty_model(uncertainty_model_path)
+    )
+    use_rf_uncertainty = uncertainty_model is not None and uncertainty_model.has_source("rf")
+    use_radar_uncertainty = (
+        uncertainty_model is not None and uncertainty_model.has_source("radar")
+    )
     radar_mode = legacy_radar_selection or radar_association
     flight = select_flight(dataset_root, flight_name)
     if flight.truth_txt is None:
@@ -449,17 +527,36 @@ def _run_baseline(
     rf_measurements = []
     if flight.rf_csv is not None:
         rf = _inside_truth_window(
-            normalize_rf(read_rf_csv(flight.rf_csv), projector, truth_origin_time), truth
-        )
-        rf_measurements = rf_measurements_to_enu(rf)
-        measurements.extend(rf_measurements)
-    if flight.radar_json is not None:
-        radar = _inside_truth_window(
-            normalize_radar(
-                read_radar_tracks_json(flight.radar_json), projector, truth_origin_time
+            _normalize_with_optional_clock_offset(
+                normalize_rf,
+                read_rf_csv(flight.rf_csv),
+                projector,
+                truth_origin_time,
+                clock_offset_s=rf_clock_offset_s,
             ),
             truth,
         )
+        if use_rf_uncertainty:
+            assert uncertainty_model is not None
+            rf = uncertainty_model.apply_rf(rf)
+        rf_measurements = _rf_measurements_to_enu_for_covariance(
+            rf, use_uncertainty_model=use_rf_uncertainty
+        )
+        measurements.extend(rf_measurements)
+    if flight.radar_json is not None:
+        radar = _inside_truth_window(
+            _normalize_with_optional_clock_offset(
+                normalize_radar,
+                read_radar_tracks_json(flight.radar_json),
+                projector,
+                truth_origin_time,
+                clock_offset_s=radar_clock_offset_s,
+            ),
+            truth,
+        )
+        if use_radar_uncertainty:
+            assert uncertainty_model is not None
+            radar = uncertainty_model.apply_radar(radar)
 
     gate_probabilities = None
     safety_gate_probabilities = None
@@ -531,7 +628,10 @@ def _run_baseline(
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
-        measurements = [*rf_measurements, *radar_measurements_to_enu(selected_radar)]
+        selected_radar_measurements = _radar_measurements_to_enu_for_covariance(
+            selected_radar, use_uncertainty_model=use_radar_uncertainty
+        )
+        measurements = [*rf_measurements, *selected_radar_measurements]
     else:
         selected_radar = select_radar_measurement_rows(
             radar,
@@ -541,7 +641,10 @@ def _run_baseline(
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
-        measurements.extend(radar_measurements_to_enu(selected_radar))
+        selected_radar_measurements = _radar_measurements_to_enu_for_covariance(
+            selected_radar, use_uncertainty_model=use_radar_uncertainty
+        )
+        measurements.extend(selected_radar_measurements)
         records = run_async_cv_baseline(
             measurements,
             acceleration_std_mps2=acceleration_std,
@@ -558,6 +661,7 @@ def _run_baseline(
         method=smoother,
         acceleration_std_mps2=acceleration_std,
         lag_s=smoother_lag_s,
+        measurements=measurements,
     )
 
     estimate_frame = _records_to_frame(records)
@@ -643,6 +747,15 @@ def _run_baseline(
         radar_max_residual_m=radar_max_residual_m,
         rf_inflation_alpha=rf_inflation_alpha,
         radar_inflation_alpha=radar_inflation_alpha,
+        rf_clock_offset_s=rf_clock_offset_s,
+        radar_clock_offset_s=radar_clock_offset_s,
+        rf_covariance_label=_covariance_label("rf", use_rf_uncertainty),
+        radar_covariance_label=_covariance_label("radar", use_radar_uncertainty),
+        uncertainty_model_summary=_uncertainty_model_summary(
+            uncertainty_model_path,
+            use_rf_uncertainty=use_rf_uncertainty,
+            use_radar_uncertainty=use_radar_uncertainty,
+        ),
     )
     metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     diagnostic_summary = build_diagnostic_summary(
@@ -666,6 +779,18 @@ def _run_baseline(
     print(f"rf_rows={len(rf)}")
     print(f"radar_rows={len(radar)}")
     print(f"radar_association={radar_mode}")
+    clock_offsets = metrics.get(
+        "clock_offsets_s",
+        {"rf": rf_clock_offset_s, "radar": radar_clock_offset_s},
+    )
+    print(f"rf_clock_offset_s={clock_offsets['rf']}")
+    print(f"radar_clock_offset_s={clock_offsets['radar']}")
+    if uncertainty_model_path is not None:
+        print(f"uncertainty_model={uncertainty_model_path}")
+        print(
+            f"heteroscedastic_sources=rf:{use_rf_uncertainty},"
+            f"radar:{use_radar_uncertainty}"
+        )
     print(f"selected_radar_rows={len(selected_radar)}")
     print(f"selected_radar_track_ids={metrics['selected_radar_track_ids']}")
     print(f"smoother={smoother}")
@@ -679,6 +804,27 @@ def _run_baseline(
     print(f"rmse_2d_m={metrics['position_error_2d']['rmse_m']:.3f}")
     print(f"rmse_3d_m={metrics['position_error_3d']['rmse_m']:.3f}")
     return 0
+
+
+def _normalize_with_optional_clock_offset(
+    normalizer,
+    raw: pd.DataFrame,
+    projector,
+    truth_origin_time: float,
+    *,
+    clock_offset_s: float,
+) -> pd.DataFrame:
+    try:
+        return normalizer(
+            raw,
+            projector,
+            truth_origin_time,
+            clock_offset_s=clock_offset_s,
+        )
+    except TypeError as exc:
+        if "clock_offset_s" not in str(exc):
+            raise
+        return normalizer(raw, projector, truth_origin_time)
 
 
 def _records_to_frame(records: list[dict[str, object]]) -> pd.DataFrame:
@@ -748,6 +894,51 @@ def _hypotheses_to_frame(records: list[dict[str, object]]) -> pd.DataFrame:
     return pd.DataFrame.from_records(rows)
 
 
+def _rf_measurements_to_enu_for_covariance(
+    rf: pd.DataFrame,
+    *,
+    use_uncertainty_model: bool,
+) -> list[Any]:
+    if use_uncertainty_model:
+        return rf_measurements_to_enu_with_uncertainty(rf)
+    return rf_measurements_to_enu(rf)
+
+
+def _radar_measurements_to_enu_for_covariance(
+    radar: pd.DataFrame,
+    *,
+    use_uncertainty_model: bool,
+) -> list[Any]:
+    if use_uncertainty_model:
+        return radar_measurements_to_enu_with_uncertainty(radar, include_velocity=False)
+    return radar_measurements_to_enu(radar)
+
+
+def _covariance_label(source: str, use_uncertainty_model: bool) -> str:
+    if use_uncertainty_model:
+        return "heteroscedastic cov_* columns from uncertainty model"
+    if source == "rf":
+        return "diag(CEP^2, CEP^2), default std 75 m"
+    if source == "radar":
+        return "diag(25^2, 25^2, 35^2) m^2"
+    raise ValueError(f"unknown source {source!r}")
+
+
+def _uncertainty_model_summary(
+    path: Path | None,
+    *,
+    use_rf_uncertainty: bool,
+    use_radar_uncertainty: bool,
+) -> dict[str, Any] | None:
+    if path is None:
+        return None
+    return {
+        "path": str(path),
+        "rf": bool(use_rf_uncertainty),
+        "radar": bool(use_radar_uncertainty),
+    }
+
+
 def _baseline_metrics(
     *,
     flight_name: str,
@@ -800,6 +991,11 @@ def _baseline_metrics(
     radar_max_residual_m: float,
     rf_inflation_alpha: float,
     radar_inflation_alpha: float,
+    rf_clock_offset_s: float = DEFAULT_RF_CLOCK_OFFSET_S,
+    radar_clock_offset_s: float = DEFAULT_RADAR_CLOCK_OFFSET_S,
+    rf_covariance_label: str = "diag(CEP^2, CEP^2), default std 75 m",
+    radar_covariance_label: str = "diag(25^2, 25^2, 35^2) m^2",
+    uncertainty_model_summary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     truth_times = truth["time_s"].to_numpy(dtype=float)
     truth_positions = truth[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
@@ -829,7 +1025,8 @@ def _baseline_metrics(
     rejected_by_source = Counter(
         str(value) for value in estimate_frame.loc[~accepted_mask, "source"]
     )
-    reweighted_mask = estimate_frame["update_action"] == "inflated"
+    reweighted_actions = {"inflated", "student_t", "huberized"}
+    reweighted_mask = estimate_frame["update_action"].isin(reweighted_actions)
     reweighted_by_source = Counter(
         str(value) for value in estimate_frame.loc[reweighted_mask, "source"]
     )
@@ -852,8 +1049,13 @@ def _baseline_metrics(
         },
         "state": ["east", "north", "up", "v_east", "v_north", "v_up"],
         "acceleration_std_mps2": float(acceleration_std),
-        "rf_covariance": "diag(CEP^2, CEP^2), default std 75 m",
-        "radar_covariance": "diag(25^2, 25^2, 35^2) m^2",
+        "clock_offsets_s": {
+            "rf": float(rf_clock_offset_s),
+            "radar": float(radar_clock_offset_s),
+        },
+        "rf_covariance": rf_covariance_label,
+        "radar_covariance": radar_covariance_label,
+        "uncertainty_model": uncertainty_model_summary,
         "radar_selection": radar_association,
         "radar_association": radar_association,
         "radar_catprob_threshold": float(radar_catprob_threshold),
