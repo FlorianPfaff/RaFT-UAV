@@ -173,6 +173,24 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     baseline_parser.add_argument(
+        "--stable-segment-rf-score-weight",
+        type=float,
+        default=1.0,
+        help="RF-NIS penalty weight used when stitching stable radar segments",
+    )
+    baseline_parser.add_argument(
+        "--stable-segment-rf-time-gate-s",
+        type=float,
+        default=2.0,
+        help="maximum RF-to-segment time distance used for stable segment scoring",
+    )
+    baseline_parser.add_argument(
+        "--stable-segment-rf-nis-cap",
+        type=float,
+        default=25.0,
+        help="per-RF NIS cap used in stable segment RF-consistency scoring",
+    )
+    baseline_parser.add_argument(
         "--smoother",
         choices=SMOOTHER_MODES,
         default="none",
@@ -291,6 +309,9 @@ def main(argv: list[str] | None = None) -> int:
             args.stable_segment_interpolation_max_speed_mps,
             args.stable_segment_interpolation_std_scale,
             args.stable_segment_interpolation_gap_std_mps,
+            args.stable_segment_rf_score_weight,
+            args.stable_segment_rf_time_gate_s,
+            args.stable_segment_rf_nis_cap,
             args.smoother,
             args.smoother_lag_s,
             args.max_eval_time_delta_s,
@@ -357,6 +378,9 @@ def _run_baseline(
     stable_segment_interpolation_max_speed_mps: float,
     stable_segment_interpolation_std_scale: float,
     stable_segment_interpolation_gap_std_mps: float,
+    stable_segment_rf_score_weight: float,
+    stable_segment_rf_time_gate_s: float,
+    stable_segment_rf_nis_cap: float,
     smoother: str,
     smoother_lag_s: float,
     max_eval_time_delta_s: float,
@@ -402,6 +426,12 @@ def _run_baseline(
         raise ValueError("stable_segment_interpolation_std_scale must be positive")
     if stable_segment_interpolation_gap_std_mps < 0.0:
         raise ValueError("stable_segment_interpolation_gap_std_mps must be nonnegative")
+    if stable_segment_rf_score_weight < 0.0:
+        raise ValueError("stable_segment_rf_score_weight must be nonnegative")
+    if stable_segment_rf_time_gate_s < 0.0:
+        raise ValueError("stable_segment_rf_time_gate_s must be nonnegative")
+    if stable_segment_rf_nis_cap <= 0.0:
+        raise ValueError("stable_segment_rf_nis_cap must be positive")
     if smoother == "fixed-lag" and smoother_lag_s < 0.0:
         raise ValueError("smoother_lag_s must be nonnegative for fixed-lag smoothing")
     radar_mode = legacy_radar_selection or radar_association
@@ -495,6 +525,9 @@ def _run_baseline(
             ),
             stable_segment_interpolation_std_scale=stable_segment_interpolation_std_scale,
             stable_segment_interpolation_gap_std_mps=stable_segment_interpolation_gap_std_mps,
+            stable_segment_rf_score_weight=stable_segment_rf_score_weight,
+            stable_segment_rf_time_gate_s=stable_segment_rf_time_gate_s,
+            stable_segment_rf_nis_cap=stable_segment_rf_nis_cap,
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
@@ -593,6 +626,9 @@ def _run_baseline(
         stable_segment_interpolation_max_speed_mps=stable_segment_interpolation_max_speed_mps,
         stable_segment_interpolation_std_scale=stable_segment_interpolation_std_scale,
         stable_segment_interpolation_gap_std_mps=stable_segment_interpolation_gap_std_mps,
+        stable_segment_rf_score_weight=stable_segment_rf_score_weight,
+        stable_segment_rf_time_gate_s=stable_segment_rf_time_gate_s,
+        stable_segment_rf_nis_cap=stable_segment_rf_nis_cap,
         smoother=smoother,
         smoother_lag_s=smoother_lag_s,
         max_eval_time_delta_s=max_eval_time_delta_s,
@@ -747,6 +783,9 @@ def _baseline_metrics(
     stable_segment_interpolation_max_speed_mps: float,
     stable_segment_interpolation_std_scale: float,
     stable_segment_interpolation_gap_std_mps: float,
+    stable_segment_rf_score_weight: float,
+    stable_segment_rf_time_gate_s: float,
+    stable_segment_rf_nis_cap: float,
     smoother: str,
     smoother_lag_s: float,
     max_eval_time_delta_s: float,
@@ -854,6 +893,9 @@ def _baseline_metrics(
             else float(stable_segment_interpolation_max_speed_mps),
             "interpolation_std_scale": float(stable_segment_interpolation_std_scale),
             "interpolation_gap_std_mps": float(stable_segment_interpolation_gap_std_mps),
+            "rf_score_weight": float(stable_segment_rf_score_weight),
+            "rf_time_gate_s": float(stable_segment_rf_time_gate_s),
+            "rf_nis_cap": float(stable_segment_rf_nis_cap),
         },
         "smoother": {
             "method": smoother,

@@ -70,6 +70,9 @@ def run_async_cv_baseline_with_radar_association(
     stable_segment_interpolation_max_speed_mps: float | None = 65.0,
     stable_segment_interpolation_std_scale: float = 2.0,
     stable_segment_interpolation_gap_std_mps: float = 12.0,
+    stable_segment_rf_score_weight: float = 1.0,
+    stable_segment_rf_time_gate_s: float = 2.0,
+    stable_segment_rf_nis_cap: float = 25.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
@@ -87,6 +90,8 @@ def run_async_cv_baseline_with_radar_association(
         del stable_segment_interpolation_max_speed_mps
         del stable_segment_interpolation_std_scale
         del stable_segment_interpolation_gap_std_mps
+        del stable_segment_rf_score_weight, stable_segment_rf_time_gate_s
+        del stable_segment_rf_nis_cap
         del truth_gate_m, truth_time_gate_s
         with _track_aware_node_builder(_track_support_by_id(radar)):
             records, accepted, _replayed = (
@@ -146,6 +151,9 @@ def run_async_cv_baseline_with_radar_association(
         stable_segment_interpolation_max_speed_mps=stable_segment_interpolation_max_speed_mps,
         stable_segment_interpolation_std_scale=stable_segment_interpolation_std_scale,
         stable_segment_interpolation_gap_std_mps=stable_segment_interpolation_gap_std_mps,
+        stable_segment_rf_score_weight=stable_segment_rf_score_weight,
+        stable_segment_rf_time_gate_s=stable_segment_rf_time_gate_s,
+        stable_segment_rf_nis_cap=stable_segment_rf_nis_cap,
         truth_gate_m=truth_gate_m,
         truth_time_gate_s=truth_time_gate_s,
     )

@@ -450,6 +450,53 @@ def test_stable_segments_respects_range_gate_and_min_frames():
     assert selected.empty
 
 
+def test_stable_segments_prefers_rf_consistent_segment_chain():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": frame,
+                "track_id": 1,
+                "time_s": float(frame),
+                "east_m": float(frame),
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": float(frame),
+                "cat_prob_uav": 0.8,
+            }
+            for frame in (1, 2, 3)
+        ]
+        + [
+            {
+                "frame_index": frame,
+                "track_id": 2,
+                "time_s": float(frame),
+                "east_m": 100.0 + float(frame),
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 100.0 + float(frame),
+                "cat_prob_uav": 0.95,
+            }
+            for frame in (1, 2, 3)
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(2.0, 2.0)],
+        radar=radar,
+        association="stable-segments",
+        candidate_catprob_threshold=0.4,
+        stable_segment_min_frames=3,
+        stable_segment_rf_score_weight=1.0,
+        stable_segment_rf_time_gate_s=0.1,
+        stable_segment_rf_nis_cap=25.0,
+    )
+
+    assert [record["source"] for record in records] == ["radar", "rf", "radar", "radar"]
+    assert selected["track_id"].tolist() == [1, 1, 1]
+    assert selected["association_segment_rf_support_count"].tolist() == [1, 1, 1]
+    assert selected["association_segment_rf_mean_nis"].tolist() == [0.0, 0.0, 0.0]
+
+
 def test_stable_segments_interpolated_fills_bracketed_radar_frames():
     radar = pd.DataFrame(
         [

@@ -51,10 +51,15 @@ class _TrackSegment:
     end_position_m: np.ndarray
     frames: int
     mean_catprob: float
+    rf_support_count: int = 0
+    rf_mean_nis: float | None = None
+    rf_score_adjustment: float = 0.0
 
     @property
     def score(self) -> float:
-        return float(self.frames) * max(self.mean_catprob, 0.0)
+        return float(self.frames) * max(self.mean_catprob, 0.0) + float(
+            self.rf_score_adjustment
+        )
 
 
 def run_async_cv_baseline_with_radar_association(
@@ -95,6 +100,9 @@ def run_async_cv_baseline_with_radar_association(
     stable_segment_interpolation_max_speed_mps: float | None = 65.0,
     stable_segment_interpolation_std_scale: float = 2.0,
     stable_segment_interpolation_gap_std_mps: float = 12.0,
+    stable_segment_rf_score_weight: float = 1.0,
+    stable_segment_rf_time_gate_s: float = 2.0,
+    stable_segment_rf_nis_cap: float = 25.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
@@ -170,11 +178,18 @@ def run_async_cv_baseline_with_radar_association(
         raise ValueError("stable_segment_interpolation_std_scale must be positive")
     if stable_segment_interpolation_gap_std_mps < 0.0:
         raise ValueError("stable_segment_interpolation_gap_std_mps must be nonnegative")
+    if stable_segment_rf_score_weight < 0.0:
+        raise ValueError("stable_segment_rf_score_weight must be nonnegative")
+    if stable_segment_rf_time_gate_s < 0.0:
+        raise ValueError("stable_segment_rf_time_gate_s must be nonnegative")
+    if stable_segment_rf_nis_cap <= 0.0:
+        raise ValueError("stable_segment_rf_nis_cap must be positive")
 
+    rf_measurement_list = list(rf_measurements)
     covariance = np.diag([float(radar_xy_std_m) ** 2, float(radar_xy_std_m) ** 2, float(radar_z_std_m) ** 2])
     if association == "track-bank":
         return _run_mht_track_bank(
-            rf_measurements=list(rf_measurements),
+            rf_measurements=rf_measurement_list,
             radar=radar,
             covariance=covariance,
             acceleration_std_mps2=acceleration_std_mps2,
@@ -195,7 +210,7 @@ def run_async_cv_baseline_with_radar_association(
             prune_log_weight_delta=track_bank_prune_log_weight_delta,
         )
 
-    events = _events(list(rf_measurements), radar)
+    events = _events(rf_measurement_list, radar)
     if not events:
         return [], _empty_selected_radar(radar)
 
@@ -207,6 +222,10 @@ def run_async_cv_baseline_with_radar_association(
             catprob_threshold=candidate_catprob_threshold,
             min_segment_frames=stable_segment_min_frames,
             max_transition_speed_mps=stable_segment_max_transition_speed_mps,
+            rf_measurements=rf_measurement_list,
+            rf_score_weight=stable_segment_rf_score_weight,
+            rf_time_gate_s=stable_segment_rf_time_gate_s,
+            rf_nis_cap=stable_segment_rf_nis_cap,
         )
         if association == "stable-segments-interpolated":
             stable_anchors = _interpolate_stable_radar_segments_to_frame_times(
@@ -830,6 +849,10 @@ def _select_stable_radar_segments(
     catprob_threshold: float | None,
     min_segment_frames: int,
     max_transition_speed_mps: float,
+    rf_measurements: list[TrackingMeasurement],
+    rf_score_weight: float,
+    rf_time_gate_s: float,
+    rf_nis_cap: float,
 ) -> pd.DataFrame:
     """Select stitched high-confidence Fortem track segments for sparse updates."""
 
@@ -838,7 +861,14 @@ def _select_stable_radar_segments(
     if pool.empty or "track_id" not in pool.columns:
         return _empty_selected_radar(radar)
 
-    segments = _stable_track_segments(pool, min_segment_frames=min_segment_frames)
+    segments = _stable_track_segments(
+        pool,
+        min_segment_frames=min_segment_frames,
+        rf_measurements=rf_measurements,
+        rf_score_weight=rf_score_weight,
+        rf_time_gate_s=rf_time_gate_s,
+        rf_nis_cap=rf_nis_cap,
+    )
     if not segments:
         return _empty_selected_radar(radar)
     selected_segments = _stitch_segments(
@@ -1154,6 +1184,10 @@ def _stable_track_segments(
     radar: pd.DataFrame,
     *,
     min_segment_frames: int,
+    rf_measurements: list[TrackingMeasurement],
+    rf_score_weight: float,
+    rf_time_gate_s: float,
+    rf_nis_cap: float,
 ) -> list[_TrackSegment]:
     segments: list[_TrackSegment] = []
     for track_id, track_rows in radar.groupby("track_id", sort=True):
@@ -1184,6 +1218,28 @@ def _stable_track_segments(
             mean_catprob = float(np.nanmean(catprob))
             if not np.isfinite(mean_catprob):
                 mean_catprob = 0.0
+            (
+                rf_support_count,
+                rf_mean_nis,
+                rf_score_adjustment,
+            ) = _stable_segment_rf_consistency(
+                frame,
+                rf_measurements=rf_measurements,
+                rf_score_weight=rf_score_weight,
+                rf_time_gate_s=rf_time_gate_s,
+                rf_nis_cap=rf_nis_cap,
+            )
+            frame["association_segment_rf_support_count"] = int(rf_support_count)
+            frame["association_segment_rf_score_adjustment"] = float(rf_score_adjustment)
+            frame["association_segment_base_score"] = float(len(frame)) * max(
+                mean_catprob,
+                0.0,
+            )
+            frame["association_segment_score"] = frame["association_segment_base_score"] + float(
+                rf_score_adjustment
+            )
+            if rf_mean_nis is not None:
+                frame["association_segment_rf_mean_nis"] = float(rf_mean_nis)
             segments.append(
                 _TrackSegment(
                     frame=frame,
@@ -1194,9 +1250,74 @@ def _stable_track_segments(
                     end_position_m=positions[-1],
                     frames=int(len(frame)),
                     mean_catprob=mean_catprob,
+                    rf_support_count=rf_support_count,
+                    rf_mean_nis=rf_mean_nis,
+                    rf_score_adjustment=rf_score_adjustment,
                 )
             )
     return sorted(segments, key=lambda item: (item.start_time_s, -item.score))
+
+
+def _stable_segment_rf_consistency(
+    frame: pd.DataFrame,
+    *,
+    rf_measurements: list[TrackingMeasurement],
+    rf_score_weight: float,
+    rf_time_gate_s: float,
+    rf_nis_cap: float,
+) -> tuple[int, float | None, float]:
+    """Return RF support count, mean horizontal RF NIS, and score adjustment."""
+
+    if frame.empty or rf_score_weight <= 0.0 or rf_time_gate_s < 0.0 or not rf_measurements:
+        return 0, None, 0.0
+    times = frame["time_s"].to_numpy(dtype=float)
+    positions_xy = frame[["east_m", "north_m"]].to_numpy(dtype=float)
+    if times.size == 0 or not np.isfinite(times).any():
+        return 0, None, 0.0
+
+    nises: list[float] = []
+    for measurement in rf_measurements:
+        if measurement.vector.size < 2 or measurement.covariance.shape[0] < 2:
+            continue
+        time_s = float(measurement.time_s)
+        dt_to_segment_s = _time_distance_to_interval(
+            time_s,
+            start_s=float(times[0]),
+            end_s=float(times[-1]),
+        )
+        if dt_to_segment_s > float(rf_time_gate_s):
+            continue
+        interpolated_xy = np.array(
+            [
+                np.interp(time_s, times, positions_xy[:, 0]),
+                np.interp(time_s, times, positions_xy[:, 1]),
+            ],
+            dtype=float,
+        )
+        residual = interpolated_xy - np.asarray(measurement.vector[:2], dtype=float)
+        covariance = np.asarray(measurement.covariance[:2, :2], dtype=float)
+        if not np.isfinite(covariance).all() or not np.isfinite(residual).all():
+            continue
+        try:
+            precision = np.linalg.inv(covariance)
+        except np.linalg.LinAlgError:
+            precision = np.linalg.pinv(covariance)
+        nis = float(residual.T @ precision @ residual)
+        if np.isfinite(nis):
+            nises.append(float(min(nis, rf_nis_cap)))
+    if not nises:
+        return 0, None, 0.0
+    mean_nis = float(np.mean(nises))
+    adjustment = -float(rf_score_weight) * float(len(nises)) * mean_nis
+    return int(len(nises)), mean_nis, adjustment
+
+
+def _time_distance_to_interval(time_s: float, *, start_s: float, end_s: float) -> float:
+    if time_s < start_s:
+        return float(start_s - time_s)
+    if time_s > end_s:
+        return float(time_s - end_s)
+    return 0.0
 
 
 def _segment_gap_threshold(frame_values: np.ndarray) -> float:
@@ -1802,6 +1923,11 @@ def _empty_selected_radar(radar: pd.DataFrame) -> pd.DataFrame:
         "association_effective_candidates",
         "association_weight_max",
         "association_position_spread_trace_m2",
+        "association_segment_base_score",
+        "association_segment_score",
+        "association_segment_rf_support_count",
+        "association_segment_rf_mean_nis",
+        "association_segment_rf_score_adjustment",
         "association_interpolated",
         "association_anchor_count",
         "association_interpolation_dropped_frame_count",
