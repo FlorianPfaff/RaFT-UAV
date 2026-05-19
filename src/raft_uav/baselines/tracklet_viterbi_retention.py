@@ -159,22 +159,34 @@ def _select_tracklet_viterbi_path(
             [n.unary_cost + (config.missed_detection_cost if n.is_miss else 0.0) for n in frames[0]]
         )
     ]
+    miss_streaks = [np.array([1 if n.is_miss else 0 for n in frames[0]], dtype=int)]
     parents = [np.full(len(frames[0]), -1, dtype=int)]
     for frame_index in range(1, len(frames)):
         previous, current = frames[frame_index - 1], frames[frame_index]
         current_costs = np.empty(len(current), dtype=float)
+        current_miss_streaks = np.empty(len(current), dtype=int)
         current_parents = np.empty(len(current), dtype=int)
         for j, node in enumerate(current):
             transition = np.array(
                 [
-                    costs[-1][k] + _base._transition_cost(prev, node, config)
+                    costs[-1][k]
+                    + _base._transition_cost(
+                        prev,
+                        node,
+                        config,
+                        previous_miss_streak=int(miss_streaks[-1][k]),
+                    )
                     for k, prev in enumerate(previous)
                 ]
             )
             parent = int(np.argmin(transition))
             current_parents[j] = parent
             current_costs[j] = node.unary_cost + float(transition[parent])
+            current_miss_streaks[j] = (
+                int(miss_streaks[-1][parent]) + 1 if node.is_miss else 0
+            )
         costs.append(current_costs)
+        miss_streaks.append(current_miss_streaks)
         parents.append(current_parents)
 
     best = int(np.argmin(costs[-1]))
@@ -186,22 +198,7 @@ def _select_tracklet_viterbi_path(
         if best < 0:
             break
     path.reverse()
-
-    rows: list[pd.Series] = []
-    for node in path:
-        if node.is_miss or node.row is None:
-            continue
-        row = node.row.copy()
-        row["association_mode"] = "tracklet-viterbi"
-        row["association_action"] = "viterbi_selected"
-        row["association_nis"] = float(node.anchor_nis)
-        row["association_score"] = float(node.unary_cost)
-        row["association_anchor_nis"] = float(node.anchor_nis)
-        row["association_catprob_cost"] = float(node.catprob_cost)
-        row["association_range_cost"] = float(node.range_cost)
-        row["association_viterbi_path_cost"] = path_cost
-        rows.append(row)
-    return rows
+    return _base._selected_rows_from_viterbi_path(path, path_cost, config)
 
 
 def _nodes_for_radar_frame_with_track_retention(
@@ -268,6 +265,7 @@ def _nodes_for_radar_frame_with_track_retention(
             anchor_nis=float(anchor_nis),
             catprob_cost=float(catprob_cost),
             range_cost=float(range_cost),
+            has_anchor=bool(config.use_rf_anchor and anchor is not None),
         )
         scored.append((float(unary_cost), int(candidate_rank), node))
 

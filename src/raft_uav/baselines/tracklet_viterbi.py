@@ -40,17 +40,25 @@ class TrackletViterbiAssociationConfig:
     range_gate_m: float | None = 850.0
     range_gate_slack_m: float = 150.0
     range_penalty: float = 10.0
+    reacquisition_miss_streak_threshold: int = 2
+    reacquisition_gate_nis: float = 25.0
+    reacquisition_gate_growth: float = 0.75
+    reacquisition_reward: float = 3.0
+    reacquisition_outside_gate_penalty: float = 4.0
     use_rf_anchor: bool = True
     min_catprob: float = 1.0e-3
 
     def __post_init__(self) -> None:
         if self.max_candidates_per_frame < 1:
             raise ValueError("max_candidates_per_frame must be positive")
+        if self.reacquisition_miss_streak_threshold < 1:
+            raise ValueError("reacquisition_miss_streak_threshold must be positive")
         positive = (
             "transition_position_std_m",
             "transition_speed_std_mps",
             "velocity_std_mps",
             "max_speed_mps",
+            "reacquisition_gate_nis",
         )
         nonnegative = (
             "missed_detection_cost",
@@ -64,6 +72,9 @@ class TrackletViterbiAssociationConfig:
             "max_speed_penalty",
             "range_gate_slack_m",
             "range_penalty",
+            "reacquisition_gate_growth",
+            "reacquisition_reward",
+            "reacquisition_outside_gate_penalty",
         )
         for name in positive:
             if float(getattr(self, name)) <= 0.0:
@@ -97,6 +108,7 @@ class _ViterbiNode:
     catprob_cost: float
     range_cost: float
     is_miss: bool = False
+    has_anchor: bool = False
 
 
 def run_async_cv_baseline_with_tracklet_viterbi_association(
@@ -293,19 +305,34 @@ def _select_tracklet_viterbi_path(
         return []
 
     costs = [np.array([n.unary_cost + (config.missed_detection_cost if n.is_miss else 0.0) for n in frames[0]])]
+    miss_streaks = [np.array([1 if n.is_miss else 0 for n in frames[0]], dtype=int)]
     parents = [np.full(len(frames[0]), -1, dtype=int)]
     for frame_index in range(1, len(frames)):
         previous, current = frames[frame_index - 1], frames[frame_index]
         current_costs = np.empty(len(current), dtype=float)
+        current_miss_streaks = np.empty(len(current), dtype=int)
         current_parents = np.empty(len(current), dtype=int)
         for j, node in enumerate(current):
             transition = np.array(
-                [costs[-1][k] + _transition_cost(prev, node, config) for k, prev in enumerate(previous)]
+                [
+                    costs[-1][k]
+                    + _transition_cost(
+                        prev,
+                        node,
+                        config,
+                        previous_miss_streak=int(miss_streaks[-1][k]),
+                    )
+                    for k, prev in enumerate(previous)
+                ]
             )
             parent = int(np.argmin(transition))
             current_parents[j] = parent
             current_costs[j] = node.unary_cost + float(transition[parent])
+            current_miss_streaks[j] = (
+                int(miss_streaks[-1][parent]) + 1 if node.is_miss else 0
+            )
         costs.append(current_costs)
+        miss_streaks.append(current_miss_streaks)
         parents.append(current_parents)
 
     best = int(np.argmin(costs[-1]))
@@ -317,12 +344,29 @@ def _select_tracklet_viterbi_path(
         if best < 0:
             break
     path.reverse()
+    return _selected_rows_from_viterbi_path(path, path_cost, config)
+
+
+def _selected_rows_from_viterbi_path(
+    path: Iterable[_ViterbiNode],
+    path_cost: float,
+    config: TrackletViterbiAssociationConfig,
+) -> list[pd.Series]:
+    """Return non-miss path rows annotated with miss-streak reacquisition terms."""
 
     rows: list[pd.Series] = []
+    preceding_miss_streak = 0
     for node in path:
         if node.is_miss or node.row is None:
+            preceding_miss_streak += 1
             continue
         row = node.row.copy()
+        reacquisition_active = _reacquisition_is_active(preceding_miss_streak, node, config)
+        reacquisition_cost = _reacquisition_cost(
+            preceding_miss_streak,
+            node,
+            config,
+        )
         row["association_mode"] = "tracklet-viterbi"
         row["association_action"] = "viterbi_selected"
         row["association_nis"] = float(node.anchor_nis)
@@ -331,7 +375,16 @@ def _select_tracklet_viterbi_path(
         row["association_catprob_cost"] = float(node.catprob_cost)
         row["association_range_cost"] = float(node.range_cost)
         row["association_viterbi_path_cost"] = path_cost
+        row["association_preceding_miss_streak"] = int(preceding_miss_streak)
+        row["association_reacquisition_active"] = bool(reacquisition_active)
+        row["association_reacquisition_cost"] = float(reacquisition_cost)
+        row["association_reacquisition_gate_nis"] = (
+            float(_reacquisition_effective_gate_nis(preceding_miss_streak, config))
+            if reacquisition_active
+            else np.nan
+        )
         rows.append(row)
+        preceding_miss_streak = 0
     return rows
 
 
@@ -373,6 +426,7 @@ def _nodes_for_radar_frame(
             anchor_nis=float(anchor_nis),
             catprob_cost=float(catprob_cost),
             range_cost=float(range_cost),
+            has_anchor=bool(config.use_rf_anchor and anchor is not None),
         )
         scored.append((float(unary_cost), node))
     scored.sort(key=lambda item: item[0])
@@ -414,15 +468,21 @@ def _transition_cost(
     previous: _ViterbiNode,
     current: _ViterbiNode,
     config: TrackletViterbiAssociationConfig,
+    *,
+    previous_miss_streak: int | None = None,
 ) -> float:
     """Return dynamic-programming transition cost between two radar nodes."""
+
+    miss_streak = 1 if previous.is_miss else 0
+    if previous_miss_streak is not None:
+        miss_streak = max(0, int(previous_miss_streak))
 
     if current.is_miss:
         return float(config.missed_detection_cost) + (
             float(config.consecutive_miss_cost) if previous.is_miss else 0.0
         )
     if previous.is_miss or previous.position is None or current.position is None:
-        return 0.0
+        return _reacquisition_cost(miss_streak, current, config)
     dt_s = max(float(current.time_s) - float(previous.time_s), 1.0e-3)
     predicted = previous.position if previous.velocity is None else previous.position + previous.velocity * dt_s
     position_std = float(config.transition_position_std_m) + float(config.transition_speed_std_mps) * dt_s
@@ -440,7 +500,57 @@ def _transition_cost(
         + config.velocity_nis_weight * velocity_nis
         + speed_cost
         + _track_continuity_cost(previous.track_id, current.track_id, config)
+        + _reacquisition_cost(miss_streak, current, config)
     )
+
+
+def _reacquisition_is_active(
+    previous_miss_streak: int,
+    current: _ViterbiNode,
+    config: TrackletViterbiAssociationConfig,
+) -> bool:
+    """Return whether RF-anchor reacquisition scoring applies to ``current``."""
+
+    if current.is_miss or not current.has_anchor:
+        return False
+    return int(previous_miss_streak) >= int(config.reacquisition_miss_streak_threshold)
+
+
+def _reacquisition_effective_gate_nis(
+    previous_miss_streak: int,
+    config: TrackletViterbiAssociationConfig,
+) -> float:
+    """Return the miss-streak widened RF-anchor NIS gate."""
+
+    threshold = int(config.reacquisition_miss_streak_threshold)
+    extra_misses = max(0, int(previous_miss_streak) - threshold)
+    return float(config.reacquisition_gate_nis) * (
+        1.0 + float(config.reacquisition_gate_growth) * float(extra_misses)
+    )
+
+
+def _reacquisition_cost(
+    previous_miss_streak: int,
+    current: _ViterbiNode,
+    config: TrackletViterbiAssociationConfig,
+) -> float:
+    """Return miss-streak adaptive reacquisition cost around the RF anchor.
+
+    After a miss streak, the ordinary Viterbi objective has no previous radar
+    position to transition from.  This term uses the RF-only anchor as a search
+    tube: candidates inside a widened NIS gate receive a bounded reward, while
+    candidates outside the tube receive a smooth quadratic penalty.
+    """
+
+    if not _reacquisition_is_active(previous_miss_streak, current, config):
+        return 0.0
+    gate_nis = max(_reacquisition_effective_gate_nis(previous_miss_streak, config), 1.0e-9)
+    anchor_nis = max(0.0, float(current.anchor_nis))
+    closeness = max(0.0, 1.0 - anchor_nis / gate_nis)
+    outside = max(0.0, (anchor_nis - gate_nis) / gate_nis)
+    reward = float(config.reacquisition_reward) * closeness
+    outside_penalty = float(config.reacquisition_outside_gate_penalty) * outside**2
+    return float(outside_penalty - reward)
 
 
 def _track_continuity_cost(
