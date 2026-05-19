@@ -448,3 +448,110 @@ def test_stable_segments_respects_range_gate_and_min_frames():
 
     assert [record["source"] for record in records] == ["rf"]
     assert selected.empty
+
+
+def test_stable_segments_interpolated_fills_bracketed_radar_frames():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 1,
+                "track_id": 7,
+                "time_s": 1.0,
+                "east_m": 0.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 0.0,
+                "cat_prob_uav": 0.9,
+            },
+            {
+                "frame_index": 2,
+                "track_id": 99,
+                "time_s": 2.0,
+                "east_m": 1000.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 1000.0,
+                "cat_prob_uav": 0.1,
+            },
+            {
+                "frame_index": 3,
+                "track_id": 7,
+                "time_s": 3.0,
+                "east_m": 20.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 20.0,
+                "cat_prob_uav": 0.9,
+            },
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(0.0, 0.0)],
+        radar=radar,
+        association="stable-segments-interpolated",
+        candidate_catprob_threshold=0.4,
+        stable_segment_min_frames=1,
+        stable_segment_max_transition_speed_mps=20.0,
+        stable_segment_interpolation_max_gap_s=5.0,
+        stable_segment_interpolation_max_speed_mps=20.0,
+    )
+
+    assert [record["source"] for record in records] == ["rf", "radar", "radar", "radar"]
+    assert selected["frame_index"].tolist() == [1, 2, 3]
+    assert selected["east_m"].tolist() == [0.0, 10.0, 20.0]
+    assert selected["track_id"].tolist() == [7, 7, 7]
+    assert selected["association_interpolated"].tolist() == [False, True, False]
+    assert selected["association_mode"].unique().tolist() == ["stable-segments-interpolated"]
+
+
+def test_stable_segments_interpolated_gap_cap_keeps_anchors_only():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 1,
+                "track_id": 7,
+                "time_s": 1.0,
+                "east_m": 0.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 0.0,
+                "cat_prob_uav": 0.9,
+            },
+            {
+                "frame_index": 2,
+                "track_id": 99,
+                "time_s": 2.0,
+                "east_m": 1000.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 1000.0,
+                "cat_prob_uav": 0.1,
+            },
+            {
+                "frame_index": 3,
+                "track_id": 7,
+                "time_s": 3.0,
+                "east_m": 20.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 20.0,
+                "cat_prob_uav": 0.9,
+            },
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(0.0, 0.0)],
+        radar=radar,
+        association="stable-segments-interpolated",
+        candidate_catprob_threshold=0.4,
+        stable_segment_min_frames=1,
+        stable_segment_max_transition_speed_mps=20.0,
+        stable_segment_interpolation_max_gap_s=1.0,
+        stable_segment_interpolation_max_speed_mps=20.0,
+    )
+
+    assert [record["source"] for record in records] == ["rf", "radar", "radar"]
+    assert selected["frame_index"].tolist() == [1, 3]
+    assert selected["association_interpolation_long_gap_dropped_count"].tolist() == [1, 1]

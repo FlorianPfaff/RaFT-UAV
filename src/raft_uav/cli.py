@@ -137,6 +137,24 @@ def main(argv: list[str] | None = None) -> int:
         help="radar range gate for stable-segments; <=0 disables the range gate",
     )
     baseline_parser.add_argument(
+        "--stable-segment-interpolation-max-gap-s",
+        type=float,
+        default=5.0,
+        help=(
+            "maximum anchor-to-anchor gap for stable-segments-interpolated; "
+            "<=0 disables the gap cap"
+        ),
+    )
+    baseline_parser.add_argument(
+        "--stable-segment-interpolation-max-speed-mps",
+        type=float,
+        default=65.0,
+        help=(
+            "maximum anchor-to-anchor speed for stable-segments-interpolated; "
+            "<=0 disables the speed cap"
+        ),
+    )
+    baseline_parser.add_argument(
         "--smoother",
         choices=SMOOTHER_MODES,
         default="none",
@@ -251,6 +269,8 @@ def main(argv: list[str] | None = None) -> int:
             args.stable_segment_min_frames,
             args.stable_segment_max_transition_speed_mps,
             args.stable_segment_range_gate_m,
+            args.stable_segment_interpolation_max_gap_s,
+            args.stable_segment_interpolation_max_speed_mps,
             args.smoother,
             args.smoother_lag_s,
             args.max_eval_time_delta_s,
@@ -313,6 +333,8 @@ def _run_baseline(
     stable_segment_min_frames: int,
     stable_segment_max_transition_speed_mps: float,
     stable_segment_range_gate_m: float,
+    stable_segment_interpolation_max_gap_s: float,
+    stable_segment_interpolation_max_speed_mps: float,
     smoother: str,
     smoother_lag_s: float,
     max_eval_time_delta_s: float,
@@ -350,6 +372,10 @@ def _run_baseline(
         raise ValueError("stable_segment_max_transition_speed_mps must be positive")
     if stable_segment_range_gate_m < 0.0:
         raise ValueError("stable_segment_range_gate_m must be nonnegative")
+    if stable_segment_interpolation_max_gap_s < 0.0:
+        raise ValueError("stable_segment_interpolation_max_gap_s must be nonnegative")
+    if stable_segment_interpolation_max_speed_mps < 0.0:
+        raise ValueError("stable_segment_interpolation_max_speed_mps must be nonnegative")
     if smoother == "fixed-lag" and smoother_lag_s < 0.0:
         raise ValueError("smoother_lag_s must be nonnegative for fixed-lag smoothing")
     radar_mode = legacy_radar_selection or radar_association
@@ -430,6 +456,16 @@ def _run_baseline(
             stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
             stable_segment_range_gate_m=(
                 None if stable_segment_range_gate_m <= 0.0 else stable_segment_range_gate_m
+            ),
+            stable_segment_interpolation_max_gap_s=(
+                None
+                if stable_segment_interpolation_max_gap_s <= 0.0
+                else stable_segment_interpolation_max_gap_s
+            ),
+            stable_segment_interpolation_max_speed_mps=(
+                None
+                if stable_segment_interpolation_max_speed_mps <= 0.0
+                else stable_segment_interpolation_max_speed_mps
             ),
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
@@ -525,6 +561,8 @@ def _run_baseline(
         stable_segment_min_frames=stable_segment_min_frames,
         stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
         stable_segment_range_gate_m=stable_segment_range_gate_m,
+        stable_segment_interpolation_max_gap_s=stable_segment_interpolation_max_gap_s,
+        stable_segment_interpolation_max_speed_mps=stable_segment_interpolation_max_speed_mps,
         smoother=smoother,
         smoother_lag_s=smoother_lag_s,
         max_eval_time_delta_s=max_eval_time_delta_s,
@@ -675,6 +713,8 @@ def _baseline_metrics(
     stable_segment_min_frames: int,
     stable_segment_max_transition_speed_mps: float,
     stable_segment_range_gate_m: float,
+    stable_segment_interpolation_max_gap_s: float,
+    stable_segment_interpolation_max_speed_mps: float,
     smoother: str,
     smoother_lag_s: float,
     max_eval_time_delta_s: float,
@@ -774,6 +814,12 @@ def _baseline_metrics(
             "range_gate_m": None
             if stable_segment_range_gate_m <= 0.0
             else float(stable_segment_range_gate_m),
+            "interpolation_max_gap_s": None
+            if stable_segment_interpolation_max_gap_s <= 0.0
+            else float(stable_segment_interpolation_max_gap_s),
+            "interpolation_max_speed_mps": None
+            if stable_segment_interpolation_max_speed_mps <= 0.0
+            else float(stable_segment_interpolation_max_speed_mps),
         },
         "smoother": {
             "method": smoother,
