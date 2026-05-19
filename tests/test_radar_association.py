@@ -622,6 +622,80 @@ def test_stable_segments_respects_range_gate_and_min_frames():
     assert selected.empty
 
 
+def test_stable_segments_hybrid_uses_stable_anchor_then_prediction_fallback():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 1,
+                "track_id": 7,
+                "time_s": 1.0,
+                "east_m": 1.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 1.0,
+                "cat_prob_uav": 0.8,
+            },
+            {
+                "frame_index": 1,
+                "track_id": 99,
+                "time_s": 1.0,
+                "east_m": 100.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 100.0,
+                "cat_prob_uav": 0.99,
+            },
+            {
+                "frame_index": 2,
+                "track_id": 7,
+                "time_s": 2.0,
+                "east_m": 2.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 2.0,
+                "cat_prob_uav": 0.8,
+            },
+            {
+                "frame_index": 3,
+                "track_id": 88,
+                "time_s": 3.0,
+                "east_m": 3.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 3.0,
+                "cat_prob_uav": 0.8,
+            },
+            {
+                "frame_index": 3,
+                "track_id": 89,
+                "time_s": 3.0,
+                "east_m": 100.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "range_m": 100.0,
+                "cat_prob_uav": 0.95,
+            },
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(0.0, 0.0)],
+        radar=radar,
+        association="stable-segments-hybrid",
+        candidate_catprob_threshold=0.4,
+        stable_segment_min_frames=2,
+        stable_segment_max_transition_speed_mps=65.0,
+    )
+
+    assert [record["source"] for record in records] == ["rf", "radar", "radar", "radar"]
+    assert selected["track_id"].tolist() == [7, 7, 88]
+    assert selected["association_action"].tolist() == [
+        "stable_segment_hybrid_update",
+        "stable_segment_hybrid_update",
+        "stable_segment_hybrid_prediction_nis",
+    ]
+
+
 def test_stable_segments_prefers_rf_consistent_segment_chain():
     radar = pd.DataFrame(
         [

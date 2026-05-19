@@ -95,6 +95,14 @@ METHODS: dict[str, MethodSpec] = {
         fixed_lag=True,
         robust=True,
     ),
+    "cv_stable_segments_hybrid_fixed_lag": MethodSpec(
+        "cv_stable_segments_hybrid_fixed_lag",
+        "baseline",
+        "CV stable radar segments hybrid fixed-lag",
+        association="stable-segments-hybrid",
+        fixed_lag=True,
+        robust=True,
+    ),
     "cv_stable_segments_interpolated_fixed_lag": MethodSpec(
         "cv_stable_segments_interpolated_fixed_lag",
         "baseline",
@@ -131,6 +139,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cv_rf_gated_nis_fixed_lag",
             "cv_track_bank_fixed_lag",
             "cv_stable_segments_fixed_lag",
+            "cv_stable_segments_hybrid_fixed_lag",
             "cv_stable_segments_interpolated_fixed_lag",
             "imm_catprob",
             "hetero_cv_fixed_lag",

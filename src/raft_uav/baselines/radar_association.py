@@ -35,11 +35,16 @@ RADAR_ASSOCIATION_MODES = (
     "pda-mixture",
     "track-bank",
     "stable-segments",
+    "stable-segments-hybrid",
     "stable-segments-interpolated",
 )
 _STABLE_SEGMENT_ASSOCIATION_MODES = {
     "stable-segments",
     "stable-segments-interpolated",
+}
+_STABLE_SEGMENT_PRECOMPUTE_MODES = {
+    *_STABLE_SEGMENT_ASSOCIATION_MODES,
+    "stable-segments-hybrid",
 }
 
 
@@ -130,9 +135,10 @@ def run_async_cv_baseline_with_radar_association(
     ``track-bank`` uses PyRecEst's track-oriented MHT to keep multiple
     single-target association hypotheses alive across radar frames.
     ``stable-segments`` preselects stitched high-confidence Fortem track
-    segments and skips all other radar frames. ``stable-segments-interpolated``
-    uses the same anchors, then fills only radar frame times bracketed by
-    plausible stable anchors.
+    segments and skips all other radar frames. ``stable-segments-hybrid``
+    uses those anchors when available and falls back to prediction-NIS
+    otherwise. ``stable-segments-interpolated`` uses the same anchors, then
+    fills only radar frame times bracketed by plausible stable anchors.
     """
 
     if association not in RADAR_ASSOCIATION_MODES:
@@ -233,7 +239,7 @@ def run_async_cv_baseline_with_radar_association(
         return [], _empty_selected_radar(radar)
 
     stable_anchor_by_key: dict[object, pd.Series] | None = None
-    if association in _STABLE_SEGMENT_ASSOCIATION_MODES:
+    if association in _STABLE_SEGMENT_PRECOMPUTE_MODES:
         stable_anchors = _select_stable_radar_segments(
             radar,
             range_gate_m=stable_segment_range_gate_m,
@@ -1532,9 +1538,22 @@ def _select_radar_candidate(
     candidates = _catprob_candidate_pool(candidates, candidate_catprob_threshold)
     if candidates.empty:
         return None
+    if association == "stable-segments-hybrid" and stable_anchor_by_key is not None:
+        selected = stable_anchor_by_key.get(_radar_event_key({"candidates": candidates}))
+        if selected is not None:
+            selected = selected.copy()
+            selected["association_mode"] = association
+            selected["association_action"] = "stable_segment_hybrid_update"
+            selected["association_candidate_rows"] = int(len(candidates))
+            return selected
     scored = _nis_scored_candidates(candidates, tracker, covariance)
     if scored.empty:
         return None
+    if association == "stable-segments-hybrid":
+        best = scored.loc[scored["association_nis"].idxmin()].copy()
+        best["association_mode"] = association
+        best["association_action"] = "stable_segment_hybrid_prediction_nis"
+        return best
     if association == "geometry-score":
         geometry_scored = _geometry_scored_candidates(
             scored,

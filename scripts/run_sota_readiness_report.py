@@ -50,6 +50,7 @@ DEFAULT_METHODS = [
     "pda-mixture",
     "track-bank",
     "stable-segments",
+    "stable-segments-hybrid",
     "stable-segments-interpolated",
     "tracklet-viterbi",
 ]
