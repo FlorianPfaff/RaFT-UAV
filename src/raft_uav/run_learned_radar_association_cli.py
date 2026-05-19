@@ -279,6 +279,7 @@ def main(argv: list[str] | None = None) -> int:
         rf_anchor_weight=0.35,
         rf_anchor_time_gate_s=2.0,
         rf_anchor_nis_cap=25.0,
+        rf_anchor_gate_nis=25.0,
         pda_nis_temperature=1.0,
         pda_catprob_exponent=1.0,
         track_bank_max_hypotheses=args.beam_max_hypotheses,

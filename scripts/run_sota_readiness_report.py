@@ -44,6 +44,7 @@ DEFAULT_METHODS = [
     "catprob",
     "prediction-nis",
     "rf-anchored-nis",
+    "rf-gated-nis",
     "track-continuity",
     "geometry-score",
     "pda-mixture",
@@ -79,6 +80,7 @@ REPORT_COLUMNS = [
     "track_switch_count",
     "selected_cat_prob_mean",
     "association_anchor_nis_p95",
+    "association_anchor_gate_rejected_count",
     "association_score_p95",
     "rejected_measurements",
     "reweighted_measurements",
@@ -116,6 +118,7 @@ PAPER_LEADERBOARD_COLUMNS = [
     "track_switch_count",
     "selected_cat_prob_mean",
     "association_anchor_nis_p95",
+    "association_anchor_gate_rejected_count",
     "association_score_p95",
     "rejected_measurements",
     "reweighted_measurements",
@@ -357,6 +360,7 @@ def base_row(*, method: str, flight: str, row_type: str) -> dict[str, object]:
         "track_switch_count": "",
         "selected_cat_prob_mean": "",
         "association_anchor_nis_p95": "",
+        "association_anchor_gate_rejected_count": "",
         "association_score_p95": "",
         "rejected_measurements": "",
         "reweighted_measurements": "",
@@ -395,6 +399,7 @@ def selected_radar_diagnostics(
             "track_switch_count": 0,
             "selected_cat_prob_mean": "",
             "association_anchor_nis_p95": "",
+            "association_anchor_gate_rejected_count": 0,
             "association_score_p95": "",
         }
     track_switches = 0
@@ -408,6 +413,10 @@ def selected_radar_diagnostics(
         "track_switch_count": track_switches,
         "selected_cat_prob_mean": mean_column(selected, "cat_prob_uav"),
         "association_anchor_nis_p95": percentile_column(selected, "association_anchor_nis", 95),
+        "association_anchor_gate_rejected_count": sum_column(
+            selected,
+            "association_anchor_gate_rejected_count",
+        ),
         "association_score_p95": percentile_column(selected, "association_score", 95),
     }
 
@@ -645,6 +654,13 @@ def percentile_column(frame: pd.DataFrame, column: str, percentile: float) -> ob
         return ""
     values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy(dtype=float)
     return rounded(float(np.percentile(values, percentile))) if values.size else ""
+
+
+def sum_column(frame: pd.DataFrame, column: str) -> object:
+    if column not in frame.columns:
+        return ""
+    values = pd.to_numeric(frame[column], errors="coerce").dropna().to_numpy(dtype=float)
+    return int(np.sum(values)) if values.size else ""
 
 
 def rounded(value: object) -> object:

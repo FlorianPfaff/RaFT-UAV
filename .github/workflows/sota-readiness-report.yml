@@ -23,7 +23,7 @@ name: SOTA readiness report
         description: "Space-separated tracking methods passed to the report."
         required: false
         type: string
-        default: "catprob prediction-nis rf-anchored-nis track-continuity geometry-score pda-mixture track-bank stable-segments stable-segments-interpolated tracklet-viterbi"
+        default: "catprob prediction-nis rf-anchored-nis rf-gated-nis track-continuity geometry-score pda-mixture track-bank stable-segments stable-segments-interpolated tracklet-viterbi"
       include_lofo:
         description: "Include LOFO time-offset rows if the LOFO summary CSV exists."
         required: false

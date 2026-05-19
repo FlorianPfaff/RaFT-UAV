@@ -29,6 +29,7 @@ RADAR_ASSOCIATION_MODES = (
     "oracle-nearest-truth",
     "prediction-nis",
     "rf-anchored-nis",
+    "rf-gated-nis",
     "track-continuity",
     "geometry-score",
     "pda-mixture",
@@ -88,6 +89,7 @@ def run_async_cv_baseline_with_radar_association(
     rf_anchor_weight: float = 0.35,
     rf_anchor_time_gate_s: float = 2.0,
     rf_anchor_nis_cap: float = 25.0,
+    rf_anchor_gate_nis: float = 25.0,
     pda_nis_temperature: float = 1.0,
     pda_catprob_exponent: float = 1.0,
     track_bank_max_hypotheses: int = 16,
@@ -117,6 +119,8 @@ def run_async_cv_baseline_with_radar_association(
     normalized innovation squared against the current predicted state.
     ``rf-anchored-nis`` adds a capped RF-position penalty from the most recent
     nearby RF update, which helps recover when the prediction has drifted.
+    ``rf-gated-nis`` uses the same RF anchor but drops radar frames whose
+    candidates are all inconsistent with the recent RF position.
     ``track-continuity`` prefers the current Fortem track ID and switches only
     when another candidate has a substantially lower NIS. ``geometry-score``
     is an online score that augments NIS with radar velocity consistency,
@@ -145,6 +149,8 @@ def run_async_cv_baseline_with_radar_association(
         raise ValueError("rf_anchor_time_gate_s must be nonnegative")
     if rf_anchor_nis_cap <= 0.0:
         raise ValueError("rf_anchor_nis_cap must be positive")
+    if rf_anchor_gate_nis <= 0.0:
+        raise ValueError("rf_anchor_gate_nis must be positive")
     for name, value in {
         "geometry_velocity_weight": geometry_velocity_weight,
         "geometry_switch_penalty": geometry_switch_penalty,
@@ -337,6 +343,7 @@ def run_async_cv_baseline_with_radar_association(
             rf_anchor_weight=rf_anchor_weight,
             rf_anchor_time_gate_s=rf_anchor_time_gate_s,
             rf_anchor_nis_cap=rf_anchor_nis_cap,
+            rf_anchor_gate_nis=rf_anchor_gate_nis,
             pda_nis_temperature=pda_nis_temperature,
             pda_catprob_exponent=pda_catprob_exponent,
             stable_anchor_by_key=stable_anchor_by_key,
@@ -1491,6 +1498,7 @@ def _select_radar_candidate(
     rf_anchor_weight: float = 0.35,
     rf_anchor_time_gate_s: float = 2.0,
     rf_anchor_nis_cap: float = 25.0,
+    rf_anchor_gate_nis: float = 25.0,
     pda_nis_temperature: float,
     pda_catprob_exponent: float,
     stable_anchor_by_key: dict[object, pd.Series] | None = None,
@@ -1550,6 +1558,20 @@ def _select_radar_candidate(
         )
         best = rf_scored.loc[rf_scored["association_score"].idxmin()].copy()
         best["association_action"] = "rf_anchored_nis"
+        return best
+    if association == "rf-gated-nis":
+        rf_scored = _rf_anchor_scored_candidates(
+            scored,
+            rf_measurements=rf_measurements,
+            anchor_weight=rf_anchor_weight,
+            time_gate_s=rf_anchor_time_gate_s,
+            nis_cap=rf_anchor_nis_cap,
+        )
+        gated = _rf_anchor_gate_candidates(rf_scored, gate_nis=rf_anchor_gate_nis)
+        if gated.empty:
+            return None
+        best = gated.loc[gated["association_score"].idxmin()].copy()
+        best["association_action"] = "rf_gated_nis"
         return best
     if association == "pda-mixture":
         return _pda_mixture_candidate(
@@ -1733,6 +1755,27 @@ def _rf_anchor_scored_candidates(
     scored["association_anchor_nis_cap"] = float(nis_cap)
     scored["association_score"] = scored["association_score"].to_numpy(dtype=float) + penalty
     return scored
+
+
+def _rf_anchor_gate_candidates(candidates: pd.DataFrame, *, gate_nis: float) -> pd.DataFrame:
+    """Keep candidates consistent with the latest RF anchor when one is available."""
+
+    gated = candidates.copy()
+    gated["association_anchor_gate_nis"] = float(gate_nis)
+    if "association_anchor_nis" not in gated.columns:
+        gated["association_anchor_gate_rejected_count"] = 0
+        gated["association_anchor_gate_candidate_count"] = int(len(gated))
+        return gated
+
+    anchor_nis = pd.to_numeric(gated["association_anchor_nis"], errors="coerce")
+    keep = anchor_nis <= float(gate_nis)
+    rejected_count = int((~keep).sum())
+    kept = gated.loc[keep].copy()
+    if kept.empty:
+        return kept
+    kept["association_anchor_gate_rejected_count"] = rejected_count
+    kept["association_anchor_gate_candidate_count"] = int(len(gated))
+    return kept
 
 
 def _latest_rf_anchor(
@@ -2024,6 +2067,9 @@ def _empty_selected_radar(radar: pd.DataFrame) -> pd.DataFrame:
         "association_anchor_time_delta_s",
         "association_anchor_weight",
         "association_anchor_nis_cap",
+        "association_anchor_gate_nis",
+        "association_anchor_gate_rejected_count",
+        "association_anchor_gate_candidate_count",
         "association_effective_candidates",
         "association_weight_max",
         "association_position_spread_trace_m2",

@@ -95,6 +95,7 @@ def run_async_cv_baseline_with_radar_association(
     rf_anchor_weight: float = 0.35,
     rf_anchor_time_gate_s: float = 2.0,
     rf_anchor_nis_cap: float = 25.0,
+    rf_anchor_gate_nis: float = 25.0,
     pda_nis_temperature: float = 1.0,
     pda_catprob_exponent: float = 1.0,
     track_bank_max_hypotheses: int = 16,
@@ -123,6 +124,7 @@ def run_async_cv_baseline_with_radar_association(
         del truth, track_switch_nis_ratio, geometry_velocity_std_mps
         del geometry_velocity_weight, geometry_switch_penalty, geometry_catprob_weight
         del rf_anchor_weight, rf_anchor_time_gate_s, rf_anchor_nis_cap
+        del rf_anchor_gate_nis
         del pda_nis_temperature, pda_catprob_exponent, track_bank_max_hypotheses
         del track_bank_max_assignments, track_bank_max_candidates, track_bank_gate_probability
         del track_bank_detection_probability, track_bank_clutter_intensity
@@ -178,6 +180,7 @@ def run_async_cv_baseline_with_radar_association(
         rf_anchor_weight=rf_anchor_weight,
         rf_anchor_time_gate_s=rf_anchor_time_gate_s,
         rf_anchor_nis_cap=rf_anchor_nis_cap,
+        rf_anchor_gate_nis=rf_anchor_gate_nis,
         pda_nis_temperature=pda_nis_temperature,
         pda_catprob_exponent=pda_catprob_exponent,
         track_bank_max_hypotheses=track_bank_max_hypotheses,
