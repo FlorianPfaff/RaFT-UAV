@@ -94,6 +94,7 @@ def run_async_cv_baseline_with_radar_association(
     stable_segment_interpolation_max_gap_s: float | None = 5.0,
     stable_segment_interpolation_max_speed_mps: float | None = 65.0,
     stable_segment_interpolation_std_scale: float = 2.0,
+    stable_segment_interpolation_gap_std_mps: float = 12.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
@@ -167,6 +168,8 @@ def run_async_cv_baseline_with_radar_association(
         raise ValueError("stable_segment_interpolation_max_speed_mps must be positive or None")
     if stable_segment_interpolation_std_scale <= 0.0:
         raise ValueError("stable_segment_interpolation_std_scale must be positive")
+    if stable_segment_interpolation_gap_std_mps < 0.0:
+        raise ValueError("stable_segment_interpolation_gap_std_mps must be nonnegative")
 
     covariance = np.diag([float(radar_xy_std_m) ** 2, float(radar_xy_std_m) ** 2, float(radar_z_std_m) ** 2])
     if association == "track-bank":
@@ -214,6 +217,7 @@ def run_async_cv_baseline_with_radar_association(
                 max_gap_s=stable_segment_interpolation_max_gap_s,
                 max_speed_mps=stable_segment_interpolation_max_speed_mps,
                 interpolated_std_scale=stable_segment_interpolation_std_scale,
+                gap_std_mps=stable_segment_interpolation_gap_std_mps,
             )
         stable_anchor_by_key = {
             _radar_row_key(row): row for _, row in stable_anchors.iterrows()
@@ -865,6 +869,7 @@ def _interpolate_stable_radar_segments_to_frame_times(
     max_gap_s: float | None,
     max_speed_mps: float | None,
     interpolated_std_scale: float,
+    gap_std_mps: float,
 ) -> pd.DataFrame:
     """Interpolate clean stable-segment anchors onto radar frame timestamps."""
 
@@ -929,11 +934,6 @@ def _interpolate_stable_radar_segments_to_frame_times(
         metadata["association_interpolation_max_gap_s"] = float(max_gap_s)
     if max_speed_mps is not None:
         metadata["association_interpolation_max_speed_mps"] = float(max_speed_mps)
-    interpolated_covariance = _scaled_covariance_columns(
-        base_covariance,
-        std_scale=interpolated_std_scale,
-    )
-
     interpolated_rows: list[pd.Series] = []
     modal_track_id = _modal_track_id(ordered_anchors)
     for _, frame_row in kept_frames.iterrows():
@@ -946,9 +946,24 @@ def _interpolate_stable_radar_segments_to_frame_times(
                 anchor_positions=anchor_positions,
                 modal_track_id=modal_track_id,
             )
+            interpolation_context = _interpolation_context(time_s=float(row["time_s"]), anchor_times=anchor_times)
+            interpolated_covariance = _interpolated_covariance_columns(
+                base_covariance,
+                std_scale=interpolated_std_scale,
+                nearest_anchor_dt_s=interpolation_context["nearest_anchor_dt_s"],
+                gap_std_mps=gap_std_mps,
+            )
             row["association_interpolated"] = True
             row["association_action"] = "stable_segment_interpolated_anchor"
             row["association_interpolation_std_scale"] = float(interpolated_std_scale)
+            row["association_interpolation_gap_std_mps"] = float(gap_std_mps)
+            row["association_interpolation_gap_s"] = interpolation_context["gap_s"]
+            row["association_interpolation_nearest_anchor_dt_s"] = interpolation_context[
+                "nearest_anchor_dt_s"
+            ]
+            row["association_interpolation_gap_fraction"] = interpolation_context[
+                "gap_fraction"
+            ]
             for name, value in interpolated_covariance.items():
                 row[name] = value
         else:
@@ -1003,12 +1018,53 @@ def _interpolated_radar_row(
     return row
 
 
-def _scaled_covariance_columns(
+def _interpolation_context(
+    *,
+    time_s: float,
+    anchor_times: np.ndarray,
+) -> dict[str, float]:
+    if anchor_times.size <= 1:
+        return {
+            "gap_s": 0.0,
+            "nearest_anchor_dt_s": 0.0,
+            "gap_fraction": 0.0,
+        }
+    insertion = int(np.searchsorted(anchor_times, float(time_s), side="left"))
+    if insertion < anchor_times.size and np.isclose(anchor_times[insertion], time_s):
+        return {
+            "gap_s": 0.0,
+            "nearest_anchor_dt_s": 0.0,
+            "gap_fraction": 0.0,
+        }
+    right = int(np.clip(insertion, 1, anchor_times.size - 1))
+    left = right - 1
+    gap_s = float(anchor_times[right] - anchor_times[left])
+    nearest_dt_s = min(
+        abs(float(time_s) - float(anchor_times[left])),
+        abs(float(anchor_times[right]) - float(time_s)),
+    )
+    if gap_s <= 0.0:
+        fraction = 0.0
+    else:
+        fraction = float(nearest_dt_s / (0.5 * gap_s))
+    return {
+        "gap_s": gap_s,
+        "nearest_anchor_dt_s": float(nearest_dt_s),
+        "gap_fraction": float(np.clip(fraction, 0.0, 1.0)),
+    }
+
+
+def _interpolated_covariance_columns(
     covariance: np.ndarray,
     *,
     std_scale: float,
+    nearest_anchor_dt_s: float,
+    gap_std_mps: float,
 ) -> dict[str, float]:
     scaled = np.asarray(covariance, dtype=float).reshape(3, 3) * float(std_scale) ** 2
+    if gap_std_mps > 0.0 and nearest_anchor_dt_s > 0.0:
+        extra_variance = (float(gap_std_mps) * float(nearest_anchor_dt_s)) ** 2
+        scaled = scaled + np.eye(3) * extra_variance
     return {
         "association_cov_ee": float(scaled[0, 0]),
         "association_cov_nn": float(scaled[1, 1]),
@@ -1750,6 +1806,10 @@ def _empty_selected_radar(radar: pd.DataFrame) -> pd.DataFrame:
         "association_anchor_count",
         "association_interpolation_dropped_frame_count",
         "association_interpolation_std_scale",
+        "association_interpolation_gap_std_mps",
+        "association_interpolation_gap_s",
+        "association_interpolation_nearest_anchor_dt_s",
+        "association_interpolation_gap_fraction",
         "association_cov_ee",
         "association_cov_nn",
         "association_cov_uu",

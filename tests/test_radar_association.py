@@ -496,6 +496,7 @@ def test_stable_segments_interpolated_fills_bracketed_radar_frames():
         stable_segment_interpolation_max_gap_s=5.0,
         stable_segment_interpolation_max_speed_mps=20.0,
         stable_segment_interpolation_std_scale=3.0,
+        stable_segment_interpolation_gap_std_mps=10.0,
     )
 
     assert [record["source"] for record in records] == ["rf", "radar", "radar", "radar"]
@@ -505,8 +506,12 @@ def test_stable_segments_interpolated_fills_bracketed_radar_frames():
     assert selected["association_interpolated"].tolist() == [False, True, False]
     assert selected["association_mode"].unique().tolist() == ["stable-segments-interpolated"]
     assert selected.loc[1, "association_interpolation_std_scale"] == 3.0
-    assert selected.loc[1, "association_cov_ee"] == 25.0**2 * 3.0**2
-    assert selected.loc[1, "association_cov_uu"] == 35.0**2 * 3.0**2
+    assert selected.loc[1, "association_interpolation_gap_std_mps"] == 10.0
+    assert selected.loc[1, "association_interpolation_gap_s"] == 2.0
+    assert selected.loc[1, "association_interpolation_nearest_anchor_dt_s"] == 1.0
+    assert selected.loc[1, "association_interpolation_gap_fraction"] == 1.0
+    assert selected.loc[1, "association_cov_ee"] == 25.0**2 * 3.0**2 + 10.0**2
+    assert selected.loc[1, "association_cov_uu"] == 35.0**2 * 3.0**2 + 10.0**2
 
 
 def test_stable_segments_interpolated_gap_cap_keeps_anchors_only():
