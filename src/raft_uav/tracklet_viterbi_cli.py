@@ -24,6 +24,7 @@ import sys
 import pandas as pd
 
 from raft_uav import cli as _base_cli
+from raft_uav import robust_cli as _robust_cli
 from raft_uav.baselines import tracklet_viterbi as _base_tracklet_viterbi
 from raft_uav.baselines import tracklet_viterbi_fixed_lag as _fixed_lag_tracklet_viterbi
 from raft_uav.baselines import tracklet_viterbi_imm as _imm_tracklet_viterbi
@@ -383,7 +384,8 @@ def main(argv: list[str] | None = None) -> int:
         run_async_cv_baseline_with_radar_association
     )
     with _temporary_environment(env_updates):
-        return _base_cli.main(filtered_argv)
+        with _robust_cli.expose_heavy_tailed_robust_update_modes():
+            return _base_cli.main(filtered_argv)
 
 
 if __name__ == "__main__":
