@@ -108,6 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         default=0.0,
         help="maximum anchor-to-anchor gap for interpolated radar rows; <=0 disables the gap cap",
     )
+    parser.add_argument(
+        "--radar-interpolation-max-speed-mps",
+        type=float,
+        default=0.0,
+        help="maximum anchor-to-anchor speed for interpolated radar rows; <=0 disables the speed cap",
+    )
     parser.add_argument("--stable-segment-min-frames", type=int, default=100)
     parser.add_argument("--stable-segment-max-transition-speed-mps", type=float, default=65.0)
     parser.add_argument(
@@ -139,6 +145,11 @@ def main(argv: list[str] | None = None) -> int:
         radar_interpolation_max_gap_s=(
             None if args.radar_interpolation_max_gap_s <= 0.0 else args.radar_interpolation_max_gap_s
         ),
+        radar_interpolation_max_speed_mps=(
+            None
+            if args.radar_interpolation_max_speed_mps <= 0.0
+            else args.radar_interpolation_max_speed_mps
+        ),
         stable_segment_min_frames=args.stable_segment_min_frames,
         stable_segment_max_transition_speed_mps=args.stable_segment_max_transition_speed_mps,
         radar_selections=tuple(args.radar_selection or RADAR_SELECTIONS),
@@ -165,6 +176,7 @@ def run_paper_table_diagnostic(
     radar_catprob_threshold: float = 0.4,
     radar_range_gate_m: float | None = 800.0,
     radar_interpolation_max_gap_s: float | None = None,
+    radar_interpolation_max_speed_mps: float | None = None,
     stable_segment_min_frames: int = 100,
     stable_segment_max_transition_speed_mps: float = 65.0,
     radar_selections: tuple[str, ...] = RADAR_SELECTIONS,
@@ -184,6 +196,11 @@ def run_paper_table_diagnostic(
         raise ValueError("stable_segment_max_transition_speed_mps must be positive")
     if radar_interpolation_max_gap_s is not None and radar_interpolation_max_gap_s <= 0.0:
         raise ValueError("radar_interpolation_max_gap_s must be positive or None")
+    if (
+        radar_interpolation_max_speed_mps is not None
+        and radar_interpolation_max_speed_mps <= 0.0
+    ):
+        raise ValueError("radar_interpolation_max_speed_mps must be positive or None")
     radar_selections = _normalize_radar_selections(radar_selections)
 
     flight = select_flight(Path(dataset_root), flight_name)
@@ -233,6 +250,7 @@ def run_paper_table_diagnostic(
                 catprob_threshold=radar_catprob_threshold,
                 range_gate_m=radar_range_gate_m if selection in RANGE_GATED_RADAR_SELECTIONS else None,
                 radar_interpolation_max_gap_s=radar_interpolation_max_gap_s,
+                radar_interpolation_max_speed_mps=radar_interpolation_max_speed_mps,
                 stable_segment_min_frames=stable_segment_min_frames,
                 stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
                 max_time_delta_s=truth_time_gate_s,
@@ -287,6 +305,9 @@ def run_paper_table_diagnostic(
         "radar_interpolation_max_gap_s": None
         if radar_interpolation_max_gap_s is None
         else float(radar_interpolation_max_gap_s),
+        "radar_interpolation_max_speed_mps": None
+        if radar_interpolation_max_speed_mps is None
+        else float(radar_interpolation_max_speed_mps),
         "stable_segment_min_frames": int(stable_segment_min_frames),
         "stable_segment_max_transition_speed_mps": float(stable_segment_max_transition_speed_mps),
         "radar_selections": list(radar_selections),
@@ -409,6 +430,7 @@ def select_radar_for_table(
     catprob_threshold: float,
     range_gate_m: float | None = None,
     radar_interpolation_max_gap_s: float | None = None,
+    radar_interpolation_max_speed_mps: float | None = None,
     stable_segment_min_frames: int = 100,
     stable_segment_max_transition_speed_mps: float = 65.0,
     max_time_delta_s: float,
@@ -423,6 +445,7 @@ def select_radar_for_table(
             catprob_threshold=catprob_threshold,
             range_gate_m=range_gate_m,
             radar_interpolation_max_gap_s=radar_interpolation_max_gap_s,
+            radar_interpolation_max_speed_mps=radar_interpolation_max_speed_mps,
             stable_segment_min_frames=stable_segment_min_frames,
             stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
             max_time_delta_s=max_time_delta_s,
@@ -432,6 +455,7 @@ def select_radar_for_table(
             anchors,
             association_mode="radar-longest-track-range-gated-interpolated",
             max_gap_s=radar_interpolation_max_gap_s,
+            max_speed_mps=radar_interpolation_max_speed_mps,
         )
     if selection == "radar-stable-segments-range-gated-interpolated":
         anchors = select_radar_for_table(
@@ -441,6 +465,7 @@ def select_radar_for_table(
             catprob_threshold=catprob_threshold,
             range_gate_m=range_gate_m,
             radar_interpolation_max_gap_s=radar_interpolation_max_gap_s,
+            radar_interpolation_max_speed_mps=radar_interpolation_max_speed_mps,
             stable_segment_min_frames=stable_segment_min_frames,
             stable_segment_max_transition_speed_mps=stable_segment_max_transition_speed_mps,
             max_time_delta_s=max_time_delta_s,
@@ -450,6 +475,7 @@ def select_radar_for_table(
             anchors,
             association_mode="radar-stable-segments-range-gated-interpolated",
             max_gap_s=radar_interpolation_max_gap_s,
+            max_speed_mps=radar_interpolation_max_speed_mps,
         )
     if selection == "radar-stable-segments-range-gated":
         return select_stable_radar_segments(
@@ -972,11 +998,14 @@ def _interpolate_selected_radar_to_frame_times(
     *,
     association_mode: str,
     max_gap_s: float | None = None,
+    max_speed_mps: float | None = None,
 ) -> pd.DataFrame:
     if radar.empty or selected.empty:
         return radar.iloc[0:0].copy()
     if max_gap_s is not None and max_gap_s <= 0.0:
         raise ValueError("max_gap_s must be positive or None")
+    if max_speed_mps is not None and max_speed_mps <= 0.0:
+        raise ValueError("max_speed_mps must be positive or None")
     all_frame_times = np.array(
         [float(group["time_s"].median()) for group in radar_frame_groups(radar)],
         dtype=float,
@@ -995,6 +1024,7 @@ def _interpolate_selected_radar_to_frame_times(
     keep = (all_frame_times >= anchor_times[0]) & (all_frame_times <= anchor_times[-1])
     outside_anchor_dropped_count = int(np.count_nonzero(~keep))
     long_gap_dropped_count = 0
+    high_speed_dropped_count = 0
     if max_gap_s is not None:
         gap_keep = _within_interpolation_gap(
             all_frame_times,
@@ -1003,11 +1033,25 @@ def _interpolate_selected_radar_to_frame_times(
         )
         long_gap_dropped_count = int(np.count_nonzero(keep & ~gap_keep))
         keep &= gap_keep
+    anchor_positions = anchors[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
+    anchor_speeds_mps = _anchor_speeds_mps(anchor_times, anchor_positions)
+    if max_speed_mps is not None:
+        speed_keep = _within_interpolation_speed(
+            all_frame_times,
+            anchor_times,
+            anchor_positions,
+            max_speed_mps=float(max_speed_mps),
+        )
+        high_speed_dropped_count = int(np.count_nonzero(keep & ~speed_keep))
+        keep &= speed_keep
     frame_times = all_frame_times[keep]
     if frame_times.size == 0:
         return radar.iloc[0:0].copy()
     anchor_gaps_s = np.diff(anchor_times)
     max_anchor_gap_s = float(np.max(anchor_gaps_s)) if anchor_gaps_s.size else 0.0
+    max_anchor_speed_mps = (
+        float(np.max(anchor_speeds_mps)) if anchor_speeds_mps.size else 0.0
+    )
 
     out = pd.DataFrame({"time_s": frame_times})
     for column in ("east_m", "north_m", "up_m"):
@@ -1021,6 +1065,7 @@ def _interpolate_selected_radar_to_frame_times(
     out["association_anchor_count"] = int(anchor_times.size)
     out["association_anchor_span_s"] = float(anchor_times[-1] - anchor_times[0])
     out["association_max_anchor_gap_s"] = max_anchor_gap_s
+    out["association_max_anchor_speed_mps"] = max_anchor_speed_mps
     out["association_interpolation_candidate_frame_count"] = int(all_frame_times.size)
     out["association_interpolation_dropped_frame_count"] = int(
         all_frame_times.size - frame_times.size
@@ -1029,8 +1074,11 @@ def _interpolate_selected_radar_to_frame_times(
         outside_anchor_dropped_count
     )
     out["association_interpolation_long_gap_dropped_count"] = long_gap_dropped_count
+    out["association_interpolation_high_speed_dropped_count"] = high_speed_dropped_count
     if max_gap_s is not None:
         out["association_interpolation_max_gap_s"] = float(max_gap_s)
+    if max_speed_mps is not None:
+        out["association_interpolation_max_speed_mps"] = float(max_speed_mps)
     if "track_id" in anchors.columns:
         track_ids = pd.to_numeric(anchors["track_id"], errors="coerce").dropna()
         if not track_ids.empty:
@@ -1057,6 +1105,49 @@ def _within_interpolation_gap(
     left = right - 1
     bracket_gap_s = anchor_times[right] - anchor_times[left]
     return on_anchor | (bracket_gap_s <= max_gap_s)
+
+
+def _within_interpolation_speed(
+    frame_times: np.ndarray,
+    anchor_times: np.ndarray,
+    anchor_positions: np.ndarray,
+    *,
+    max_speed_mps: float,
+) -> np.ndarray:
+    """Return frames bracketed by anchors no faster than ``max_speed_mps``."""
+
+    if frame_times.size == 0:
+        return np.zeros(0, dtype=bool)
+    if anchor_times.size <= 1:
+        return np.isin(frame_times, anchor_times)
+    insertion = np.searchsorted(anchor_times, frame_times, side="left")
+    on_anchor = insertion < anchor_times.size
+    on_anchor &= np.isclose(anchor_times[np.minimum(insertion, anchor_times.size - 1)], frame_times)
+    right = np.clip(insertion, 1, anchor_times.size - 1)
+    left = right - 1
+    dt_s = anchor_times[right] - anchor_times[left]
+    distance_m = np.linalg.norm(anchor_positions[right] - anchor_positions[left], axis=1)
+    speeds_mps = np.divide(
+        distance_m,
+        dt_s,
+        out=np.full_like(distance_m, np.inf, dtype=float),
+        where=dt_s > 0.0,
+    )
+    return on_anchor | (speeds_mps <= max_speed_mps)
+
+
+def _anchor_speeds_mps(anchor_times: np.ndarray, anchor_positions: np.ndarray) -> np.ndarray:
+    if anchor_times.size <= 1:
+        return np.empty(0)
+    dt_s = np.diff(anchor_times)
+    distance_m = np.linalg.norm(np.diff(anchor_positions, axis=0), axis=1)
+    speeds_mps = np.divide(
+        distance_m,
+        dt_s,
+        out=np.full_like(distance_m, np.inf, dtype=float),
+        where=dt_s > 0.0,
+    )
+    return speeds_mps[np.isfinite(speeds_mps)]
 
 
 def _catprob_hard_candidate_pool(
@@ -1222,6 +1313,9 @@ def _radar_selection_diagnostics(selected: pd.DataFrame) -> dict[str, object]:
             "interpolation_outside_anchor_dropped_count"
         ),
         "association_interpolation_long_gap_dropped_count": "interpolation_long_gap_dropped_count",
+        "association_interpolation_high_speed_dropped_count": (
+            "interpolation_high_speed_dropped_count"
+        ),
         "association_segment_count": "segment_count",
     }
     for source, target in count_columns.items():
@@ -1231,7 +1325,9 @@ def _radar_selection_diagnostics(selected: pd.DataFrame) -> dict[str, object]:
     float_columns = {
         "association_anchor_span_s": "interpolation_anchor_span_s",
         "association_max_anchor_gap_s": "interpolation_max_anchor_gap_s",
+        "association_max_anchor_speed_mps": "interpolation_max_anchor_speed_mps",
         "association_interpolation_max_gap_s": "interpolation_max_gap_cap_s",
+        "association_interpolation_max_speed_mps": "interpolation_max_speed_cap_mps",
     }
     for source, target in float_columns.items():
         value = _finite_numeric_column_max(selected, source)

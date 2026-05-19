@@ -22,6 +22,7 @@ from raft_uav.diagnostics.paper_table import run_paper_table_diagnostic  # noqa:
 
 RADAR_SELECTIONS = (
     "radar-longest-track-range-gated",
+    "radar-longest-track-range-gated-interpolated",
     "radar-stable-segments-range-gated",
     "radar-stable-segments-range-gated-interpolated",
 )
@@ -32,6 +33,7 @@ SUMMARY_COLUMNS = (
     "radar_catprob_threshold",
     "radar_range_gate_m",
     "radar_interpolation_max_gap_s",
+    "radar_interpolation_max_speed_mps",
     "stable_segment_min_frames",
     "stable_segment_max_transition_speed_mps",
     "flight_count",
@@ -46,11 +48,14 @@ SUMMARY_COLUMNS = (
     "interpolation_anchor_count",
     "interpolation_anchor_span_s",
     "interpolation_max_anchor_gap_s",
+    "interpolation_max_anchor_speed_mps",
     "interpolation_max_gap_cap_s",
+    "interpolation_max_speed_cap_mps",
     "interpolation_candidate_frame_count",
     "interpolation_dropped_frame_count",
     "interpolation_outside_anchor_dropped_count",
     "interpolation_long_gap_dropped_count",
+    "interpolation_high_speed_dropped_count",
     "error_3d_mean_m",
     "error_3d_rmse_m",
     "error_3d_p95_m",
@@ -70,6 +75,7 @@ RANKING_COLUMNS = (
     "radar_catprob_threshold",
     "radar_range_gate_m",
     "radar_interpolation_max_gap_s",
+    "radar_interpolation_max_speed_mps",
     "stable_segment_min_frames",
     "stable_segment_max_transition_speed_mps",
     "coverage",
@@ -90,11 +96,14 @@ RANKING_COLUMNS = (
     "interpolation_anchor_count",
     "interpolation_anchor_span_s",
     "interpolation_max_anchor_gap_s",
+    "interpolation_max_anchor_speed_mps",
     "interpolation_max_gap_cap_s",
+    "interpolation_max_speed_cap_mps",
     "interpolation_candidate_frame_count",
     "interpolation_dropped_frame_count",
     "interpolation_outside_anchor_dropped_count",
     "interpolation_long_gap_dropped_count",
+    "interpolation_high_speed_dropped_count",
 )
 SUM_COLUMNS = (
     "candidate_count",
@@ -108,11 +117,14 @@ SUM_COLUMNS = (
     "interpolation_dropped_frame_count",
     "interpolation_outside_anchor_dropped_count",
     "interpolation_long_gap_dropped_count",
+    "interpolation_high_speed_dropped_count",
 )
 MAX_COLUMNS = (
     "interpolation_anchor_span_s",
     "interpolation_max_anchor_gap_s",
+    "interpolation_max_anchor_speed_mps",
     "interpolation_max_gap_cap_s",
+    "interpolation_max_speed_cap_mps",
 )
 MEAN_COLUMNS = (
     "error_3d_mean_m",
@@ -133,6 +145,7 @@ class StableSegmentConfig:
     radar_catprob_threshold: float
     radar_range_gate_m: float
     radar_interpolation_max_gap_s: float | None
+    radar_interpolation_max_speed_mps: float | None
     stable_segment_min_frames: int
     stable_segment_max_transition_speed_mps: float
 
@@ -151,6 +164,12 @@ def main() -> int:
         nargs="*",
         type=float,
         default=[0.0, 2.0, 5.0, 10.0],
+    )
+    parser.add_argument(
+        "--interpolation-max-speeds-mps",
+        nargs="*",
+        type=float,
+        default=[0.0, 65.0, 100.0],
     )
     parser.add_argument("--min-segment-frames", nargs="*", type=int, default=[75, 100, 150])
     parser.add_argument("--max-transition-speeds-mps", nargs="*", type=float, default=[35.0, 65.0, 100.0])
@@ -180,6 +199,9 @@ def main() -> int:
                     radar_catprob_threshold=config.radar_catprob_threshold,
                     radar_range_gate_m=config.radar_range_gate_m,
                     radar_interpolation_max_gap_s=config.radar_interpolation_max_gap_s,
+                    radar_interpolation_max_speed_mps=(
+                        config.radar_interpolation_max_speed_mps
+                    ),
                     stable_segment_min_frames=config.stable_segment_min_frames,
                     stable_segment_max_transition_speed_mps=config.stable_segment_max_transition_speed_mps,
                     radar_selections=RADAR_SELECTIONS,
@@ -220,6 +242,7 @@ def _validate_args(args: argparse.Namespace) -> None:
         "catprob_thresholds",
         "range_gates_m",
         "interpolation_max_gaps_s",
+        "interpolation_max_speeds_mps",
         "min_segment_frames",
         "max_transition_speeds_mps",
     ):
@@ -231,6 +254,8 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--range-gates-m values must be positive")
     if any(value < 0.0 for value in args.interpolation_max_gaps_s):
         raise SystemExit("--interpolation-max-gaps-s values must be nonnegative")
+    if any(value < 0.0 for value in args.interpolation_max_speeds_mps):
+        raise SystemExit("--interpolation-max-speeds-mps values must be nonnegative")
     if any(value <= 0.0 for value in args.max_transition_speeds_mps):
         raise SystemExit("--max-transition-speeds-mps values must be positive")
     if not 0.0 <= float(args.ranking_min_coverage) <= 1.0:
@@ -239,19 +264,30 @@ def _validate_args(args: argparse.Namespace) -> None:
 
 def _configs(args: argparse.Namespace) -> list[StableSegmentConfig]:
     configs: list[StableSegmentConfig] = []
-    for catprob, range_gate, max_gap, min_frames, max_speed in itertools.product(
+    for catprob, range_gate, max_gap, interp_speed, min_frames, max_speed in itertools.product(
         args.catprob_thresholds,
         args.range_gates_m,
         args.interpolation_max_gaps_s,
+        args.interpolation_max_speeds_mps,
         args.min_segment_frames,
         args.max_transition_speeds_mps,
     ):
         configs.append(
             StableSegmentConfig(
-                name=_config_name(catprob, range_gate, max_gap, min_frames, max_speed),
+                name=_config_name(
+                    catprob,
+                    range_gate,
+                    max_gap,
+                    interp_speed,
+                    min_frames,
+                    max_speed,
+                ),
                 radar_catprob_threshold=float(catprob),
                 radar_range_gate_m=float(range_gate),
                 radar_interpolation_max_gap_s=None if float(max_gap) <= 0.0 else float(max_gap),
+                radar_interpolation_max_speed_mps=(
+                    None if float(interp_speed) <= 0.0 else float(interp_speed)
+                ),
                 stable_segment_min_frames=int(min_frames),
                 stable_segment_max_transition_speed_mps=float(max_speed),
             )
@@ -263,14 +299,21 @@ def _config_name(
     catprob: float,
     range_gate_m: float,
     max_gap_s: float,
+    max_interp_speed_mps: float,
     min_frames: int,
     max_transition_speed_mps: float,
 ) -> str:
     gap_slug = "none" if float(max_gap_s) <= 0.0 else common.slug(max_gap_s, precision=1)
+    speed_slug = (
+        "none"
+        if float(max_interp_speed_mps) <= 0.0
+        else common.slug(max_interp_speed_mps, precision=0)
+    )
     return (
         f"stable_cat{common.slug(catprob, precision=2)}"
         f"_rg{common.slug(range_gate_m, precision=0)}"
         f"_gap{gap_slug}"
+        f"_is{speed_slug}"
         f"_min{int(min_frames)}"
         f"_v{common.slug(max_transition_speed_mps, precision=0)}"
     )
@@ -294,6 +337,9 @@ def _rows_from_table(
             "radar_range_gate_m": config.radar_range_gate_m,
             "radar_interpolation_max_gap_s": common.empty_if_none(
                 config.radar_interpolation_max_gap_s
+            ),
+            "radar_interpolation_max_speed_mps": common.empty_if_none(
+                config.radar_interpolation_max_speed_mps
             ),
             "stable_segment_min_frames": config.stable_segment_min_frames,
             "stable_segment_max_transition_speed_mps": config.stable_segment_max_transition_speed_mps,
@@ -319,6 +365,7 @@ def _aggregate_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
         "radar_catprob_threshold",
         "radar_range_gate_m",
         "radar_interpolation_max_gap_s",
+        "radar_interpolation_max_speed_mps",
         "stable_segment_min_frames",
         "stable_segment_max_transition_speed_mps",
     ]
