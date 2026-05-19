@@ -19,6 +19,7 @@ from raft_uav.baselines.kalman import TrackingMeasurement
 from raft_uav.baselines.tracklet_viterbi import (
     TrackletViterbiAssociationConfig,
     _build_rf_anchor_states,
+    _first_rf_bootstrap_index,
     _radar_event_key,
     _select_tracklet_viterbi_path,
     _selected_row_event_key,
@@ -71,6 +72,11 @@ def run_async_cv_baseline_with_fixed_lag_tracklet_viterbi_association_and_replay
     if not events:
         empty = _empty_selected_radar(radar)
         return [], empty, _empty_replayed_rows(empty)
+    bootstrap_index = _first_rf_bootstrap_index(events)
+    if bootstrap_index is None:
+        empty = _empty_selected_radar(radar)
+        return [], empty, _empty_replayed_rows(empty)
+    events = events[bootstrap_index:]
 
     initial = _initial_measurement(
         events[0],

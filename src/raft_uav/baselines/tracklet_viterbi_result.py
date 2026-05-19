@@ -12,6 +12,7 @@ from raft_uav.baselines.kalman import AsyncConstantVelocityKalmanTracker, Tracki
 from raft_uav.baselines.tracklet_viterbi import (
     TrackletViterbiAssociationConfig,
     _build_rf_anchor_states,
+    _first_rf_bootstrap_index,
     _nodes_for_radar_frame,
     _optional_float,
     _optional_track_id,
@@ -77,6 +78,16 @@ def run_async_cv_baseline_with_tracklet_viterbi_result(
             _empty_replayed_rows(empty),
             _empty_candidate_ledger(radar),
         )
+    bootstrap_index = _first_rf_bootstrap_index(events)
+    if bootstrap_index is None:
+        empty = _empty_selected_radar(radar)
+        return TrackletViterbiResult(
+            [],
+            empty,
+            _empty_replayed_rows(empty),
+            _empty_candidate_ledger(radar),
+        )
+    events = events[bootstrap_index:]
 
     initial = _initial_measurement(
         events[0],
