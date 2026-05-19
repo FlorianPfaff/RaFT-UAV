@@ -18,13 +18,14 @@ from __future__ import annotations
 import argparse
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
+import json
 import os
+from pathlib import Path
 import sys
 
 import pandas as pd
 
 from raft_uav import cli as _base_cli
-from raft_uav.baselines import tracklet_viterbi as _base_tracklet_viterbi
 from raft_uav.baselines import tracklet_viterbi_fixed_lag as _fixed_lag_tracklet_viterbi
 from raft_uav.baselines import (
     tracklet_viterbi_range_covariance as _range_covariance_tracklet_viterbi,
@@ -37,6 +38,10 @@ from raft_uav.baselines.radar_association import (
     run_async_cv_baseline_with_radar_association as _base_radar_association_runner,
 )
 from raft_uav.baselines.tracklet_viterbi import TrackletViterbiAssociationConfig
+from raft_uav.baselines.tracklet_viterbi_result import (
+    TrackletViterbiResult,
+    run_async_cv_baseline_with_tracklet_viterbi_result as _run_base_tracklet_viterbi_result,
+)
 
 _TRACKLET_MODE = "tracklet-viterbi"
 _TRACKLET_VARIANT_ENV = "RAFT_UAV_TRACKLET_VARIANT"
@@ -45,6 +50,10 @@ _BELOW_CATPROB_PENALTY_ENV = "RAFT_UAV_TRACKLET_BELOW_CATPROB_THRESHOLD_PENALTY"
 _TRACK_SUPPORT_WEIGHT_ENV = "RAFT_UAV_TRACKLET_SUPPORT_WEIGHT"
 _MAX_TRACK_SUPPORT_REWARD_ENV = "RAFT_UAV_TRACKLET_MAX_SUPPORT_REWARD"
 _MAX_CANDIDATES_PER_FRAME_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_FRAME"
+_PATH_BEAM_WIDTH_ENV = "RAFT_UAV_TRACKLET_PATH_BEAM_WIDTH"
+_REPLAY_NIS_WEIGHT_ENV = "RAFT_UAV_TRACKLET_REPLAY_NIS_WEIGHT"
+_REPLAY_REJECTION_COST_ENV = "RAFT_UAV_TRACKLET_REPLAY_REJECTION_COST"
+_REPLAY_ROUGHNESS_WEIGHT_ENV = "RAFT_UAV_TRACKLET_REPLAY_ROUGHNESS_WEIGHT"
 _MAX_CANDIDATE_POOL_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATE_POOL_PER_FRAME"
 _MAX_CANDIDATES_PER_TRACK_ENV = "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_TRACK_ID"
 _VITERBI_LAG_S_ENV = "RAFT_UAV_TRACKLET_VITERBI_LAG_S"
@@ -53,6 +62,7 @@ _RADAR_MEASUREMENT_MODEL_ENV = "RAFT_UAV_RADAR_MEASUREMENT_MODEL"
 _TRACKLET_VARIANTS = ("base", "retention", "range-covariance", "fixed-lag")
 _CATPROB_RETENTION_MODES = ("soft", "hard")
 _RF_ANCHOR_MODES = ("causal", "smoothed")
+_LAST_TRACKLET_VITERBI_RESULT: TrackletViterbiResult | None = None
 
 
 class _TrackletConfigOverlay:
@@ -121,10 +131,13 @@ def run_async_cv_baseline_with_radar_association(
     stable_segment_rf_nis_cap: float = 25.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
+    tracker_factory: Callable[..., object] | None = None,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
     """Dispatch to the tracklet-Viterbi runner when requested."""
 
     if association == _TRACKLET_MODE:
+        global _LAST_TRACKLET_VITERBI_RESULT
+        _LAST_TRACKLET_VITERBI_RESULT = None
         del truth, track_switch_nis_ratio, geometry_velocity_std_mps
         del geometry_velocity_weight, geometry_switch_penalty, geometry_catprob_weight
         del rf_anchor_weight, rf_anchor_time_gate_s, rf_anchor_nis_cap
@@ -158,6 +171,7 @@ def run_async_cv_baseline_with_radar_association(
             max_residual_norms_by_source=max_residual_norms_by_source,
             candidate_catprob_threshold=candidate_catprob_threshold,
             config=config,
+            tracker_factory=tracker_factory,
         )
 
     return _base_radar_association_runner(
@@ -206,15 +220,16 @@ def run_async_cv_baseline_with_radar_association(
         stable_segment_rf_nis_cap=stable_segment_rf_nis_cap,
         truth_gate_m=truth_gate_m,
         truth_time_gate_s=truth_time_gate_s,
+        tracker_factory=tracker_factory,
     )
 
 
 def _tracklet_runner_from_environment() -> Callable[
     ..., tuple[list[dict[str, object]], pd.DataFrame]
 ]:
-    variant = os.environ.get(_TRACKLET_VARIANT_ENV, "range-covariance").strip().lower()
+    variant = os.environ.get(_TRACKLET_VARIANT_ENV, "fixed-lag").strip().lower()
     if variant == "base":
-        return _base_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
+        return _run_base_tracklet_viterbi_association
     if variant == "retention":
         return _retention_tracklet_viterbi.run_async_cv_baseline_with_tracklet_viterbi_association
     if variant == "range-covariance":
@@ -226,17 +241,30 @@ def _tracklet_runner_from_environment() -> Callable[
     )
 
 
+def _run_base_tracklet_viterbi_association(
+    **kwargs: object,
+) -> tuple[list[dict[str, object]], pd.DataFrame]:
+    global _LAST_TRACKLET_VITERBI_RESULT
+
+    result = _run_base_tracklet_viterbi_result(**kwargs)
+    _LAST_TRACKLET_VITERBI_RESULT = result
+    return result.records, result.accepted_radar
+
+
 def _run_fixed_lag_tracklet_viterbi_association(
     **kwargs: object,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
-    records, accepted, _ = (
+    global _LAST_TRACKLET_VITERBI_RESULT
+
+    result = (
         _fixed_lag_tracklet_viterbi
-        .run_async_cv_baseline_with_fixed_lag_tracklet_viterbi_association_and_replay(
+        .run_async_cv_baseline_with_fixed_lag_tracklet_viterbi_result(
             lag_s=_env_float(_VITERBI_LAG_S_ENV, 20.0),
             **kwargs,
         )
     )
-    return records, accepted
+    _LAST_TRACKLET_VITERBI_RESULT = result
+    return result.records, result.accepted_radar
 
 
 def _tracklet_config_from_environment() -> _TrackletConfigOverlay:
@@ -247,6 +275,10 @@ def _tracklet_config_from_environment() -> _TrackletConfigOverlay:
             _MAX_CANDIDATES_PER_FRAME_ENV,
             int(base.max_candidates_per_frame),
         ),
+        path_beam_width=_env_int(_PATH_BEAM_WIDTH_ENV, int(base.path_beam_width)),
+        replay_nis_weight=_env_float(_REPLAY_NIS_WEIGHT_ENV, float(base.replay_nis_weight)),
+        replay_rejection_cost=_env_float(_REPLAY_REJECTION_COST_ENV, float(base.replay_rejection_cost)),
+        replay_roughness_weight=_env_float(_REPLAY_ROUGHNESS_WEIGHT_ENV, float(base.replay_roughness_weight)),
         catprob_retention_mode=_env_str(_CATPROB_MODE_ENV, "soft"),
         below_catprob_threshold_penalty=_env_float(_BELOW_CATPROB_PENALTY_ENV, 3.0),
         track_support_weight=_env_float(_TRACK_SUPPORT_WEIGHT_ENV, 0.45),
@@ -269,6 +301,10 @@ def _tracklet_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tracklet-track-support-weight", type=_nonnegative_float)
     parser.add_argument("--tracklet-max-track-support-reward", type=_nonnegative_float)
     parser.add_argument("--tracklet-max-candidates-per-frame", type=_positive_int)
+    parser.add_argument("--tracklet-path-beam-width", type=_positive_int)
+    parser.add_argument("--tracklet-replay-nis-weight", type=_nonnegative_float)
+    parser.add_argument("--tracklet-replay-rejection-cost", type=_nonnegative_float)
+    parser.add_argument("--tracklet-replay-roughness-weight", type=_nonnegative_float)
     parser.add_argument("--tracklet-max-candidate-pool-per-frame", type=_positive_int)
     parser.add_argument("--tracklet-max-candidates-per-track-id", type=_positive_int)
     parser.add_argument("--tracklet-viterbi-lag-s", type=_positive_float)
@@ -296,6 +332,10 @@ def _environment_updates_from_namespace(namespace: argparse.Namespace) -> dict[s
     _maybe_add(updates, _TRACK_SUPPORT_WEIGHT_ENV, namespace.tracklet_track_support_weight)
     _maybe_add(updates, _MAX_TRACK_SUPPORT_REWARD_ENV, namespace.tracklet_max_track_support_reward)
     _maybe_add(updates, _MAX_CANDIDATES_PER_FRAME_ENV, namespace.tracklet_max_candidates_per_frame)
+    _maybe_add(updates, _PATH_BEAM_WIDTH_ENV, namespace.tracklet_path_beam_width)
+    _maybe_add(updates, _REPLAY_NIS_WEIGHT_ENV, namespace.tracklet_replay_nis_weight)
+    _maybe_add(updates, _REPLAY_REJECTION_COST_ENV, namespace.tracklet_replay_rejection_cost)
+    _maybe_add(updates, _REPLAY_ROUGHNESS_WEIGHT_ENV, namespace.tracklet_replay_roughness_weight)
     _maybe_add(updates, _MAX_CANDIDATE_POOL_ENV, namespace.tracklet_max_candidate_pool_per_frame)
     _maybe_add(updates, _MAX_CANDIDATES_PER_TRACK_ENV, namespace.tracklet_max_candidates_per_track_id)
     _maybe_add(updates, _VITERBI_LAG_S_ENV, namespace.tracklet_viterbi_lag_s)
@@ -362,6 +402,65 @@ def _env_int(name: str, default: int) -> int:
     return int(value)
 
 
+def _run_baseline_output_dir(argv: list[str]) -> Path | None:
+    """Return the output directory for a forwarded run-baseline invocation."""
+
+    if len(argv) < 2 or argv[0] != "run-baseline":
+        return None
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("command")
+    parser.add_argument("dataset_root")
+    parser.add_argument("--flight")
+    parser.add_argument("--output-dir", type=Path, default=Path("outputs/baseline"))
+    namespace, _ = parser.parse_known_args(argv)
+    if namespace.flight is None:
+        return None
+    return namespace.output_dir / str(namespace.flight)
+
+
+def _write_last_tracklet_viterbi_artifacts(argv: list[str]) -> None:
+    """Write replay-preserving artifacts for the canonical tracklet runner."""
+
+    result = _LAST_TRACKLET_VITERBI_RESULT
+    output_dir = _run_baseline_output_dir(argv)
+    if result is None or output_dir is None:
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    accepted_radar_path = output_dir / "accepted_radar.csv"
+    viterbi_selected_radar_path = output_dir / "viterbi_selected_radar.csv"
+    radar_candidate_ledger_path = output_dir / "radar_candidate_ledger.csv"
+    artifact_summary_path = output_dir / "tracklet_viterbi_artifacts.json"
+
+    result.accepted_radar.to_csv(accepted_radar_path, index=False)
+    result.viterbi_selected_radar.to_csv(viterbi_selected_radar_path, index=False)
+    result.radar_candidate_ledger.to_csv(radar_candidate_ledger_path, index=False)
+    artifact_summary_path.write_text(
+        json.dumps(
+            {
+                "accepted_radar_rows": int(len(result.accepted_radar)),
+                "viterbi_selected_radar_rows": int(len(result.viterbi_selected_radar)),
+                "radar_candidate_ledger_rows": int(len(result.radar_candidate_ledger)),
+                "radar_candidate_ledger_selected_rows": _selected_ledger_rows(
+                    result.radar_candidate_ledger
+                ),
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    print(f"accepted_radar_csv={accepted_radar_path}")
+    print(f"viterbi_selected_radar_csv={viterbi_selected_radar_path}")
+    print(f"radar_candidate_ledger_csv={radar_candidate_ledger_path}")
+    print(f"tracklet_viterbi_artifacts_json={artifact_summary_path}")
+
+
+def _selected_ledger_rows(ledger: pd.DataFrame) -> int:
+    if "association_viterbi_selected" not in ledger.columns:
+        return 0
+    return int(ledger["association_viterbi_selected"].fillna(False).astype(bool).sum())
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the standard CLI with tracklet-Viterbi association enabled."""
 
@@ -371,7 +470,10 @@ def main(argv: list[str] | None = None) -> int:
         run_async_cv_baseline_with_radar_association
     )
     with _temporary_environment(env_updates):
-        return _base_cli.main(filtered_argv)
+        return_code = _base_cli.main(filtered_argv)
+    if return_code == 0:
+        _write_last_tracklet_viterbi_artifacts(filtered_argv)
+    return return_code
 
 
 if __name__ == "__main__":

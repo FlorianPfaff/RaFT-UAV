@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 import os
 from typing import Any
@@ -18,6 +18,7 @@ from raft_uav.baselines.kalman import (
     RadarPolarMeasurement,
     TrackingMeasurement,
     TrackingUpdateDiagnostics,
+    bootstrap_tracking_diagnostics,
     constant_velocity_matrix,
     enu_position_to_radar_polar,
     gate_threshold_from_probability,
@@ -76,6 +77,12 @@ class _TrackSegment:
         )
 
 
+@dataclass(frozen=True)
+class _InitialObservation:
+    measurement: TrackingMeasurement
+    selected_radar_row: pd.Series | None = None
+
+
 def run_async_cv_baseline_with_radar_association(
     *,
     rf_measurements: Iterable[TrackingMeasurement],
@@ -94,6 +101,7 @@ def run_async_cv_baseline_with_radar_association(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     track_switch_nis_ratio: float = 0.5,
     candidate_catprob_threshold: float | None = 0.5,
+    candidate_catprob_fallback_top_k: int = 0,
     geometry_velocity_std_mps: float = 12.0,
     geometry_velocity_weight: float = 0.25,
     geometry_switch_penalty: float = 4.0,
@@ -123,6 +131,7 @@ def run_async_cv_baseline_with_radar_association(
     stable_segment_rf_nis_cap: float = 25.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
     """Run CV fusion while selecting at most one radar row per radar frame.
 
@@ -156,6 +165,8 @@ def run_async_cv_baseline_with_radar_association(
         raise ValueError("track_switch_nis_ratio must be positive")
     if geometry_velocity_std_mps <= 0.0:
         raise ValueError("geometry_velocity_std_mps must be positive")
+    if candidate_catprob_fallback_top_k < 0:
+        raise ValueError("candidate_catprob_fallback_top_k must be nonnegative")
     if rf_anchor_weight < 0.0:
         raise ValueError("rf_anchor_weight must be nonnegative")
     if rf_anchor_time_gate_s < 0.0:
@@ -223,6 +234,8 @@ def run_async_cv_baseline_with_radar_association(
     rf_measurement_list = list(rf_measurements)
     covariance = np.diag([float(radar_xy_std_m) ** 2, float(radar_xy_std_m) ** 2, float(radar_z_std_m) ** 2])
     if association == "track-bank":
+        if tracker_factory is not None:
+            raise ValueError("track-bank association currently supports only the CV tracker")
         return _run_mht_track_bank(
             rf_measurements=rf_measurement_list,
             radar=radar,
@@ -236,6 +249,7 @@ def run_async_cv_baseline_with_radar_association(
             inflation_alpha_by_source=inflation_alpha_by_source,
             max_residual_norms_by_source=max_residual_norms_by_source,
             candidate_catprob_threshold=candidate_catprob_threshold,
+            candidate_catprob_fallback_top_k=candidate_catprob_fallback_top_k,
             max_global_hypotheses=track_bank_max_hypotheses,
             max_assignments_per_hypothesis=track_bank_max_assignments,
             max_candidates_per_track=track_bank_max_candidates,
@@ -278,12 +292,12 @@ def run_async_cv_baseline_with_radar_association(
         }
 
     start_index = 0
-    initial_measurement = None
+    initial_observation: _InitialObservation | None = None
     initial_events = (
         enumerate(events) if association in _STABLE_SEGMENT_ASSOCIATION_MODES else [(0, events[0])]
     )
     for index, event in initial_events:
-        initial_measurement = _initial_measurement(
+        initial_observation = _initial_observation(
             event,
             association=association,
             covariance=covariance,
@@ -292,13 +306,16 @@ def run_async_cv_baseline_with_radar_association(
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
         )
-        if initial_measurement is not None:
+        if initial_observation is not None:
             start_index = int(index)
             break
-    if initial_measurement is None:
+    if initial_observation is None:
         return [], _empty_selected_radar(radar)
 
-    tracker = AsyncConstantVelocityKalmanTracker(
+    initial_measurement = initial_observation.measurement
+    initial_selected_row = initial_observation.selected_radar_row
+    tracker = _make_tracker(
+        tracker_factory,
         initial_position=initial_measurement.vector,
         initial_time_s=initial_measurement.time_s,
         acceleration_std_mps2=acceleration_std_mps2,
@@ -306,8 +323,19 @@ def run_async_cv_baseline_with_radar_association(
     records: list[dict[str, object]] = []
     selected_rows: list[pd.Series] = []
     current_track_id: int | None = None
+    if initial_selected_row is not None:
+        current_track_id = _optional_track_id(initial_selected_row)
+        selected_rows.append(initial_selected_row)
+    records.append(
+        _bootstrap_record(
+            initial_measurement,
+            tracker,
+            selected_row=initial_selected_row,
+            association_mode=association,
+        )
+    )
 
-    for event in events[start_index:]:
+    for event in events[start_index + 1 :]:
         if event["kind"] == "rf":
             measurement = event["measurement"]
             assert isinstance(measurement, TrackingMeasurement)
@@ -352,6 +380,7 @@ def run_async_cv_baseline_with_radar_association(
             current_track_id=current_track_id,
             track_switch_nis_ratio=track_switch_nis_ratio,
             candidate_catprob_threshold=candidate_catprob_threshold,
+            candidate_catprob_fallback_top_k=candidate_catprob_fallback_top_k,
             geometry_velocity_std_mps=geometry_velocity_std_mps,
             geometry_velocity_weight=geometry_velocity_weight,
             geometry_switch_penalty=geometry_switch_penalty,
@@ -438,6 +467,33 @@ def _events(
     return sorted(events, key=lambda item: (float(item["time_s"]), int(item["priority"])))
 
 
+def _make_tracker(
+    tracker_factory: Callable[..., Any] | None,
+    *,
+    initial_position: np.ndarray,
+    initial_time_s: float,
+    acceleration_std_mps2: float,
+) -> Any:
+    """Instantiate the configured single-target filtering backend.
+
+    Association code only relies on ``predict_to``, ``update``, ``state``, and
+    ``covariance_matrix``.  Supplying a factory therefore integrates IMM without
+    duplicating the radar association and tracklet code paths.
+    """
+
+    if tracker_factory is None:
+        return AsyncConstantVelocityKalmanTracker(
+            initial_position=initial_position,
+            initial_time_s=initial_time_s,
+            acceleration_std_mps2=acceleration_std_mps2,
+        )
+    return tracker_factory(
+        initial_position=initial_position,
+        initial_time_s=initial_time_s,
+        acceleration_std_mps2=acceleration_std_mps2,
+    )
+
+
 def _run_mht_track_bank(
     *,
     rf_measurements: list[TrackingMeasurement],
@@ -452,6 +508,7 @@ def _run_mht_track_bank(
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
     candidate_catprob_threshold: float | None,
+    candidate_catprob_fallback_top_k: int,
     max_global_hypotheses: int,
     max_assignments_per_hypothesis: int,
     max_candidates_per_track: int,
@@ -464,7 +521,7 @@ def _run_mht_track_bank(
     if not events:
         return [], _empty_selected_radar(radar)
 
-    initial_measurement = _initial_measurement(
+    initial_observation = _initial_observation(
         events[0],
         association="track-bank",
         covariance=covariance,
@@ -473,9 +530,11 @@ def _run_mht_track_bank(
         truth_gate_m=150.0,
         truth_time_gate_s=1.0,
     )
-    if initial_measurement is None:
+    if initial_observation is None:
         return [], _empty_selected_radar(radar)
 
+    initial_measurement = initial_observation.measurement
+    initial_selected_row = initial_observation.selected_radar_row
     tracker = _initial_mht_tracker(
         initial_measurement,
         max_global_hypotheses=max_global_hypotheses,
@@ -489,8 +548,25 @@ def _run_mht_track_bank(
     current_time_s = float(initial_measurement.time_s)
     records: list[dict[str, object]] = []
     selected_rows: list[pd.Series] = []
+    if initial_selected_row is not None:
+        selected_rows.append(initial_selected_row)
+    records.append(
+        _mht_record(
+            measurement=initial_measurement,
+            tracker=tracker,
+            diagnostics=bootstrap_tracking_diagnostics(initial_measurement),
+            track_id=None if initial_selected_row is None else _optional_track_id(initial_selected_row),
+            association_nis=None
+            if initial_selected_row is None
+            else _optional_float(initial_selected_row.get("association_nis")),
+            association_score=None
+            if initial_selected_row is None
+            else _optional_float(initial_selected_row.get("association_score")),
+            association_mode="track-bank",
+        )
+    )
 
-    for event in events:
+    for event in events[1:]:
         time_s = float(event["time_s"])
         _predict_mht_to(
             tracker,
@@ -541,7 +617,11 @@ def _run_mht_track_bank(
 
         candidates = event["candidates"]
         assert isinstance(candidates, pd.DataFrame)
-        candidates = _catprob_candidate_pool(candidates, candidate_catprob_threshold)
+        candidates = _catprob_candidate_pool(
+            candidates,
+            candidate_catprob_threshold,
+            fallback_top_k=candidate_catprob_fallback_top_k,
+        )
         if candidates.empty:
             continue
 
@@ -551,7 +631,8 @@ def _run_mht_track_bank(
             covariance,
         )
         measurements = candidates[["east_m", "north_m", "up_m"]].to_numpy(dtype=float).T
-        covariances = np.repeat(covariance[:, :, None], measurements.shape[1], axis=2)
+        candidate_covariances = _candidate_covariance_stack(candidates, covariance)
+        covariances = np.moveaxis(candidate_covariances, 0, 2)
         tracker.update_linear(measurements, measurement_matrix(3), covariances)
 
         selected = _selected_row_from_best_mht_assignment(
@@ -1465,7 +1546,7 @@ def _integer_like(values: np.ndarray) -> bool:
     return bool(finite.size and np.allclose(finite, np.round(finite)))
 
 
-def _initial_measurement(
+def _initial_observation(
     event: dict[str, object],
     *,
     association: str,
@@ -1474,11 +1555,11 @@ def _initial_measurement(
     truth: pd.DataFrame | None,
     truth_gate_m: float,
     truth_time_gate_s: float,
-) -> TrackingMeasurement | None:
+) -> _InitialObservation | None:
     if event["kind"] == "rf":
         measurement = event["measurement"]
         assert isinstance(measurement, TrackingMeasurement)
-        return measurement
+        return _InitialObservation(measurement=measurement)
     candidates = event["candidates"]
     assert isinstance(candidates, pd.DataFrame)
     if association == "oracle-nearest-truth":
@@ -1498,7 +1579,33 @@ def _initial_measurement(
         selected = _highest_catprob(candidates)
     if selected is None:
         return None
-    return _radar_row_to_measurement(selected, covariance)
+    selected = selected.copy()
+    return _InitialObservation(
+        measurement=_radar_row_to_measurement(selected, covariance),
+        selected_radar_row=selected,
+    )
+
+
+def _initial_measurement(
+    event: dict[str, object],
+    *,
+    association: str,
+    covariance: np.ndarray,
+    stable_anchor_by_key: dict[object, pd.Series] | None = None,
+    truth: pd.DataFrame | None,
+    truth_gate_m: float,
+    truth_time_gate_s: float,
+) -> TrackingMeasurement | None:
+    observation = _initial_observation(
+        event,
+        association=association,
+        covariance=covariance,
+        stable_anchor_by_key=stable_anchor_by_key,
+        truth=truth,
+        truth_gate_m=truth_gate_m,
+        truth_time_gate_s=truth_time_gate_s,
+    )
+    return None if observation is None else observation.measurement
 
 
 def _select_radar_candidate(
@@ -1511,6 +1618,7 @@ def _select_radar_candidate(
     current_track_id: int | None,
     track_switch_nis_ratio: float,
     candidate_catprob_threshold: float | None,
+    candidate_catprob_fallback_top_k: int = 0,
     geometry_velocity_std_mps: float,
     geometry_velocity_weight: float,
     geometry_switch_penalty: float,
@@ -1550,7 +1658,11 @@ def _select_radar_candidate(
         selected["association_candidate_rows"] = int(len(candidates))
         return selected
 
-    candidates = _catprob_candidate_pool(candidates, candidate_catprob_threshold)
+    candidates = _catprob_candidate_pool(
+        candidates,
+        candidate_catprob_threshold,
+        fallback_top_k=candidate_catprob_fallback_top_k,
+    )
     if candidates.empty:
         return None
     if association == "stable-segments-hybrid" and stable_anchor_by_key is not None:
@@ -1666,15 +1778,31 @@ def _oracle_nearest_truth(
 def _catprob_candidate_pool(
     candidates: pd.DataFrame,
     candidate_catprob_threshold: float | None,
+    *,
+    fallback_top_k: int = 0,
 ) -> pd.DataFrame:
+    if fallback_top_k < 0:
+        raise ValueError("fallback_top_k must be nonnegative")
     if candidate_catprob_threshold is None or "cat_prob_uav" not in candidates.columns:
         return candidates
     catprob = pd.to_numeric(candidates["cat_prob_uav"], errors="coerce")
     threshold = float(candidate_catprob_threshold)
     keep = catprob >= threshold
     pool = candidates.loc[keep].copy()
+
+    fallback_used = False
+    if pool.empty and fallback_top_k > 0 and not candidates.empty:
+        scores = catprob.fillna(-np.inf).to_numpy(dtype=float)
+        order = np.argsort(-scores, kind="stable")[: int(fallback_top_k)]
+        pool = candidates.iloc[order].copy()
+        fallback_used = True
+
     pool["association_catprob_threshold"] = threshold
-    pool["association_catprob_fallback"] = False
+    pool["association_catprob_fallback"] = bool(fallback_used)
+    pool["association_catprob_fallback_top_k"] = int(fallback_top_k)
+    pool["association_catprob_original_candidate_rows"] = int(len(candidates))
+    pool["association_catprob_threshold_rejected_count"] = int((~keep).sum())
+    pool["association_catprob_pool_rows"] = int(len(pool))
     return pool
 
 
@@ -1701,16 +1829,24 @@ def _nis_scored_candidates(
         return candidates.iloc[0:0].copy()
     observation = measurement_matrix(3)
     state_position = observation @ tracker.state
-    innovation_covariance = observation @ tracker.covariance_matrix @ observation.T + covariance
-    try:
-        precision = np.linalg.inv(innovation_covariance)
-    except np.linalg.LinAlgError:
-        precision = np.linalg.pinv(innovation_covariance)
+    predicted_covariance = observation @ tracker.covariance_matrix @ observation.T
     vectors = candidates[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
-    residuals = vectors - state_position
+    measurement_covariances = _candidate_covariance_stack(candidates, covariance)
+    nises: list[float] = []
+    for vector, measurement_covariance in zip(vectors, measurement_covariances):
+        innovation_covariance = predicted_covariance + measurement_covariance
+        try:
+            precision = np.linalg.inv(innovation_covariance)
+        except np.linalg.LinAlgError:
+            precision = np.linalg.pinv(innovation_covariance)
+        residual = vector - state_position
+        nises.append(float(residual.T @ precision @ residual))
     scored = candidates.copy()
-    scored["association_nis"] = np.einsum("ij,jk,ik->i", residuals, precision, residuals)
+    scored["association_nis"] = nises
     scored["association_candidate_rows"] = int(len(candidates))
+    cov_trace = np.trace(measurement_covariances, axis1=1, axis2=2)
+    scored["association_cov_trace_m2"] = cov_trace
+    scored["association_measurement_cov_trace_m2"] = cov_trace
     return scored
 
 
@@ -1892,7 +2028,13 @@ def _pda_mixture_candidate(
     mean = weights @ vectors
     residuals = vectors - mean
     spread = residuals.T @ (residuals * weights[:, None])
-    covariance = np.asarray(base_covariance, dtype=float) + spread
+    measurement_covariances = _candidate_covariance_stack(candidates, base_covariance)
+    mean_measurement_covariance = np.tensordot(
+        weights,
+        measurement_covariances,
+        axes=(0, 0),
+    )
+    covariance = mean_measurement_covariance + spread
 
     best_index = int(np.argmax(weights))
     selected = candidates.iloc[best_index].copy()
@@ -1946,6 +2088,22 @@ def _pda_weights(
 def _weight_entropy(weights: np.ndarray) -> float:
     clipped = np.clip(np.asarray(weights, dtype=float), 1e-300, 1.0)
     return float(-np.sum(clipped * np.log(clipped)))
+
+
+def _candidate_covariance_stack(
+    candidates: pd.DataFrame,
+    fallback: np.ndarray,
+) -> np.ndarray:
+    fallback_covariance = np.asarray(fallback, dtype=float).reshape(3, 3)
+    if candidates.empty:
+        return np.empty((0, 3, 3), dtype=float)
+    covariances: list[np.ndarray] = []
+    for _, row in candidates.iterrows():
+        row_covariance = _row_covariance(row)
+        covariances.append(
+            fallback_covariance.copy() if row_covariance is None else row_covariance
+        )
+    return np.stack(covariances, axis=0)
 
 
 def _radar_row_to_measurement(
@@ -2057,28 +2215,28 @@ def _resolve_radar_measurement_model(measurement_model: str | None) -> str:
 
 
 def _row_covariance(row: pd.Series) -> np.ndarray | None:
-    columns = [
-        "association_cov_ee",
-        "association_cov_nn",
-        "association_cov_uu",
-        "association_cov_en",
-        "association_cov_eu",
-        "association_cov_nu",
-    ]
-    if not all(column in row for column in columns):
-        return None
-    values = [float(row[column]) for column in columns]
-    if not np.isfinite(values).all():
-        return None
-    ee, nn, uu, en, eu, nu = values
-    return np.array(
-        [
-            [ee, en, eu],
-            [en, nn, nu],
-            [eu, nu, uu],
-        ],
-        dtype=float,
-    )
+    for prefix in ("association_cov", "cov"):
+        columns = [
+            f"{prefix}_ee",
+            f"{prefix}_nn",
+            f"{prefix}_uu",
+            f"{prefix}_en",
+            f"{prefix}_eu",
+            f"{prefix}_nu",
+        ]
+        if not all(column in row.index for column in columns):
+            continue
+        try:
+            values = [float(row[column]) for column in columns]
+        except (TypeError, ValueError):
+            continue
+        if not np.isfinite(values).all():
+            continue
+        ee, nn, uu, en, eu, nu = values
+        if ee <= 0.0 or nn <= 0.0 or uu <= 0.0:
+            continue
+        return np.array([[ee, en, eu], [en, nn, nu], [eu, nu, uu]], dtype=float)
+    return None
 
 
 def _nearest_truth_position(
@@ -2149,7 +2307,7 @@ def _inflation_alpha_for_measurement(
 
 def _record(
     measurement: TrackingMeasurement,
-    tracker: AsyncConstantVelocityKalmanTracker,
+    tracker: Any,
     diagnostics: Any,
     *,
     track_id: int | None = None,
@@ -2164,6 +2322,7 @@ def _record(
         "covariance": tracker.covariance_matrix.copy(),
         **diagnostics.to_record(),
     }
+    _add_motion_mode_diagnostics(record, tracker)
     if track_id is not None:
         record["track_id"] = track_id
     if association_nis is not None:
@@ -2173,6 +2332,54 @@ def _record(
     if association_mode is not None:
         record["association_mode"] = association_mode
     return record
+
+
+def _add_motion_mode_diagnostics(record: dict[str, object], tracker: Any) -> None:
+    """Attach IMM diagnostics when the tracker exposes motion-mode state."""
+
+    mode_names = getattr(tracker, "mode_names", None)
+    mode_probabilities = getattr(tracker, "mode_probabilities", None)
+    if mode_names is not None and mode_probabilities is not None:
+        probabilities = np.asarray(mode_probabilities, dtype=float).reshape(-1)
+        record["mode_names"] = tuple(str(name) for name in mode_names)
+        record["mode_probabilities"] = probabilities.copy()
+        if len(probabilities):
+            record["most_likely_mode"] = str(mode_names[int(np.argmax(probabilities))])
+
+    probability_map = getattr(tracker, "mode_probability_map", None)
+    if isinstance(probability_map, dict):
+        record["mode_probability_map"] = {
+            str(name): float(probability)
+            for name, probability in probability_map.items()
+        }
+    most_likely = getattr(tracker, "most_likely_mode_name", None)
+    if most_likely is not None:
+        record["most_likely_mode"] = str(most_likely)
+
+
+def _bootstrap_record(
+    measurement: TrackingMeasurement,
+    tracker: AsyncConstantVelocityKalmanTracker,
+    *,
+    selected_row: pd.Series | None = None,
+    association_mode: str | None = None,
+) -> dict[str, object]:
+    row_mode = association_mode
+    if selected_row is not None:
+        row_mode = str(selected_row.get("association_mode", row_mode))
+    return _record(
+        measurement,
+        tracker,
+        bootstrap_tracking_diagnostics(measurement),
+        track_id=None if selected_row is None else _optional_track_id(selected_row),
+        association_nis=None
+        if selected_row is None
+        else _optional_float(selected_row.get("association_nis")),
+        association_score=None
+        if selected_row is None
+        else _optional_float(selected_row.get("association_score")),
+        association_mode=row_mode,
+    )
 
 
 def _selected_rows_frame(radar: pd.DataFrame, rows: list[pd.Series]) -> pd.DataFrame:

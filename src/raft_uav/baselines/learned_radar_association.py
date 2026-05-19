@@ -8,17 +8,21 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from raft_uav.baselines.kalman import AsyncConstantVelocityKalmanTracker, TrackingMeasurement
+from raft_uav.baselines.kalman import (
+    AsyncConstantVelocityKalmanTracker,
+    TrackingMeasurement,
+)
 from raft_uav.baselines.learned_radar_likelihood import (
     LearnedRadarAssociationModel,
     score_radar_candidates_with_learned_likelihood,
 )
 from raft_uav.baselines.radar_association import (
+    _bootstrap_record,
     _catprob_candidate_pool,
     _empty_selected_radar,
     _events,
     _gate_threshold_for_measurement,
-    _initial_measurement,
+    _initial_observation,
     _inflation_alpha_for_measurement,
     _max_residual_norm_for_measurement,
     _nis_scored_candidates,
@@ -64,7 +68,7 @@ def run_async_cv_baseline_with_learned_radar_association(
     if not events:
         return [], _empty_selected_radar(radar)
 
-    initial_measurement = _initial_measurement(
+    initial_observation = _initial_observation(
         events[0],
         association="prediction-nis",
         covariance=covariance,
@@ -72,9 +76,11 @@ def run_async_cv_baseline_with_learned_radar_association(
         truth_gate_m=150.0,
         truth_time_gate_s=1.0,
     )
-    if initial_measurement is None:
+    if initial_observation is None:
         return [], _empty_selected_radar(radar)
 
+    initial_measurement = initial_observation.measurement
+    initial_selected_row = initial_observation.selected_radar_row
     tracker = AsyncConstantVelocityKalmanTracker(
         initial_position=initial_measurement.vector,
         initial_time_s=initial_measurement.time_s,
@@ -83,8 +89,19 @@ def run_async_cv_baseline_with_learned_radar_association(
     records: list[dict[str, object]] = []
     selected_rows: list[pd.Series] = []
     current_track_id: int | None = None
+    if initial_selected_row is not None:
+        current_track_id = _optional_track_id(initial_selected_row)
+        selected_rows.append(initial_selected_row)
+    records.append(
+        _bootstrap_record(
+            initial_measurement,
+            tracker,
+            selected_row=initial_selected_row,
+            association_mode="learned-likelihood",
+        )
+    )
 
-    for event in events:
+    for event in events[1:]:
         if event["kind"] == "rf":
             measurement = event["measurement"]
             assert isinstance(measurement, TrackingMeasurement)

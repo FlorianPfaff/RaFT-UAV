@@ -16,6 +16,7 @@ from pyrecest.filters import InteractingMultipleModelFilter, KalmanFilter
 from raft_uav.baselines.kalman import (
     TrackingMeasurement,
     TrackingUpdateDiagnostics,
+    bootstrap_tracking_diagnostics,
     constant_velocity_matrix,
     gate_threshold_from_probability,
     measurement_matrix,
@@ -23,10 +24,12 @@ from raft_uav.baselines.kalman import (
 )
 from raft_uav.baselines.update_logic import (
     gate_threshold_for_measurement,
+    huber_threshold_for_measurement,
     inflation_alpha_for_measurement,
     max_residual_norm_for_measurement,
     plan_linear_measurement_update,
     robust_update_for_measurement,
+    student_t_dof_for_measurement,
     symmetrized,
 )
 
@@ -260,6 +263,8 @@ class AsyncInteractingMultipleModelTracker:
         max_residual_norm: float | None = None,
         robust_update: str | None = None,
         inflation_alpha: float = 1.0,
+        student_t_dof: float = 4.0,
+        huber_threshold: float = 2.0,
     ) -> TrackingUpdateDiagnostics:
         """Predict to and conditionally update from one RF or radar measurement."""
 
@@ -275,6 +280,8 @@ class AsyncInteractingMultipleModelTracker:
             max_residual_norm=max_residual_norm,
             robust_update=robust_update,
             inflation_alpha=inflation_alpha,
+            student_t_dof=student_t_dof,
+            huber_threshold=huber_threshold,
         )
 
         if plan.accepted:
@@ -313,6 +320,8 @@ def run_async_imm_baseline(
     inflation_alpha_by_source: Mapping[str, float] | None = None,
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     modes: Sequence[IMMMode] | None = None,
+    student_t_dof_by_source: Mapping[str, float] | None = None,
+    huber_threshold_by_source: Mapping[str, float] | None = None,
     mode_switch_time_constant_s: float = 20.0,
 ) -> list[dict[str, object]]:
     """Run the asynchronous IMM baseline and return posterior records."""
@@ -329,8 +338,22 @@ def run_async_imm_baseline(
         mode_switch_time_constant_s=mode_switch_time_constant_s,
     )
 
-    records: list[dict[str, object]] = []
-    for measurement in ordered:
+    first = ordered[0]
+    bootstrap_diagnostics = bootstrap_tracking_diagnostics(first)
+    records: list[dict[str, object]] = [
+        {
+            "time_s": first.time_s,
+            "source": first.source,
+            "state": tracker.state.copy(),
+            "covariance": tracker.covariance_matrix.copy(),
+            "mode_names": tracker.mode_names,
+            "mode_probabilities": tracker.mode_probabilities.copy(),
+            "mode_probability_map": tracker.mode_probability_map,
+            "most_likely_mode": tracker.most_likely_mode_name,
+            **bootstrap_diagnostics.to_record(),
+        }
+    ]
+    for measurement in ordered[1:]:
         diagnostics = tracker.update(
             measurement,
             gate_threshold=gate_threshold_for_measurement(
@@ -356,6 +379,14 @@ def run_async_imm_baseline(
             inflation_alpha=inflation_alpha_for_measurement(
                 measurement,
                 inflation_alpha_by_source=inflation_alpha_by_source,
+            ),
+            student_t_dof=student_t_dof_for_measurement(
+                measurement,
+                student_t_dof_by_source=student_t_dof_by_source,
+            ),
+            huber_threshold=huber_threshold_for_measurement(
+                measurement,
+                huber_threshold_by_source=huber_threshold_by_source,
             ),
         )
         records.append(

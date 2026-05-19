@@ -58,6 +58,14 @@ Run the soft NIS covariance-inflation baseline on one flight:
 python -m raft_uav.cli run-baseline data/raw/AADM2025Dryad --flight Opt2 --robust-update nis-inflate --rf-gate-prob 0.99 --radar-gate-prob 0.99
 ```
 
+Run the heavy-tailed Student-t or Huber covariance-reweighting baselines on one
+flight:
+
+```bash
+python -m raft_uav.cli run-baseline data/raw/AADM2025Dryad --flight Opt2 --robust-update student-t --rf-gate-prob 0.99 --radar-gate-prob 0.99
+python -m raft_uav.cli run-baseline data/raw/AADM2025Dryad --flight Opt2 --robust-update huber --rf-gate-prob 0.99 --radar-gate-prob 0.99
+```
+
 Tune source-specific inflation strength:
 
 ```bash
@@ -112,6 +120,13 @@ Run the Opt1-Opt3 radar candidate class-probability threshold ablation:
 
 ```bash
 python scripts/run_candidate_threshold_ablation.py data/raw/AADM2025Dryad --thresholds 0.4 0.5
+```
+
+When a threshold is useful but occasionally rejects every radar row in a frame,
+enable a truth-free top-K fallback for the association pool:
+
+```bash
+python scripts/run_candidate_threshold_ablation.py data/raw/AADM2025Dryad --thresholds 0.4 0.5 --fallback-top-k 0 2
 ```
 
 Sweep the stable radar segment diagnostic without running fusion or oracle rows:

@@ -4,6 +4,8 @@ import pandas as pd
 from raft_uav.baselines.kalman import AsyncConstantVelocityKalmanTracker, TrackingMeasurement
 from raft_uav.baselines.radar_association import (
     _catprob_candidate_pool,
+    _nis_scored_candidates,
+    _row_covariance,
     _select_radar_candidate,
     run_async_cv_baseline_with_radar_association,
 )
@@ -51,6 +53,7 @@ def test_oracle_nearest_truth_selects_closest_candidate_per_frame():
     )
 
     assert len(records) == 1
+    assert records[0]["update_action"] == "bootstrap"
     assert selected["track_id"].tolist() == [2]
 
 
@@ -85,6 +88,7 @@ def test_prediction_nis_selects_candidate_near_prediction():
     )
 
     assert len(records) == 3
+    assert records[0]["update_action"] == "bootstrap"
     assert selected["track_id"].tolist() == [1]
 
 
@@ -135,6 +139,27 @@ def test_catprob_candidate_pool_filters_when_possible():
     assert pool["track_id"].tolist() == [2]
     assert pool["association_catprob_threshold"].tolist() == [0.4]
     assert pool["association_catprob_fallback"].tolist() == [False]
+
+
+def test_catprob_candidate_pool_falls_back_to_top_k_when_threshold_empty():
+    candidates = pd.DataFrame(
+        {
+            "track_id": [1, 2, 3],
+            "cat_prob_uav": [0.1, 0.3, 0.2],
+            "east_m": [0.0, 1.0, 2.0],
+            "north_m": [0.0, 0.0, 0.0],
+            "up_m": [0.0, 0.0, 0.0],
+        }
+    )
+
+    pool = _catprob_candidate_pool(candidates, 0.4, fallback_top_k=2)
+
+    assert pool["track_id"].tolist() == [2, 3]
+    assert pool["association_catprob_threshold"].tolist() == [0.4, 0.4]
+    assert pool["association_catprob_fallback"].tolist() == [True, True]
+    assert pool["association_catprob_fallback_top_k"].tolist() == [2, 2]
+    assert pool["association_catprob_original_candidate_rows"].tolist() == [3, 3]
+    assert pool["association_catprob_threshold_rejected_count"].tolist() == [3, 3]
 
 
 def test_catprob_candidate_pool_returns_empty_when_threshold_empty():
@@ -188,6 +213,108 @@ def test_prediction_nis_treats_empty_catprob_pool_as_no_radar_selection():
 
     assert [record["source"] for record in records] == ["rf", "rf"]
     assert selected.empty
+
+
+def test_row_covariance_accepts_heteroscedastic_cov_columns():
+    row = pd.Series(
+        {
+            "cov_ee": 9.0,
+            "cov_nn": 16.0,
+            "cov_uu": 25.0,
+            "cov_en": 1.0,
+            "cov_eu": 2.0,
+            "cov_nu": 3.0,
+        }
+    )
+
+    covariance = _row_covariance(row)
+
+    assert covariance is not None
+    assert np.allclose(
+        covariance,
+        np.array([[9.0, 1.0, 2.0], [1.0, 16.0, 3.0], [2.0, 3.0, 25.0]]),
+    )
+
+
+def test_prediction_nis_scoring_uses_candidate_covariance_columns():
+    tracker = AsyncConstantVelocityKalmanTracker(
+        initial_position=np.zeros(3),
+        initial_time_s=0.0,
+        initial_position_std_m=1.0,
+    )
+    candidates = pd.DataFrame(
+        [
+            {
+                "time_s": 0.0,
+                "east_m": 10.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cov_ee": 1.0,
+                "cov_nn": 1.0,
+                "cov_uu": 1.0,
+                "cov_en": 0.0,
+                "cov_eu": 0.0,
+                "cov_nu": 0.0,
+            },
+            {
+                "time_s": 0.0,
+                "east_m": 10.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cov_ee": 99.0,
+                "cov_nn": 1.0,
+                "cov_uu": 1.0,
+                "cov_en": 0.0,
+                "cov_eu": 0.0,
+                "cov_nu": 0.0,
+            },
+        ]
+    )
+
+    scored = _nis_scored_candidates(candidates, tracker, np.eye(3))
+
+    assert scored["association_nis"].iloc[1] < scored["association_nis"].iloc[0]
+    assert scored["association_measurement_cov_trace_m2"].iloc[1] > scored[
+        "association_measurement_cov_trace_m2"
+    ].iloc[0]
+
+
+def test_prediction_nis_uses_top_k_catprob_fallback_when_threshold_empty():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 0,
+                "track_id": 1,
+                "time_s": 2.0,
+                "east_m": 2.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.2,
+            },
+            {
+                "frame_index": 0,
+                "track_id": 2,
+                "time_s": 2.0,
+                "east_m": 100.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.3,
+            },
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[_rf_measurement(0.0, 0.0), _rf_measurement(1.0, 1.0)],
+        radar=radar,
+        association="prediction-nis",
+        candidate_catprob_threshold=0.4,
+        candidate_catprob_fallback_top_k=2,
+    )
+
+    assert [record["source"] for record in records] == ["rf", "rf", "radar"]
+    assert selected["track_id"].tolist() == [1]
+    assert selected["association_catprob_fallback"].tolist() == [True]
+    assert selected["association_catprob_fallback_top_k"].tolist() == [2]
 
 
 def test_track_continuity_keeps_current_track_for_small_nis_gain():

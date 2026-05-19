@@ -38,7 +38,22 @@ def test_async_imm_baseline_returns_mode_probabilities():
     records = run_async_imm_baseline(measurements)
 
     assert len(records) == 2
+    assert records[0]["update_action"] == "bootstrap"
     assert np.asarray(records[-1]["state"]).shape == (6,)
     probabilities = np.asarray(records[-1]["mode_probabilities"], dtype=float)
     np.testing.assert_allclose(probabilities.sum(), 1.0)
     assert len(records[-1]["mode_names"]) == probabilities.size
+
+
+def test_async_imm_baseline_does_not_update_bootstrap_measurement():
+    covariance = np.diag([10.0, 10.0, 10.0])
+    measurement = TrackingMeasurement(0.0, np.array([0.0, 0.0, 0.0]), covariance, "radar")
+
+    records = run_async_imm_baseline([measurement])
+
+    assert len(records) == 1
+    assert records[0]["update_action"] == "bootstrap"
+    np.testing.assert_allclose(
+        np.diag(np.asarray(records[0]["covariance"], dtype=float))[:3],
+        np.full(3, 50.0**2),
+    )

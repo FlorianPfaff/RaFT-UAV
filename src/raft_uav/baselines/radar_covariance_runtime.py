@@ -88,7 +88,9 @@ def _nis_scored_candidates_with_candidate_covariance(
     scored = candidates.copy()
     scored["association_nis"] = nis
     scored["association_candidate_rows"] = int(len(candidates))
-    scored["association_cov_trace_m2"] = np.trace(measurement_covariances, axis1=1, axis2=2)
+    cov_trace = np.trace(measurement_covariances, axis1=1, axis2=2)
+    scored["association_cov_trace_m2"] = cov_trace
+    scored["association_measurement_cov_trace_m2"] = cov_trace
     return scored
 
 

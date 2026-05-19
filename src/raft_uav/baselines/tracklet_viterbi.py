@@ -9,12 +9,13 @@ missed-detection branch.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 import json
 import math
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -22,6 +23,7 @@ import pandas as pd
 from raft_uav.baselines.kalman import (
     AsyncConstantVelocityKalmanTracker,
     TrackingMeasurement,
+    bootstrap_tracking_diagnostics,
     constant_velocity_matrix,
     white_acceleration_process_noise,
 )
@@ -32,6 +34,10 @@ class TrackletViterbiAssociationConfig:
     """Configuration for sequence-level radar association."""
 
     max_candidates_per_frame: int = 8
+    path_beam_width: int = 1
+    replay_nis_weight: float = 0.0
+    replay_rejection_cost: float = 0.0
+    replay_roughness_weight: float = 0.0
     missed_detection_cost: float = 7.0
     consecutive_miss_cost: float = 1.0
     track_switch_cost: float = 8.0
@@ -57,6 +63,8 @@ class TrackletViterbiAssociationConfig:
     def __post_init__(self) -> None:
         if self.max_candidates_per_frame < 1:
             raise ValueError("max_candidates_per_frame must be positive")
+        if self.path_beam_width < 1:
+            raise ValueError("path_beam_width must be positive")
         positive = (
             "transition_position_std_m",
             "transition_speed_std_mps",
@@ -75,6 +83,9 @@ class TrackletViterbiAssociationConfig:
             "max_speed_penalty",
             "range_gate_slack_m",
             "range_penalty",
+            "replay_nis_weight",
+            "replay_rejection_cost",
+            "replay_roughness_weight",
             "association_reranker_weight",
         )
         for name in positive:
@@ -116,6 +127,12 @@ class _ViterbiNode:
     reranker_logit: float | None = None
 
 
+@dataclass(frozen=True)
+class _ViterbiPath:
+    cost: float
+    nodes: tuple[_ViterbiNode, ...]
+
+
 def run_async_cv_baseline_with_tracklet_viterbi_association(
     *,
     rf_measurements: Iterable[TrackingMeasurement],
@@ -132,13 +149,14 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
     """Run CV fusion after Viterbi radar-tracklet selection."""
 
     from raft_uav.baselines.radar_association import (
         _empty_selected_radar,
         _events,
-        _initial_measurement,
+        _initial_observation,
         _selected_rows_frame,
     )
 
@@ -153,7 +171,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     if bootstrap_index is None:
         return [], _empty_selected_radar(radar)
     events = events[bootstrap_index:]
-    initial = _initial_measurement(
+    initial_observation = _initial_observation(
         events[0],
         association="tracklet-viterbi",
         covariance=covariance,
@@ -161,8 +179,9 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         truth_gate_m=150.0,
         truth_time_gate_s=1.0,
     )
-    if initial is None:
+    if initial_observation is None:
         return [], _empty_selected_radar(radar)
+    initial = initial_observation.measurement
 
     anchors = _build_rf_anchor_states_for_config(
         events=events,
@@ -175,6 +194,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
         config=cfg,
+        tracker_factory=tracker_factory,
     )
     selected = _select_tracklet_viterbi_path(
         events=events,
@@ -187,6 +207,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         events=events,
         selected_rows=selected,
         initial_measurement=initial,
+        initial_selected_row=initial_observation.selected_radar_row,
         acceleration_std_mps2=acceleration_std_mps2,
         covariance=covariance,
         gate_probabilities_by_source=gate_probabilities_by_source,
@@ -196,6 +217,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         robust_update_by_source=robust_update_by_source,
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
+        tracker_factory=tracker_factory,
     )
     return records, _selected_rows_frame(radar, accepted)
 
@@ -228,6 +250,7 @@ def _build_rf_anchor_states(
     robust_update_by_source: Mapping[str, str | None] | None,
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> dict[int, _AnchorState]:
     """Return RF-only CV predictions at radar event indices."""
 
@@ -238,7 +261,7 @@ def _build_rf_anchor_states(
         _robust_update_for_measurement,
     )
 
-    tracker: AsyncConstantVelocityKalmanTracker | None = None
+    tracker: Any | None = None
     anchors: dict[int, _AnchorState] = {}
     for event_index, event in enumerate(events):
         time_s = float(event["time_s"])
@@ -246,11 +269,13 @@ def _build_rf_anchor_states(
             measurement = event["measurement"]
             assert isinstance(measurement, TrackingMeasurement)
             if tracker is None:
-                tracker = AsyncConstantVelocityKalmanTracker(
+                tracker = _make_tracker(
+                    tracker_factory,
                     initial_position=measurement.vector,
                     initial_time_s=measurement.time_s,
                     acceleration_std_mps2=acceleration_std_mps2,
                 )
+                continue
             tracker.update(
                 measurement,
                 gate_threshold=_gate_threshold_for_measurement(
@@ -297,6 +322,7 @@ def _build_rf_anchor_states_for_config(
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
     config: TrackletViterbiAssociationConfig,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> dict[int, _AnchorState]:
     """Build RF anchors according to the configured information pattern.
 
@@ -319,6 +345,7 @@ def _build_rf_anchor_states_for_config(
             robust_update_by_source=robust_update_by_source,
             inflation_alpha_by_source=inflation_alpha_by_source,
             max_residual_norms_by_source=max_residual_norms_by_source,
+            tracker_factory=tracker_factory,
         )
     if mode == "smoothed":
         return _build_smoothed_rf_anchor_states(
@@ -331,6 +358,7 @@ def _build_rf_anchor_states_for_config(
             robust_update_by_source=robust_update_by_source,
             inflation_alpha_by_source=inflation_alpha_by_source,
             max_residual_norms_by_source=max_residual_norms_by_source,
+            tracker_factory=tracker_factory,
         )
     raise ValueError('rf_anchor_mode must be either "causal" or "smoothed"')
 
@@ -346,6 +374,7 @@ def _build_smoothed_rf_anchor_states(
     robust_update_by_source: Mapping[str, str | None] | None,
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> dict[int, _AnchorState]:
     """Return offline RF-smoothed CV states at radar event indices.
 
@@ -364,7 +393,7 @@ def _build_smoothed_rf_anchor_states(
     )
 
     snapshots: list[dict[str, object]] = []
-    tracker: AsyncConstantVelocityKalmanTracker | None = None
+    tracker: Any | None = None
     previous_time_s: float | None = None
 
     for event_index, event in enumerate(events):
@@ -374,7 +403,8 @@ def _build_smoothed_rf_anchor_states(
                 continue
             measurement = event["measurement"]
             assert isinstance(measurement, TrackingMeasurement)
-            tracker = AsyncConstantVelocityKalmanTracker(
+            tracker = _make_tracker(
+                tracker_factory,
                 initial_position=measurement.vector,
                 initial_time_s=measurement.time_s,
                 acceleration_std_mps2=acceleration_std_mps2,
@@ -520,7 +550,73 @@ def _select_tracklet_viterbi_path(
 ) -> list[pd.Series]:
     """Return selected radar rows from the lowest-cost Viterbi path."""
 
-    frames = [
+    paths = _select_tracklet_viterbi_paths(
+        events=events,
+        anchors=anchors,
+        covariance=covariance,
+        candidate_catprob_threshold=candidate_catprob_threshold,
+        config=config,
+    )
+    return paths[0] if paths else []
+
+
+def _select_tracklet_viterbi_paths(
+    *,
+    events: list[dict[str, object]],
+    anchors: Mapping[int, _AnchorState],
+    covariance: np.ndarray,
+    candidate_catprob_threshold: float | None,
+    config: TrackletViterbiAssociationConfig,
+) -> list[list[pd.Series]]:
+    """Return up to ``path_beam_width`` radar paths ordered by Viterbi cost."""
+
+    candidates = _select_tracklet_viterbi_path_candidates(
+        events=events,
+        anchors=anchors,
+        covariance=covariance,
+        candidate_catprob_threshold=candidate_catprob_threshold,
+        config=config,
+    )
+    return [rows for _, rows in candidates]
+
+
+def _select_tracklet_viterbi_path_candidates(
+    *,
+    events: list[dict[str, object]],
+    anchors: Mapping[int, _AnchorState],
+    covariance: np.ndarray,
+    candidate_catprob_threshold: float | None,
+    config: TrackletViterbiAssociationConfig,
+) -> list[tuple[float, list[pd.Series]]]:
+    """Return candidate Viterbi paths as ``(path_cost, selected_rows)`` tuples."""
+
+    frames = _tracklet_viterbi_frames(
+        events=events,
+        anchors=anchors,
+        covariance=covariance,
+        candidate_catprob_threshold=candidate_catprob_threshold,
+        config=config,
+    )
+    paths = _beam_viterbi_paths(
+        frames=frames,
+        config=config,
+        max_paths=int(config.path_beam_width),
+    )
+    return [
+        (float(path.cost), _viterbi_path_to_rows(path, path_rank=path_rank, config=config))
+        for path_rank, path in enumerate(paths)
+    ]
+
+
+def _tracklet_viterbi_frames(
+    *,
+    events: list[dict[str, object]],
+    anchors: Mapping[int, _AnchorState],
+    covariance: np.ndarray,
+    candidate_catprob_threshold: float | None,
+    config: TrackletViterbiAssociationConfig,
+) -> list[list[_ViterbiNode]]:
+    return [
         _nodes_for_radar_frame(
             event_index=i,
             candidates=event["candidates"],
@@ -532,37 +628,50 @@ def _select_tracklet_viterbi_path(
         for i, event in enumerate(events)
         if event["kind"] == "radar"
     ]
+
+
+def _beam_viterbi_paths(
+    *,
+    frames: list[list[_ViterbiNode]],
+    config: TrackletViterbiAssociationConfig,
+    max_paths: int,
+) -> list[_ViterbiPath]:
+    """Return the best Viterbi paths using a bounded per-node beam."""
+
     if not frames:
         return []
+    beam_width = max(1, int(max_paths))
+    states_by_node: list[list[_ViterbiPath]] = []
+    for node in frames[0]:
+        initial_cost = node.unary_cost + (config.missed_detection_cost if node.is_miss else 0.0)
+        states_by_node.append([_ViterbiPath(float(initial_cost), (node,))])
 
-    costs = [np.array([n.unary_cost + (config.missed_detection_cost if n.is_miss else 0.0) for n in frames[0]])]
-    parents = [np.full(len(frames[0]), -1, dtype=int)]
     for frame_index in range(1, len(frames)):
         previous, current = frames[frame_index - 1], frames[frame_index]
-        current_costs = np.empty(len(current), dtype=float)
-        current_parents = np.empty(len(current), dtype=int)
-        for j, node in enumerate(current):
-            transition = np.array(
-                [costs[-1][k] + _transition_cost(prev, node, config) for k, prev in enumerate(previous)]
-            )
-            parent = int(np.argmin(transition))
-            current_parents[j] = parent
-            current_costs[j] = node.unary_cost + float(transition[parent])
-        costs.append(current_costs)
-        parents.append(current_parents)
+        next_states_by_node: list[list[_ViterbiPath]] = []
+        for node in current:
+            candidates: list[_ViterbiPath] = []
+            for previous_index, previous_node in enumerate(previous):
+                for partial in states_by_node[previous_index]:
+                    cost = partial.cost + _transition_cost(previous_node, node, config) + node.unary_cost
+                    candidates.append(_ViterbiPath(float(cost), partial.nodes + (node,)))
+            candidates.sort(key=lambda path: path.cost)
+            next_states_by_node.append(candidates[:beam_width])
+        states_by_node = next_states_by_node
 
-    best = int(np.argmin(costs[-1]))
-    path_cost = float(costs[-1][best])
-    path: list[_ViterbiNode] = []
-    for frame_index in range(len(frames) - 1, -1, -1):
-        path.append(frames[frame_index][best])
-        best = int(parents[frame_index][best])
-        if best < 0:
-            break
-    path.reverse()
+    paths = [path for node_paths in states_by_node for path in node_paths]
+    paths.sort(key=lambda path: path.cost)
+    return paths[:beam_width]
 
+
+def _viterbi_path_to_rows(
+    path: _ViterbiPath,
+    *,
+    path_rank: int,
+    config: TrackletViterbiAssociationConfig | None = None,
+) -> list[pd.Series]:
     rows: list[pd.Series] = []
-    for node in path:
+    for node in path.nodes:
         if node.is_miss or node.row is None:
             continue
         row = node.row.copy()
@@ -577,7 +686,8 @@ def _select_tracklet_viterbi_path(
         row["association_reranker_cost"] = float(node.reranker_cost)
         row["association_reranker_probability"] = node.reranker_probability
         row["association_reranker_logit"] = node.reranker_logit
-        row["association_viterbi_path_cost"] = path_cost
+        row["association_viterbi_path_cost"] = float(path.cost)
+        row["association_viterbi_path_rank"] = int(path_rank)
         rows.append(row)
     return rows
 
@@ -856,6 +966,7 @@ def _replay_selected_tracklet_path(
     events: list[dict[str, object]],
     selected_rows: list[pd.Series],
     initial_measurement: TrackingMeasurement,
+    initial_selected_row: pd.Series | None = None,
     acceleration_std_mps2: float,
     covariance: np.ndarray,
     gate_probabilities_by_source: Mapping[str, float | None] | None,
@@ -865,6 +976,7 @@ def _replay_selected_tracklet_path(
     robust_update_by_source: Mapping[str, str | None] | None,
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> tuple[list[dict[str, object]], list[pd.Series]]:
     from raft_uav.baselines.radar_association import (
         _gate_threshold_for_measurement,
@@ -876,14 +988,39 @@ def _replay_selected_tracklet_path(
     )
 
     selected_by_key = {_selected_row_event_key(row): row for row in selected_rows}
-    tracker = AsyncConstantVelocityKalmanTracker(
+    tracker = _make_tracker(
+        tracker_factory,
         initial_position=initial_measurement.vector,
         initial_time_s=initial_measurement.time_s,
         acceleration_std_mps2=acceleration_std_mps2,
     )
     records: list[dict[str, object]] = []
     accepted_rows: list[pd.Series] = []
-    for event in events:
+
+    if initial_selected_row is not None:
+        replayed = initial_selected_row.copy()
+        replayed["association_replay_accepted"] = True
+        replayed["association_replay_nis"] = float("nan")
+        accepted_rows.append(replayed)
+    records.append(
+        _record(
+            initial_measurement,
+            tracker,
+            bootstrap_tracking_diagnostics(initial_measurement),
+            track_id=None
+            if initial_selected_row is None
+            else _optional_track_id(initial_selected_row.get("track_id")),
+            association_nis=None
+            if initial_selected_row is None
+            else _optional_float(initial_selected_row.get("association_nis")),
+            association_score=None
+            if initial_selected_row is None
+            else _optional_float(initial_selected_row.get("association_score")),
+            association_mode=None if initial_selected_row is None else "tracklet-viterbi",
+        )
+    )
+
+    for event in events[1:]:
         if event["kind"] == "rf":
             measurement = event["measurement"]
             assert isinstance(measurement, TrackingMeasurement)
@@ -980,6 +1117,23 @@ def _selected_row_event_key(row: pd.Series) -> tuple[str, int | float]:
         return "frame_index", int(frame_index)
     time_s = _optional_float(row.get("time_s"))
     return ("time_s", float("nan")) if time_s is None else ("time_s", round(float(time_s), 9))
+
+
+def _make_tracker(
+    tracker_factory: Callable[..., Any] | None,
+    *,
+    initial_position: np.ndarray,
+    initial_time_s: float,
+    acceleration_std_mps2: float,
+) -> Any:
+    from raft_uav.baselines.radar_association import _make_tracker as make_tracker
+
+    return make_tracker(
+        tracker_factory,
+        initial_position=initial_position,
+        initial_time_s=initial_time_s,
+        acceleration_std_mps2=acceleration_std_mps2,
+    )
 
 
 def _row_position(row: pd.Series) -> np.ndarray | None:

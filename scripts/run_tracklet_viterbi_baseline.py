@@ -40,6 +40,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--acceleration-std", type=float, default=4.0)
     parser.add_argument("--radar-catprob-threshold", type=float, default=0.4)
     parser.add_argument("--max-candidates-per-frame", type=int, default=8)
+    parser.add_argument("--path-beam-width", type=int, default=1)
+    parser.add_argument("--replay-nis-weight", type=float, default=0.0)
+    parser.add_argument("--replay-rejection-cost", type=float, default=0.0)
+    parser.add_argument("--replay-roughness-weight", type=float, default=0.0)
     parser.add_argument("--missed-detection-cost", type=float, default=7.0)
     parser.add_argument("--track-switch-cost", type=float, default=8.0)
     parser.add_argument("--catprob-weight", type=float, default=2.5)
@@ -85,6 +89,10 @@ def main(argv: list[str] | None = None) -> int:
 
     config = TrackletViterbiAssociationConfig(
         max_candidates_per_frame=args.max_candidates_per_frame,
+        path_beam_width=args.path_beam_width,
+        replay_nis_weight=args.replay_nis_weight,
+        replay_rejection_cost=args.replay_rejection_cost,
+        replay_roughness_weight=args.replay_roughness_weight,
         missed_detection_cost=args.missed_detection_cost,
         track_switch_cost=args.track_switch_cost,
         catprob_weight=args.catprob_weight,
@@ -346,6 +354,10 @@ def _tracklet_viterbi_config(args: argparse.Namespace) -> dict[str, object]:
     return {
         "candidate_threshold": args.radar_catprob_threshold,
         "max_candidates_per_frame": args.max_candidates_per_frame,
+        "path_beam_width": args.path_beam_width,
+        "replay_nis_weight": args.replay_nis_weight,
+        "replay_rejection_cost": args.replay_rejection_cost,
+        "replay_roughness_weight": args.replay_roughness_weight,
         "missed_detection_cost": args.missed_detection_cost,
         "track_switch_cost": args.track_switch_cost,
         "catprob_weight": args.catprob_weight,

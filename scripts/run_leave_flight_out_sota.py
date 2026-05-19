@@ -119,6 +119,41 @@ METHODS: dict[str, MethodSpec] = {
     "hetero_cv_fixed_lag": MethodSpec(
         "hetero_cv_fixed_lag", "hetero", "Heteroscedastic CV fixed-lag", fixed_lag=True
     ),
+    "hetero_cv_prediction_nis_fixed_lag": MethodSpec(
+        "hetero_cv_prediction_nis_fixed_lag",
+        "hetero",
+        "Heteroscedastic CV prediction-NIS fixed-lag",
+        association="prediction-nis",
+        fixed_lag=True,
+    ),
+    "hetero_cv_rf_anchored_nis_fixed_lag": MethodSpec(
+        "hetero_cv_rf_anchored_nis_fixed_lag",
+        "hetero",
+        "Heteroscedastic CV RF-anchored NIS fixed-lag",
+        association="rf-anchored-nis",
+        fixed_lag=True,
+    ),
+    "hetero_cv_rf_gated_nis_fixed_lag": MethodSpec(
+        "hetero_cv_rf_gated_nis_fixed_lag",
+        "hetero",
+        "Heteroscedastic CV RF-gated NIS fixed-lag",
+        association="rf-gated-nis",
+        fixed_lag=True,
+    ),
+    "hetero_cv_track_bank_fixed_lag": MethodSpec(
+        "hetero_cv_track_bank_fixed_lag",
+        "hetero",
+        "Heteroscedastic CV MHT track-bank fixed-lag",
+        association="track-bank",
+        fixed_lag=True,
+    ),
+    "hetero_cv_stable_segments_hybrid_fixed_lag": MethodSpec(
+        "hetero_cv_stable_segments_hybrid_fixed_lag",
+        "hetero",
+        "Heteroscedastic CV stable radar segments hybrid fixed-lag",
+        association="stable-segments-hybrid",
+        fixed_lag=True,
+    ),
 }
 
 
@@ -143,11 +178,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             "cv_stable_segments_interpolated_fixed_lag",
             "imm_catprob",
             "hetero_cv_fixed_lag",
+            "hetero_cv_rf_anchored_nis_fixed_lag",
+            "hetero_cv_stable_segments_hybrid_fixed_lag",
         ],
     )
     parser.add_argument("--candidate-threshold", type=float, default=0.4)
     parser.add_argument("--fixed-lag-s", type=float, default=20.0)
     parser.add_argument("--max-eval-time-delta-s", type=float, default=2.0)
+    parser.add_argument(
+        "--coverage-target",
+        type=float,
+        default=1.0,
+        help="Target truth coverage used by coverage-aware leaderboard scores.",
+    )
+    parser.add_argument(
+        "--coverage-penalty-m",
+        type=float,
+        default=100.0,
+        help="Penalty in metres for a full unit of truth-coverage shortfall.",
+    )
     parser.add_argument("--acceleration-std", type=float, default=4.0)
     parser.add_argument("--rf-gate-prob", type=float, default=0.99)
     parser.add_argument("--radar-gate-prob", type=float, default=0.99)
@@ -156,6 +205,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--ridge-lambda", type=float, default=1.0)
     parser.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args(argv)
+    _validate_coverage_scoring_args(args.coverage_target, args.coverage_penalty_m)
 
     flights = _selected_flight_names(args.dataset_root, args.flights)
     methods = [METHODS[name] for name in args.methods]
@@ -170,9 +220,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         train_flights = [flight for flight in flights if flight != heldout]
         fold_dir = args.output_dir / f"heldout_{_slug(heldout)}"
         model_path = fold_dir / "models" / "heteroscedastic_uncertainty.json"
+        if any(method.runner == "hetero" for method in methods):
+            _train_uncertainty_model(args, train_flights, model_path)
+
         for method in methods:
-            if method.runner == "hetero":
-                _train_uncertainty_model(args, train_flights, model_path)
             run_dir = fold_dir / method.name
             metrics_path = common.metrics_json_path(run_dir, heldout)
             if not (args.skip_existing and metrics_path.exists()):
@@ -184,11 +235,18 @@ def main(argv: Sequence[str] | None = None) -> int:
                 metrics_path=metrics_path,
                 max_eval_time_delta_s=args.max_eval_time_delta_s,
                 train_flights=train_flights,
+                coverage_target=args.coverage_target,
+                coverage_penalty_m=args.coverage_penalty_m,
             )
             fold_rows.append(evaluation.row)
             evaluations[method.name].append(evaluation)
 
-    aggregate_rows = _aggregate_method_rows(methods, evaluations)
+    aggregate_rows = _aggregate_method_rows(
+        methods,
+        evaluations,
+        coverage_target=args.coverage_target,
+        coverage_penalty_m=args.coverage_penalty_m,
+    )
     _write_csv(args.output_dir / "fold_summary.csv", fold_rows)
     _write_csv(args.output_dir / "aggregate_summary.csv", aggregate_rows)
     (args.output_dir / "report.json").write_text(
@@ -197,6 +255,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "dataset_root": str(args.dataset_root),
                 "flights": flights,
                 "methods": [method.__dict__ for method in methods],
+                "coverage_scoring": {
+                    "coverage_target": args.coverage_target,
+                    "coverage_penalty_m": args.coverage_penalty_m,
+                },
                 "fold_rows": fold_rows,
                 "aggregate_rows": aggregate_rows,
             },
@@ -217,6 +279,8 @@ def evaluate_run(
     metrics_path: Path,
     max_eval_time_delta_s: float,
     train_flights: Sequence[str],
+    coverage_target: float = 0.0,
+    coverage_penalty_m: float = 0.0,
 ) -> RunEvaluation:
     """Load one run artifact set and recompute leakage-safe reporting metrics."""
 
@@ -244,6 +308,8 @@ def evaluate_run(
         dimensions=3,
     )
     coverage = truth_coverage(truth_times, estimate_times, max_time_delta_s=max_eval_time_delta_s)
+    error_2d_summary = summarize_scalar_errors(errors_2d)
+    error_3d_summary = summarize_scalar_errors(errors_3d)
     smoother = metrics.get("smoother") or {}
     robust_update = metrics.get("robust_update") or {}
     row: dict[str, object] = {
@@ -262,9 +328,18 @@ def evaluate_run(
         "rejected_measurements": int(metrics.get("rejected_measurements", 0)),
         "metrics_path": str(metrics_path),
     }
-    row.update(_prefixed_summary("error_2d", summarize_scalar_errors(errors_2d)))
-    row.update(_prefixed_summary("error_3d", summarize_scalar_errors(errors_3d)))
+    row.update(_prefixed_summary("error_2d", error_2d_summary))
+    row.update(_prefixed_summary("error_3d", error_3d_summary))
     row.update(coverage)
+    row.update(
+        coverage_aware_metrics(
+            error_summary_3d=error_3d_summary,
+            truth_rows=int(coverage["truth_rows"]),
+            covered_truth_rows=int(coverage["covered_truth_rows"]),
+            coverage_target=coverage_target,
+            coverage_penalty_m=coverage_penalty_m,
+        )
+    )
     row.update(_nis_summary(estimates))
     return RunEvaluation(
         row=row,
@@ -299,6 +374,60 @@ def truth_coverage(
     }
 
 
+def coverage_aware_metrics(
+    *,
+    error_summary_3d: dict[str, float],
+    truth_rows: int,
+    covered_truth_rows: int,
+    coverage_target: float,
+    coverage_penalty_m: float,
+) -> dict[str, float | int]:
+    """Return coverage-aware 3D metrics for leaderboard sorting.
+
+    The raw errors are computed on matched estimate/truth timestamps only. These
+    derived scores keep full-coverage methods competitive by adding a tunable
+    penalty for missing truth timestamps and by exposing a normalized RMSE per
+    unit of achieved truth coverage.
+    """
+
+    truth_count = int(truth_rows)
+    covered_count = int(covered_truth_rows)
+    uncovered_count = max(0, truth_count - covered_count)
+    coverage_rate = float(covered_count / truth_count) if truth_count else float("nan")
+    shortfall = (
+        max(0.0, float(coverage_target) - coverage_rate)
+        if np.isfinite(coverage_rate)
+        else float("nan")
+    )
+    penalty_component = (
+        float(coverage_penalty_m) * shortfall if np.isfinite(shortfall) else float("nan")
+    )
+
+    def _penalized(metric_name: str) -> float:
+        value = _finite_or_nan(error_summary_3d.get(metric_name))
+        if not np.isfinite(value) or not np.isfinite(penalty_component):
+            return float("nan")
+        return float(value + penalty_component)
+
+    rmse = _finite_or_nan(error_summary_3d.get("rmse_m"))
+    normalized_rmse = (
+        float(rmse / coverage_rate)
+        if np.isfinite(rmse) and np.isfinite(coverage_rate) and coverage_rate > 0.0
+        else float("nan")
+    )
+    return {
+        "coverage_target_rate": float(coverage_target),
+        "coverage_penalty_m": float(coverage_penalty_m),
+        "truth_uncovered_rows": uncovered_count,
+        "truth_coverage_shortfall_rate": float(shortfall),
+        "coverage_penalty_component_m": float(penalty_component),
+        "coverage_score_3d_rmse_m": _penalized("rmse_m"),
+        "coverage_score_3d_mae_m": _penalized("mae_m"),
+        "coverage_score_3d_p95_m": _penalized("p95_m"),
+        "coverage_normalized_error_3d_rmse_m": normalized_rmse,
+    }
+
+
 def summarize_scalar_errors(errors_m: np.ndarray) -> dict[str, float]:
     """Summarize scalar errors with tail metrics for SOTA-style tables."""
 
@@ -330,6 +459,9 @@ def summarize_scalar_errors(errors_m: np.ndarray) -> dict[str, float]:
 def _aggregate_method_rows(
     methods: Sequence[MethodSpec],
     evaluations: dict[str, Sequence[RunEvaluation]],
+    *,
+    coverage_target: float = 0.0,
+    coverage_penalty_m: float = 0.0,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for method in methods:
@@ -338,6 +470,8 @@ def _aggregate_method_rows(
         errors_3d = _concat([run.errors_3d_m for run in runs])
         truth_rows = int(sum(run.truth_rows for run in runs))
         covered = int(sum(run.covered_truth_rows for run in runs))
+        error_2d_summary = summarize_scalar_errors(errors_2d)
+        error_3d_summary = summarize_scalar_errors(errors_3d)
         row: dict[str, object] = {
             "method": method.name,
             "label": method.label,
@@ -349,18 +483,37 @@ def _aggregate_method_rows(
             "covered_truth_rows": covered,
             "truth_coverage_rate": float(covered / truth_rows) if truth_rows else float("nan"),
         }
-        row.update(_prefixed_summary("error_2d", summarize_scalar_errors(errors_2d)))
-        row.update(_prefixed_summary("error_3d", summarize_scalar_errors(errors_3d)))
+        row.update(_prefixed_summary("error_2d", error_2d_summary))
+        row.update(_prefixed_summary("error_3d", error_3d_summary))
+        row.update(
+            coverage_aware_metrics(
+                error_summary_3d=error_3d_summary,
+                truth_rows=truth_rows,
+                covered_truth_rows=covered,
+                coverage_target=coverage_target,
+                coverage_penalty_m=coverage_penalty_m,
+            )
+        )
         rows.append(row)
     ranked = sorted(
         enumerate(rows),
         key=lambda item: (
-            float(item[1].get("error_3d_rmse_m", float("inf"))),
+            _rank_value(item[1].get("error_3d_rmse_m")),
             -float(item[1].get("truth_coverage_rate", 0.0)),
         ),
     )
     for rank, (original_index, _) in enumerate(ranked, start=1):
         rows[original_index]["rank_rmse_3d"] = rank
+    coverage_ranked = sorted(
+        enumerate(rows),
+        key=lambda item: (
+            _rank_value(item[1].get("coverage_score_3d_rmse_m")),
+            _rank_value(item[1].get("error_3d_rmse_m")),
+            -float(item[1].get("truth_coverage_rate", 0.0)),
+        ),
+    )
+    for rank, (original_index, _) in enumerate(coverage_ranked, start=1):
+        rows[original_index]["rank_coverage_score_3d"] = rank
     return rows
 
 
@@ -414,8 +567,8 @@ def _run_method(args: argparse.Namespace, method: MethodSpec, flight: str, run_d
             str(model_path),
             "--output-dir",
             str(run_dir),
-            "--radar-selection",
-            "catprob",
+            "--radar-association",
+            method.association,
             "--radar-catprob-threshold",
             str(args.candidate_threshold),
             "--acceleration-std",
@@ -473,6 +626,26 @@ def _robust_name(value: object) -> object:
     if isinstance(value, dict):
         return value.get("method") or ""
     return ""
+
+
+def _validate_coverage_scoring_args(coverage_target: float, coverage_penalty_m: float) -> None:
+    if not 0.0 <= float(coverage_target) <= 1.0:
+        raise ValueError("--coverage-target must be in [0, 1]")
+    if float(coverage_penalty_m) < 0.0:
+        raise ValueError("--coverage-penalty-m must be non-negative")
+
+
+def _finite_or_nan(value: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if np.isfinite(number) else float("nan")
+
+
+def _rank_value(value: object) -> float:
+    number = _finite_or_nan(value)
+    return number if np.isfinite(number) else float("inf")
 
 
 def _nis_summary(estimates: pd.DataFrame) -> dict[str, object]:

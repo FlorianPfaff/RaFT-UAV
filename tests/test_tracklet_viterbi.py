@@ -110,6 +110,51 @@ def test_tracklet_viterbi_result_preserves_rejected_viterbi_choices():
     assert result.viterbi_selected_radar["association_replay_update_action"].tolist() == ["missed_detection"]
 
 
+def test_tracklet_viterbi_beam_can_rerank_by_replay_rejection_cost():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 0,
+                "track_id": 2,
+                "time_s": 1.0,
+                "east_m": 1000.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.99,
+            },
+            {
+                "frame_index": 0,
+                "track_id": 1,
+                "time_s": 1.0,
+                "east_m": 5.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.8,
+            },
+        ]
+    )
+
+    result = run_async_cv_baseline_with_tracklet_viterbi_result(
+        rf_measurements=[_rf_measurement(0.0, 0.0)],
+        radar=radar,
+        candidate_catprob_threshold=None,
+        safety_gate_thresholds_by_source={"radar": 1.0},
+        config=TrackletViterbiAssociationConfig(
+            anchor_nis_weight=0.0,
+            missed_detection_cost=1_000.0,
+            range_gate_m=None,
+            path_beam_width=2,
+            replay_rejection_cost=1_000.0,
+        ),
+    )
+
+    assert result.viterbi_selected_radar["track_id"].tolist() == [1]
+    assert result.viterbi_selected_radar["association_viterbi_path_rank"].tolist() == [1]
+    assert result.viterbi_selected_radar["association_replay_accepted"].tolist() == [True]
+    assert "association_viterbi_replay_objective" in result.viterbi_selected_radar.columns
+    assert result.radar_candidate_ledger["association_viterbi_selected"].tolist() == [False, True]
+
+
 def test_tracklet_viterbi_smoothed_rf_anchor_uses_future_rf_context():
     radar = pd.DataFrame(
         [

@@ -55,6 +55,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--candidate-threshold", type=float, default=0.4)
     parser.add_argument("--fixed-lag-s", type=float, default=20.0)
     parser.add_argument("--max-eval-time-delta-s", type=float, default=2.0)
+    parser.add_argument(
+        "--coverage-target",
+        type=float,
+        default=1.0,
+        help="Target truth coverage used by coverage-aware leaderboard scores.",
+    )
+    parser.add_argument(
+        "--coverage-penalty-m",
+        type=float,
+        default=100.0,
+        help="Penalty in metres for a full unit of truth-coverage shortfall.",
+    )
     parser.add_argument("--acceleration-std", type=float, default=4.0)
     parser.add_argument("--max-candidates-per-frame", type=int, default=8)
     parser.add_argument("--missed-detection-cost", type=float, default=7.0)
@@ -77,6 +89,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--radar-inflation-alpha", type=float, default=0.5)
     parser.add_argument("--skip-existing", action="store_true")
     args = parser.parse_args(argv)
+    _validate_coverage_scoring_args(args.coverage_target, args.coverage_penalty_m)
 
     flights = _selected_flight_names(args.dataset_root, args.flights)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -94,11 +107,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                 metrics_path=metrics_path,
                 max_eval_time_delta_s=args.max_eval_time_delta_s,
                 train_flights=[flight for flight in flights if flight != heldout],
+                coverage_target=args.coverage_target,
+                coverage_penalty_m=args.coverage_penalty_m,
             )
         )
 
     fold_rows = [evaluation.row for evaluation in evaluations]
-    aggregate_rows = [_aggregate_row(evaluations)]
+    aggregate_rows = [
+        _aggregate_row(
+            evaluations,
+            coverage_target=args.coverage_target,
+            coverage_penalty_m=args.coverage_penalty_m,
+        )
+    ]
     _write_csv(args.output_dir / "fold_summary.csv", fold_rows)
     _write_csv(args.output_dir / "aggregate_summary.csv", aggregate_rows)
     (args.output_dir / "report.json").write_text(
@@ -108,6 +129,10 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "flights": flights,
                 "method": "cv_tracklet_viterbi_fixed_lag",
                 "fold_rows": fold_rows,
+                "coverage_scoring": {
+                    "coverage_target": args.coverage_target,
+                    "coverage_penalty_m": args.coverage_penalty_m,
+                },
                 "aggregate_rows": aggregate_rows,
             },
             indent=2,
@@ -187,6 +212,8 @@ def _evaluate_run(
     metrics_path: Path,
     max_eval_time_delta_s: float,
     train_flights: Sequence[str],
+    coverage_target: float,
+    coverage_penalty_m: float,
 ) -> RunEvaluation:
     metrics = common.load_metrics(metrics_path)
     estimates = pd.read_csv(metrics_path.parent / "estimates.csv")
@@ -241,6 +268,10 @@ def _evaluate_run(
         selected_times,
         max_time_delta_s=max_eval_time_delta_s,
     )
+    error_2d_summary = _summarize_scalar_errors(errors_2d)
+    error_3d_summary = _summarize_scalar_errors(errors_3d)
+    selected_error_2d_summary = _summarize_scalar_errors(selected_errors_2d)
+    selected_error_3d_summary = _summarize_scalar_errors(selected_errors_3d)
     diagnostics = metrics.get("selected_radar_diagnostics") or {}
     smoother = metrics.get("smoother") or {}
     radar_frame_count = _optional_int(diagnostics.get("radar_frame_count"), default=0)
@@ -285,12 +316,31 @@ def _evaluate_run(
         "selected_radar_unique_track_ids": int(unique_track_ids),
         "metrics_path": str(metrics_path),
     }
-    row.update(_prefixed_summary("error_2d", _summarize_scalar_errors(errors_2d)))
-    row.update(_prefixed_summary("error_3d", _summarize_scalar_errors(errors_3d)))
-    row.update(_prefixed_summary("selected_radar_error_2d", _summarize_scalar_errors(selected_errors_2d)))
-    row.update(_prefixed_summary("selected_radar_error_3d", _summarize_scalar_errors(selected_errors_3d)))
+    row.update(_prefixed_summary("error_2d", error_2d_summary))
+    row.update(_prefixed_summary("error_3d", error_3d_summary))
+    row.update(_prefixed_summary("selected_radar_error_2d", selected_error_2d_summary))
+    row.update(_prefixed_summary("selected_radar_error_3d", selected_error_3d_summary))
     row.update(_association_stat_columns(diagnostics, selected_radar))
     row.update(coverage)
+    row.update(
+        _coverage_aware_metrics(
+            error_summary_3d=error_3d_summary,
+            truth_rows=int(coverage["truth_rows"]),
+            covered_truth_rows=int(coverage["covered_truth_rows"]),
+            coverage_target=coverage_target,
+            coverage_penalty_m=coverage_penalty_m,
+        )
+    )
+    row.update(
+        _coverage_aware_metrics(
+            error_summary_3d=selected_error_3d_summary,
+            truth_rows=int(selected_coverage["truth_rows"]),
+            covered_truth_rows=int(selected_coverage["covered_truth_rows"]),
+            coverage_target=coverage_target,
+            coverage_penalty_m=coverage_penalty_m,
+            prefix="selected_radar_",
+        )
+    )
     row.update(_nis_summary(estimates))
     return RunEvaluation(
         row=row,
@@ -308,7 +358,12 @@ def _evaluate_run(
     )
 
 
-def _aggregate_row(evaluations: Sequence[RunEvaluation]) -> dict[str, object]:
+def _aggregate_row(
+    evaluations: Sequence[RunEvaluation],
+    *,
+    coverage_target: float,
+    coverage_penalty_m: float,
+) -> dict[str, object]:
     errors_2d = _concat([evaluation.errors_2d_m for evaluation in evaluations])
     errors_3d = _concat([evaluation.errors_3d_m for evaluation in evaluations])
     selected_errors_2d = _concat([evaluation.selected_radar_errors_2d_m for evaluation in evaluations])
@@ -319,6 +374,10 @@ def _aggregate_row(evaluations: Sequence[RunEvaluation]) -> dict[str, object]:
     selected_frames = int(sum(evaluation.selected_radar_frame_count for evaluation in evaluations))
     radar_frames = int(sum(evaluation.radar_frame_count for evaluation in evaluations))
     unique_track_ids = [evaluation.selected_radar_unique_track_ids for evaluation in evaluations]
+    error_2d_summary = _summarize_scalar_errors(errors_2d)
+    error_3d_summary = _summarize_scalar_errors(errors_3d)
+    selected_error_2d_summary = _summarize_scalar_errors(selected_errors_2d)
+    selected_error_3d_summary = _summarize_scalar_errors(selected_errors_3d)
     row: dict[str, object] = {
         "method": "cv_tracklet_viterbi_fixed_lag",
         "label": "CV tracklet-Viterbi fixed-lag",
@@ -342,11 +401,31 @@ def _aggregate_row(evaluations: Sequence[RunEvaluation]) -> dict[str, object]:
         else float("nan"),
         "selected_radar_unique_track_ids_max": int(max(unique_track_ids)) if unique_track_ids else 0,
     }
-    row.update(_prefixed_summary("error_2d", _summarize_scalar_errors(errors_2d)))
-    row.update(_prefixed_summary("error_3d", _summarize_scalar_errors(errors_3d)))
-    row.update(_prefixed_summary("selected_radar_error_2d", _summarize_scalar_errors(selected_errors_2d)))
-    row.update(_prefixed_summary("selected_radar_error_3d", _summarize_scalar_errors(selected_errors_3d)))
+    row.update(_prefixed_summary("error_2d", error_2d_summary))
+    row.update(_prefixed_summary("error_3d", error_3d_summary))
+    row.update(_prefixed_summary("selected_radar_error_2d", selected_error_2d_summary))
+    row.update(_prefixed_summary("selected_radar_error_3d", selected_error_3d_summary))
+    row.update(
+        _coverage_aware_metrics(
+            error_summary_3d=error_3d_summary,
+            truth_rows=truth_rows,
+            covered_truth_rows=covered,
+            coverage_target=coverage_target,
+            coverage_penalty_m=coverage_penalty_m,
+        )
+    )
+    row.update(
+        _coverage_aware_metrics(
+            error_summary_3d=selected_error_3d_summary,
+            truth_rows=truth_rows,
+            covered_truth_rows=selected_covered,
+            coverage_target=coverage_target,
+            coverage_penalty_m=coverage_penalty_m,
+            prefix="selected_radar_",
+        )
+    )
     row["rank_rmse_3d"] = 1
+    row["rank_coverage_score_3d"] = 1
     return row
 
 
@@ -369,6 +448,55 @@ def _truth_coverage(
         "truth_rows": int(truth_times.size),
         "covered_truth_rows": covered,
         "truth_coverage_rate": float(covered / truth_times.size),
+    }
+
+
+def _coverage_aware_metrics(
+    *,
+    error_summary_3d: dict[str, float],
+    truth_rows: int,
+    covered_truth_rows: int,
+    coverage_target: float,
+    coverage_penalty_m: float,
+    prefix: str = "",
+) -> dict[str, float | int]:
+    """Return coverage-aware 3D metrics, optionally under a column prefix."""
+
+    truth_count = int(truth_rows)
+    covered_count = int(covered_truth_rows)
+    uncovered_count = max(0, truth_count - covered_count)
+    coverage_rate = float(covered_count / truth_count) if truth_count else float("nan")
+    shortfall = (
+        max(0.0, float(coverage_target) - coverage_rate)
+        if np.isfinite(coverage_rate)
+        else float("nan")
+    )
+    penalty_component = (
+        float(coverage_penalty_m) * shortfall if np.isfinite(shortfall) else float("nan")
+    )
+
+    def _penalized(metric_name: str) -> float:
+        value = _finite_or_nan(error_summary_3d.get(metric_name))
+        if not np.isfinite(value) or not np.isfinite(penalty_component):
+            return float("nan")
+        return float(value + penalty_component)
+
+    rmse = _finite_or_nan(error_summary_3d.get("rmse_m"))
+    normalized_rmse = (
+        float(rmse / coverage_rate)
+        if np.isfinite(rmse) and np.isfinite(coverage_rate) and coverage_rate > 0.0
+        else float("nan")
+    )
+    return {
+        f"{prefix}coverage_target_rate": float(coverage_target),
+        f"{prefix}coverage_penalty_m": float(coverage_penalty_m),
+        f"{prefix}truth_uncovered_rows": uncovered_count,
+        f"{prefix}truth_coverage_shortfall_rate": float(shortfall),
+        f"{prefix}coverage_penalty_component_m": float(penalty_component),
+        f"{prefix}coverage_score_3d_rmse_m": _penalized("rmse_m"),
+        f"{prefix}coverage_score_3d_mae_m": _penalized("mae_m"),
+        f"{prefix}coverage_score_3d_p95_m": _penalized("p95_m"),
+        f"{prefix}coverage_normalized_error_3d_rmse_m": normalized_rmse,
     }
 
 
@@ -523,6 +651,21 @@ def _optional_int(value: object, *, default: int) -> int:
 
 def _nan_if_none(value: float | None) -> float:
     return float("nan") if value is None else float(value)
+
+
+def _validate_coverage_scoring_args(coverage_target: float, coverage_penalty_m: float) -> None:
+    if not 0.0 <= float(coverage_target) <= 1.0:
+        raise ValueError("--coverage-target must be in [0, 1]")
+    if float(coverage_penalty_m) < 0.0:
+        raise ValueError("--coverage-penalty-m must be non-negative")
+
+
+def _finite_or_nan(value: object) -> float:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+    return number if np.isfinite(number) else float("nan")
 
 
 def _nis_summary(estimates: pd.DataFrame) -> dict[str, object]:

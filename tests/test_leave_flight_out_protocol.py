@@ -66,3 +66,11 @@ def test_aggregate_method_rows_pools_errors_and_ranks_methods() -> None:
     assert by_method["method_b"]["truth_coverage_rate"] == 1.0
     assert by_method["method_b"]["rank_rmse_3d"] == 1
     assert by_method["method_a"]["rank_rmse_3d"] == 2
+
+
+def test_heteroscedastic_sota_methods_expose_stronger_association() -> None:
+    method = lfo.METHODS["hetero_cv_rf_gated_nis_fixed_lag"]
+
+    assert method.runner == "hetero"
+    assert method.association == "rf-gated-nis"
+    assert method.fixed_lag is True

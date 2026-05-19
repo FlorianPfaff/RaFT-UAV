@@ -11,12 +11,14 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from raft_uav.baselines.imm import AsyncInteractingMultipleModelTracker, run_async_imm_baseline
 from raft_uav.baselines.kalman import run_async_cv_baseline
 from raft_uav.baselines.radar_association import (
     RADAR_ASSOCIATION_MODES,
     run_async_cv_baseline_with_radar_association,
 )
 from raft_uav.baselines.smoothing import SMOOTHER_MODES, smooth_tracking_records
+from raft_uav.baselines.update_logic import ROBUST_UPDATE_MODES
 from raft_uav.evaluation.diagnostics import build_diagnostic_summary
 from raft_uav.evaluation.metrics import position_errors_m, summarize_errors
 from raft_uav.io.aerpaw import (
@@ -67,7 +69,14 @@ def main(argv: list[str] | None = None) -> int:
     baseline_parser.add_argument("dataset_root", type=Path)
     baseline_parser.add_argument("--flight", required=True)
     baseline_parser.add_argument("--output-dir", type=Path, default=Path("outputs/baseline"))
+    baseline_parser.add_argument(
+        "--tracker",
+        choices=["cv", "imm"],
+        default="cv",
+        help="single-target filtering backend used after radar association",
+    )
     baseline_parser.add_argument("--acceleration-std", type=float, default=4.0)
+    baseline_parser.add_argument("--imm-mode-switch-time-constant", type=float, default=20.0)
     baseline_parser.add_argument(
         "--rf-clock-offset-s",
         type=float,
@@ -93,6 +102,16 @@ def main(argv: list[str] | None = None) -> int:
         help="legacy radar row selection; overrides --radar-association when provided",
     )
     baseline_parser.add_argument("--radar-catprob-threshold", type=float, default=0.5)
+    baseline_parser.add_argument(
+        "--radar-catprob-fallback-top-k",
+        type=int,
+        default=0,
+        help=(
+            "when the class-probability threshold rejects every radar candidate "
+            "in a frame, keep this many highest-probability candidates; "
+            "0 disables fallback"
+        ),
+    )
     baseline_parser.add_argument("--truth-gate-m", type=float, default=150.0)
     baseline_parser.add_argument("--truth-time-gate-s", type=float, default=1.0)
     baseline_parser.add_argument(
@@ -260,9 +279,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     baseline_parser.add_argument(
         "--robust-update",
-        choices=["none", "nis-inflate"],
+        choices=["none", *ROBUST_UPDATE_MODES],
         default="none",
-        help="robust update rule; nis-inflate keeps plausible high-NIS updates with inflated covariance",
+        help=(
+            "robust update rule; nis-inflate keeps plausible high-NIS updates "
+            "with inflated covariance, student-t applies heavy-tailed covariance "
+            "reweighting, and huber applies multivariate Huber reweighting"
+        ),
     )
     baseline_parser.add_argument(
         "--rf-gate-prob",
@@ -337,12 +360,15 @@ def main(argv: list[str] | None = None) -> int:
             args.dataset_root,
             args.flight,
             args.output_dir,
+            args.tracker,
             args.acceleration_std,
+            args.imm_mode_switch_time_constant,
             args.rf_clock_offset_s,
             args.radar_clock_offset_s,
             args.radar_association,
             args.radar_selection,
             args.radar_catprob_threshold,
+            args.radar_catprob_fallback_top_k,
             args.truth_gate_m,
             args.truth_time_gate_s,
             args.track_switch_nis_ratio,
@@ -421,12 +447,15 @@ def _run_baseline(
     dataset_root: Path,
     flight_name: str,
     output_dir: Path,
+    tracker: str,
     acceleration_std: float,
+    imm_mode_switch_time_constant: float,
     rf_clock_offset_s: float,
     radar_clock_offset_s: float,
     radar_association: str,
     legacy_radar_selection: str | None,
     radar_catprob_threshold: float,
+    radar_catprob_fallback_top_k: int,
     truth_gate_m: float,
     truth_time_gate_s: float,
     track_switch_nis_ratio: float,
@@ -472,10 +501,16 @@ def _run_baseline(
     rf_inflation_alpha: float,
     radar_inflation_alpha: float,
 ) -> int:
+    if tracker not in {"cv", "imm"}:
+        raise ValueError("tracker must be 'cv' or 'imm'")
+    if imm_mode_switch_time_constant <= 0.0:
+        raise ValueError("imm_mode_switch_time_constant must be positive")
     if enable_gating and robust_update != "none":
         raise ValueError("--enable-gating and --robust-update are mutually exclusive")
     if rf_inflation_alpha <= 0.0 or radar_inflation_alpha <= 0.0:
         raise ValueError("inflation alphas must be positive")
+    if radar_catprob_fallback_top_k < 0:
+        raise ValueError("radar_catprob_fallback_top_k must be nonnegative")
     if track_switch_nis_ratio <= 0.0:
         raise ValueError("track_switch_nis_ratio must be positive")
     if rf_anchor_weight < 0.0:
@@ -574,6 +609,11 @@ def _run_baseline(
         robust_updates = {"rf": robust_update, "radar": robust_update}
         inflation_alphas = {"rf": rf_inflation_alpha, "radar": radar_inflation_alpha}
 
+    tracker_factory = None
+    if tracker == "imm":
+        if radar_mode == "track-bank":
+            raise ValueError("--tracker imm is not supported with --radar-association track-bank")
+        tracker_factory = _imm_tracker_factory(imm_mode_switch_time_constant)
     if radar_mode in RADAR_ASSOCIATION_MODES:
         records, selected_radar = run_async_cv_baseline_with_radar_association(
             rf_measurements=rf_measurements,
@@ -588,6 +628,7 @@ def _run_baseline(
             max_residual_norms_by_source=max_residual_norms,
             track_switch_nis_ratio=track_switch_nis_ratio,
             candidate_catprob_threshold=radar_catprob_threshold,
+            candidate_catprob_fallback_top_k=radar_catprob_fallback_top_k,
             geometry_velocity_std_mps=geometry_velocity_std,
             geometry_velocity_weight=geometry_velocity_weight,
             geometry_switch_penalty=geometry_switch_penalty,
@@ -627,6 +668,7 @@ def _run_baseline(
             stable_segment_rf_nis_cap=stable_segment_rf_nis_cap,
             truth_gate_m=truth_gate_m,
             truth_time_gate_s=truth_time_gate_s,
+            tracker_factory=tracker_factory,
         )
         measurements = [*rf_measurements, *radar_measurements_to_enu(selected_radar)]
     else:
@@ -639,7 +681,11 @@ def _run_baseline(
             truth_time_gate_s=truth_time_gate_s,
         )
         measurements.extend(radar_measurements_to_enu(selected_radar))
-        records = run_async_cv_baseline(
+        runner = run_async_imm_baseline if tracker == "imm" else run_async_cv_baseline
+        runner_kwargs = {}
+        if tracker == "imm":
+            runner_kwargs["mode_switch_time_constant_s"] = imm_mode_switch_time_constant
+        records = runner(
             measurements,
             acceleration_std_mps2=acceleration_std,
             gate_probabilities_by_source=gate_probabilities,
@@ -647,6 +693,7 @@ def _run_baseline(
             robust_update_by_source=robust_updates,
             inflation_alpha_by_source=inflation_alphas,
             max_residual_norms_by_source=max_residual_norms,
+            **runner_kwargs,
         )
     if not records:
         raise RuntimeError(f"{flight.name} produced no baseline posterior records")
@@ -655,9 +702,11 @@ def _run_baseline(
         method=smoother,
         acceleration_std_mps2=acceleration_std,
         lag_s=smoother_lag_s,
+        measurements=measurements,
     )
 
     estimate_frame = _records_to_frame(records)
+    estimate_frame = _with_mode_probability_columns(estimate_frame, records)
     diagnostics_columns = [
         "time_s",
         "source",
@@ -697,11 +746,14 @@ def _run_baseline(
         radar=radar,
         selected_radar=selected_radar,
         estimate_frame=estimate_frame,
+        tracker=tracker,
         acceleration_std=acceleration_std,
+        imm_mode_switch_time_constant=imm_mode_switch_time_constant,
         rf_clock_offset_s=rf_clock_offset_s,
         radar_clock_offset_s=radar_clock_offset_s,
         radar_association=radar_mode,
         radar_catprob_threshold=radar_catprob_threshold,
+        radar_catprob_fallback_top_k=radar_catprob_fallback_top_k,
         truth_gate_m=truth_gate_m,
         truth_time_gate_s=truth_time_gate_s,
         track_switch_nis_ratio=track_switch_nis_ratio,
@@ -771,6 +823,8 @@ def _run_baseline(
     print(f"rf_clock_offset_s={metrics['clock_offsets_s']['rf']:.3f}")
     print(f"radar_clock_offset_s={metrics['clock_offsets_s']['radar']:.3f}")
     print(f"radar_association={radar_mode}")
+    print(f"radar_catprob_fallback_top_k={radar_catprob_fallback_top_k}")
+    print(f"radar_catprob_fallback_rows={metrics['radar_catprob_fallback_rows']}")
     print(f"selected_radar_rows={len(selected_radar)}")
     print(f"selected_radar_track_ids={metrics['selected_radar_track_ids']}")
     print(f"smoother={smoother}")
@@ -805,6 +859,7 @@ def _records_to_frame(records: list[dict[str, object]]) -> pd.DataFrame:
                 "association_nis": _optional_float(record.get("association_nis")),
                 "association_score": _optional_float(record.get("association_score")),
                 "hypothesis_count": _optional_int(record.get("hypothesis_count")),
+                "most_likely_mode": _optional_str(record.get("most_likely_mode")),
                 "best_hypothesis_weight": _optional_float(record.get("best_hypothesis_weight")),
                 "hypothesis_weight_margin": _optional_float(record.get("hypothesis_weight_margin")),
                 "measurement_dim": int(record.get("measurement_dim", 0)),
@@ -838,6 +893,27 @@ def _records_to_frame(records: list[dict[str, object]]) -> pd.DataFrame:
     return pd.DataFrame.from_records(rows).sort_values("time_s").reset_index(drop=True)
 
 
+def _with_mode_probability_columns(
+    frame: pd.DataFrame,
+    records: list[dict[str, object]],
+) -> pd.DataFrame:
+    """Add one CSV column per IMM mode when mode probabilities are present."""
+
+    if frame.empty:
+        return frame
+    out = frame.copy()
+    for row_index, record in enumerate(records[: len(out)]):
+        probabilities = record.get("mode_probability_map")
+        if not isinstance(probabilities, dict):
+            continue
+        for mode_name, probability in probabilities.items():
+            column = f"mode_probability_{str(mode_name).replace('-', '_')}"
+            if column not in out.columns:
+                out[column] = np.nan
+            out.loc[row_index, column] = float(probability)
+    return out
+
+
 def _hypotheses_to_frame(records: list[dict[str, object]]) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for record_index, record in enumerate(records):
@@ -862,11 +938,14 @@ def _baseline_metrics(
     radar: pd.DataFrame,
     selected_radar: pd.DataFrame,
     estimate_frame: pd.DataFrame,
+    tracker: str,
     acceleration_std: float,
+    imm_mode_switch_time_constant: float,
     rf_clock_offset_s: float = DEFAULT_RF_CLOCK_OFFSET_S,
     radar_clock_offset_s: float = DEFAULT_RADAR_CLOCK_OFFSET_S,
     radar_association: str,
     radar_catprob_threshold: float,
+    radar_catprob_fallback_top_k: int,
     truth_gate_m: float,
     truth_time_gate_s: float,
     track_switch_nis_ratio: float,
@@ -962,6 +1041,11 @@ def _baseline_metrics(
             "radar": flight.radar_json.name if flight.radar_json else None,
         },
         "state": ["east", "north", "up", "v_east", "v_north", "v_up"],
+        "tracker": {
+            "method": tracker,
+            "imm_mode_switch_time_constant_s": float(imm_mode_switch_time_constant)
+            if tracker == "imm" else None,
+        },
         "acceleration_std_mps2": float(acceleration_std),
         "clock_offsets_s": {
             "rf": float(rf_clock_offset_s),
@@ -972,6 +1056,7 @@ def _baseline_metrics(
         "radar_selection": radar_association,
         "radar_association": radar_association,
         "radar_catprob_threshold": float(radar_catprob_threshold),
+        "radar_catprob_fallback_top_k": int(radar_catprob_fallback_top_k),
         "truth_gate_m": float(truth_gate_m),
         "truth_time_gate_s": float(truth_time_gate_s),
         "track_switch_nis_ratio": float(track_switch_nis_ratio),
@@ -1168,6 +1253,23 @@ def _inside_truth_window(frame: pd.DataFrame, truth: pd.DataFrame) -> pd.DataFra
     truth_min = float(truth["time_s"].min())
     truth_max = float(truth["time_s"].max())
     return frame.loc[(frame["time_s"] >= truth_min) & (frame["time_s"] <= truth_max)].copy()
+
+
+def _imm_tracker_factory(mode_switch_time_constant_s: float):
+    def make_tracker(
+        *,
+        initial_position: np.ndarray,
+        initial_time_s: float,
+        acceleration_std_mps2: float,
+    ) -> AsyncInteractingMultipleModelTracker:
+        return AsyncInteractingMultipleModelTracker(
+            initial_position=initial_position,
+            initial_time_s=initial_time_s,
+            acceleration_std_mps2=acceleration_std_mps2,
+            mode_switch_time_constant_s=float(mode_switch_time_constant_s),
+        )
+
+    return make_tracker
 
 
 def _write_trajectory_plot(

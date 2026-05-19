@@ -110,7 +110,7 @@ def run_async_cv_baseline_with_stateful_learned_radar_association(
         _empty_selected_radar,
         _events,
         _gate_threshold_for_measurement,
-        _initial_measurement,
+        _initial_observation,
         _inflation_alpha_for_measurement,
         _max_residual_norm_for_measurement,
         _nis_scored_candidates,
@@ -134,7 +134,7 @@ def run_async_cv_baseline_with_stateful_learned_radar_association(
     if not events:
         return [], _empty_selected_radar(radar)
 
-    initial_measurement = _initial_measurement(
+    initial_observation = _initial_observation(
         events[0],
         association="prediction-nis",
         covariance=covariance,
@@ -142,9 +142,24 @@ def run_async_cv_baseline_with_stateful_learned_radar_association(
         truth_gate_m=150.0,
         truth_time_gate_s=1.0,
     )
-    if initial_measurement is None:
+    if initial_observation is None:
         return [], _empty_selected_radar(radar)
 
+    initial_measurement = initial_observation.measurement
+    initial_selected_row = initial_observation.selected_radar_row
+    initial_current_track_id: int | None = None
+    initial_decision: RadarDecisionNode | None = None
+    if initial_selected_row is not None:
+        initial_selected_row = initial_selected_row.copy()
+        initial_selected_row["association_mode"] = "stateful-learned-likelihood"
+        initial_selected_row["association_action"] = "stateful_bootstrap"
+        initial_current_track_id = _optional_track_id(initial_selected_row.get("track_id"))
+        initial_decision = RadarDecisionNode(
+            parent=None,
+            event_key=_selected_row_event_key(initial_selected_row),
+            time_s=float(initial_selected_row["time_s"]),
+            selected=initial_selected_row,
+        )
     initial_tracker = AsyncConstantVelocityKalmanTracker(
         initial_position=initial_measurement.vector,
         initial_time_s=initial_measurement.time_s,
@@ -154,13 +169,13 @@ def run_async_cv_baseline_with_stateful_learned_radar_association(
         _BeamHypothesis(
             tracker=initial_tracker,
             log_cost=0.0,
-            current_track_id=None,
-            decision=None,
+            current_track_id=initial_current_track_id,
+            decision=initial_decision,
             missed_frames=0,
         )
     ]
 
-    for event in events:
+    for event in events[1:]:
         if event["kind"] == "rf":
             measurement = event["measurement"]
             for hypothesis in hypotheses:
@@ -310,6 +325,7 @@ def run_async_cv_baseline_with_stateful_learned_radar_association(
         events=events,
         selected_rows=selected_rows,
         initial_measurement=initial_measurement,
+        initial_selected_row=initial_selected_row,
         acceleration_std_mps2=acceleration_std_mps2,
         covariance=covariance,
         gate_probabilities_by_source=gate_probabilities_by_source,
@@ -500,6 +516,7 @@ def _replay_stateful_radar_path(
     events: list[dict[str, object]],
     selected_rows: list[pd.Series],
     initial_measurement: Any,
+    initial_selected_row: pd.Series | None,
     acceleration_std_mps2: float,
     covariance: np.ndarray,
     gate_probabilities_by_source: Mapping[str, float | None] | None,
@@ -517,6 +534,8 @@ def _replay_stateful_radar_path(
     inflation_alpha_fn: Any,
     radar_row_to_measurement_fn: Any,
 ) -> list[dict[str, object]]:
+    from raft_uav.baselines.kalman import bootstrap_tracking_diagnostics
+
     selected_by_key = {_selected_row_event_key(row): row for row in selected_rows}
     tracker = tracker_cls(
         initial_position=initial_measurement.vector,
@@ -525,7 +544,27 @@ def _replay_stateful_radar_path(
     )
     records: list[dict[str, object]] = []
 
-    for event in events:
+    records.append(
+        record_fn(
+            initial_measurement,
+            tracker,
+            bootstrap_tracking_diagnostics(initial_measurement),
+            track_id=None
+            if initial_selected_row is None
+            else _optional_track_id(initial_selected_row.get("track_id")),
+            association_nis=None
+            if initial_selected_row is None
+            else _optional_float(initial_selected_row.get("association_nis")),
+            association_score=None
+            if initial_selected_row is None
+            else _optional_float(initial_selected_row.get("association_score")),
+            association_mode=None
+            if initial_selected_row is None
+            else "stateful-learned-likelihood",
+        )
+    )
+
+    for event in events[1:]:
         if event["kind"] == "rf":
             measurement = event["measurement"]
             diagnostics = tracker.update(

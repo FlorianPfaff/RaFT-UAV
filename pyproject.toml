@@ -36,6 +36,7 @@ raft-uav-tracklet-viterbi-fixed-lag = "raft_uav.tracklet_viterbi_fixed_lag_cli:m
 raft-uav-lofo-time-offset = "raft_uav.lofo_time_offset_cli:main"
 raft-uav-diagnose-time-offset = "raft_uav.diagnostics.time_offset:main"
 raft-uav-lofo-bias-time-offset = "raft_uav.calibration.lofo_cli:main"
+raft-uav-lofo-leaderboard = "raft_uav.lofo_leaderboard_cli:main"
 raft-uav-diagnose-paper-table = "raft_uav.diagnostics.paper_table:main"
 raft-uav-sweep-tracklet-viterbi = "raft_uav.sweep_tracklet_viterbi_cli:main"
 

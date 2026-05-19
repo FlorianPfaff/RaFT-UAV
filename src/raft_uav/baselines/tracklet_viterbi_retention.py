@@ -12,7 +12,8 @@ association decisions.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -42,13 +43,14 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
     """Run tracklet-Viterbi with native retention-aware node construction."""
 
     from raft_uav.baselines.radar_association import (
         _empty_selected_radar,
         _events,
-        _initial_measurement,
+        _initial_observation,
         _selected_rows_frame,
     )
 
@@ -63,7 +65,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
     if bootstrap_index is None:
         return [], _empty_selected_radar(radar)
     events = events[bootstrap_index:]
-    initial = _initial_measurement(
+    initial_observation = _initial_observation(
         events[0],
         association="tracklet-viterbi",
         covariance=covariance,
@@ -71,8 +73,9 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         truth_gate_m=150.0,
         truth_time_gate_s=1.0,
     )
-    if initial is None:
+    if initial_observation is None:
         return [], _empty_selected_radar(radar)
+    initial = initial_observation.measurement
 
     anchors = _base._build_rf_anchor_states_for_config(
         events=events,
@@ -98,6 +101,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         events=events,
         selected_rows=selected,
         initial_measurement=initial,
+        initial_selected_row=initial_observation.selected_radar_row,
         acceleration_std_mps2=acceleration_std_mps2,
         covariance=covariance,
         gate_probabilities_by_source=gate_probabilities_by_source,
@@ -107,6 +111,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_association(
         robust_update_by_source=robust_update_by_source,
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
+        tracker_factory=tracker_factory,
     )
     return records, _selected_rows_frame(radar, accepted)
 
@@ -155,55 +160,12 @@ def _select_tracklet_viterbi_path(
     if not frames:
         return []
 
-    costs = [
-        np.array(
-            [n.unary_cost + (config.missed_detection_cost if n.is_miss else 0.0) for n in frames[0]]
-        )
-    ]
-    parents = [np.full(len(frames[0]), -1, dtype=int)]
-    for frame_index in range(1, len(frames)):
-        previous, current = frames[frame_index - 1], frames[frame_index]
-        current_costs = np.empty(len(current), dtype=float)
-        current_parents = np.empty(len(current), dtype=int)
-        for j, node in enumerate(current):
-            transition = np.array(
-                [
-                    costs[-1][k] + _base._transition_cost(prev, node, config)
-                    for k, prev in enumerate(previous)
-                ]
-            )
-            parent = int(np.argmin(transition))
-            current_parents[j] = parent
-            current_costs[j] = node.unary_cost + float(transition[parent])
-        costs.append(current_costs)
-        parents.append(current_parents)
-
-    best = int(np.argmin(costs[-1]))
-    path_cost = float(costs[-1][best])
-    path: list[_base._ViterbiNode] = []
-    for frame_index in range(len(frames) - 1, -1, -1):
-        path.append(frames[frame_index][best])
-        best = int(parents[frame_index][best])
-        if best < 0:
-            break
-    path.reverse()
-
-    rows: list[pd.Series] = []
-    for node in path:
-        if node.is_miss or node.row is None:
-            continue
-        row = node.row.copy()
-        row["association_mode"] = "tracklet-viterbi"
-        row["association_action"] = "viterbi_selected"
-        row["association_nis"] = float(node.anchor_nis)
-        row["association_score"] = float(node.unary_cost)
-        row["association_anchor_nis"] = float(node.anchor_nis)
-        row["association_rf_anchor_mode"] = str(getattr(config, "rf_anchor_mode", "causal"))
-        row["association_catprob_cost"] = float(node.catprob_cost)
-        row["association_range_cost"] = float(node.range_cost)
-        row["association_viterbi_path_cost"] = path_cost
-        rows.append(row)
-    return rows
+    paths = _base._beam_viterbi_paths(
+        frames=frames,
+        config=config,
+        max_paths=int(getattr(config, "path_beam_width", 1)),
+    )
+    return _base._viterbi_path_to_rows(paths[0], path_rank=0, config=config) if paths else []
 
 
 def _nodes_for_radar_frame_with_track_retention(

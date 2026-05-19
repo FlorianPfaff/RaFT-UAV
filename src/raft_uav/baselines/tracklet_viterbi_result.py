@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
+from typing import Any
 
 import numpy as np
 import pandas as pd
@@ -17,7 +18,7 @@ from raft_uav.baselines.tracklet_viterbi import (
     _optional_float,
     _optional_track_id,
     _radar_event_key,
-    _select_tracklet_viterbi_path,
+    _select_tracklet_viterbi_path_candidates,
     _selected_row_event_key,
 )
 
@@ -48,6 +49,7 @@ def run_async_cv_baseline_with_tracklet_viterbi_result(
     max_residual_norms_by_source: Mapping[str, float | None] | None = None,
     candidate_catprob_threshold: float | None = 0.4,
     config: TrackletViterbiAssociationConfig | None = None,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> TrackletViterbiResult:
     """Run CV fusion and return accepted plus all non-miss Viterbi choices.
 
@@ -117,25 +119,18 @@ def run_async_cv_baseline_with_tracklet_viterbi_result(
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
         config=cfg,
+        tracker_factory=tracker_factory,
     )
-    selected = _select_tracklet_viterbi_path(
+    candidate_paths = _select_tracklet_viterbi_path_candidates(
         events=events,
         anchors=anchors,
         covariance=covariance,
         candidate_catprob_threshold=candidate_catprob_threshold,
         config=cfg,
     )
-    candidate_ledger = _tracklet_candidate_ledger(
+    selected, replay_cache = _select_tracklet_viterbi_path_with_replay_objective(
         events=events,
-        anchors=anchors,
-        covariance=covariance,
-        candidate_catprob_threshold=candidate_catprob_threshold,
-        config=cfg,
-        selected_rows=selected,
-    )
-    records, accepted, replayed = _replay_selected_tracklet_path_with_replay(
-        events=events,
-        selected_rows=selected,
+        candidate_paths=candidate_paths,
         initial_measurement=initial,
         acceleration_std_mps2=acceleration_std_mps2,
         covariance=covariance,
@@ -146,7 +141,36 @@ def run_async_cv_baseline_with_tracklet_viterbi_result(
         robust_update_by_source=robust_update_by_source,
         inflation_alpha_by_source=inflation_alpha_by_source,
         max_residual_norms_by_source=max_residual_norms_by_source,
+        config=cfg,
+        tracker_factory=tracker_factory,
     )
+    candidate_ledger = _tracklet_candidate_ledger(
+        events=events,
+        anchors=anchors,
+        covariance=covariance,
+        candidate_catprob_threshold=candidate_catprob_threshold,
+        config=cfg,
+        selected_rows=selected,
+    )
+    if replay_cache is None:
+        records, accepted, replayed = _replay_selected_tracklet_path_with_replay(
+            events=events,
+            selected_rows=selected,
+            initial_measurement=initial,
+            acceleration_std_mps2=acceleration_std_mps2,
+            covariance=covariance,
+            gate_probabilities_by_source=gate_probabilities_by_source,
+            gate_thresholds_by_source=gate_thresholds_by_source,
+            safety_gate_probabilities_by_source=safety_gate_probabilities_by_source,
+            safety_gate_thresholds_by_source=safety_gate_thresholds_by_source,
+            robust_update_by_source=robust_update_by_source,
+            inflation_alpha_by_source=inflation_alpha_by_source,
+            max_residual_norms_by_source=max_residual_norms_by_source,
+            tracker_factory=tracker_factory,
+        )
+    else:
+        records, accepted, replayed = replay_cache
+
     accepted_frame = _selected_rows_frame(radar, accepted)
     replayed_frame = _selected_rows_frame(radar, replayed)
     return TrackletViterbiResult(records, accepted_frame, replayed_frame, candidate_ledger)
@@ -215,6 +239,21 @@ def _tracklet_candidate_ledger(
                 if selected_here and selected is not None
                 else None
             )
+            row["association_viterbi_path_rank"] = (
+                _optional_float(selected.get("association_viterbi_path_rank"))
+                if selected_here and selected is not None
+                else None
+            )
+            row["association_viterbi_replay_objective"] = (
+                _optional_float(selected.get("association_viterbi_replay_objective"))
+                if selected_here and selected is not None
+                else None
+            )
+            row["association_viterbi_replay_rejected_rows"] = (
+                _optional_float(selected.get("association_viterbi_replay_rejected_rows"))
+                if selected_here and selected is not None
+                else None
+            )
             rows.append(row)
     if not rows:
         return _empty_candidate_ledger(template)
@@ -232,6 +271,170 @@ def _tracklet_candidate_ledger(
     return pd.DataFrame(rows).sort_values(sort_columns).reset_index(drop=True)
 
 
+def _select_tracklet_viterbi_path_with_replay_objective(
+    *,
+    events: list[dict[str, object]],
+    candidate_paths: list[tuple[float, list[pd.Series]]],
+    initial_measurement: TrackingMeasurement,
+    acceleration_std_mps2: float,
+    covariance: np.ndarray,
+    gate_probabilities_by_source: Mapping[str, float | None] | None,
+    gate_thresholds_by_source: Mapping[str, float | None] | None,
+    safety_gate_probabilities_by_source: Mapping[str, float | None] | None,
+    safety_gate_thresholds_by_source: Mapping[str, float | None] | None,
+    robust_update_by_source: Mapping[str, str | None] | None,
+    inflation_alpha_by_source: Mapping[str, float] | None,
+    max_residual_norms_by_source: Mapping[str, float | None] | None,
+    config: TrackletViterbiAssociationConfig,
+    tracker_factory: Callable[..., Any] | None = None,
+) -> tuple[
+    list[pd.Series],
+    tuple[list[dict[str, object]], list[pd.Series], list[pd.Series]] | None,
+]:
+    """Select a candidate path, optionally reranking the Viterbi beam by replay diagnostics."""
+
+    if not candidate_paths:
+        return [], None
+    use_replay_objective = int(config.path_beam_width) > 1 and (
+        float(config.replay_nis_weight) > 0.0
+        or float(config.replay_rejection_cost) > 0.0
+        or float(config.replay_roughness_weight) > 0.0
+    )
+    if not use_replay_objective:
+        return candidate_paths[0][1], None
+
+    scored: list[
+        tuple[
+            float,
+            int,
+            list[pd.Series],
+            tuple[list[dict[str, object]], list[pd.Series], list[pd.Series]],
+        ]
+    ] = []
+    for path_rank, (path_cost, rows) in enumerate(candidate_paths):
+        records, accepted, replayed = _replay_selected_tracklet_path_with_replay(
+            events=events,
+            selected_rows=rows,
+            initial_measurement=initial_measurement,
+            acceleration_std_mps2=acceleration_std_mps2,
+            covariance=covariance,
+            gate_probabilities_by_source=gate_probabilities_by_source,
+            gate_thresholds_by_source=gate_thresholds_by_source,
+            safety_gate_probabilities_by_source=safety_gate_probabilities_by_source,
+            safety_gate_thresholds_by_source=safety_gate_thresholds_by_source,
+            robust_update_by_source=robust_update_by_source,
+            inflation_alpha_by_source=inflation_alpha_by_source,
+            max_residual_norms_by_source=max_residual_norms_by_source,
+            tracker_factory=tracker_factory,
+        )
+        terms = _replay_objective_terms(
+            path_cost=path_cost,
+            records=records,
+            replayed_rows=replayed,
+            config=config,
+        )
+        annotated_rows = _annotate_replay_objective_rows(rows, terms, path_rank)
+        annotated_accepted = _annotate_replay_objective_rows(accepted, terms, path_rank)
+        annotated_replayed = _annotate_replay_objective_rows(replayed, terms, path_rank)
+        scored.append(
+            (
+                float(terms["objective"]),
+                int(path_rank),
+                annotated_rows,
+                (records, annotated_accepted, annotated_replayed),
+            )
+        )
+
+    _, _, selected_rows, replay_cache = min(scored, key=lambda item: (item[0], item[1]))
+    return selected_rows, replay_cache
+
+
+def _replay_objective_terms(
+    *,
+    path_cost: float,
+    records: list[dict[str, object]],
+    replayed_rows: list[pd.Series],
+    config: TrackletViterbiAssociationConfig,
+) -> dict[str, float]:
+    replay_nis_sum = _sum_replay_nis(replayed_rows)
+    rejected_rows = float(_count_replay_rejections(replayed_rows))
+    roughness = _trajectory_roughness_cost(records)
+    objective = (
+        float(path_cost)
+        + float(config.replay_nis_weight) * replay_nis_sum
+        + float(config.replay_rejection_cost) * rejected_rows
+        + float(config.replay_roughness_weight) * roughness
+    )
+    return {
+        "path_cost": float(path_cost),
+        "objective": float(objective),
+        "replay_nis_sum": float(replay_nis_sum),
+        "replay_rejected_rows": float(rejected_rows),
+        "replay_roughness": float(roughness),
+    }
+
+
+def _annotate_replay_objective_rows(
+    rows: list[pd.Series],
+    terms: Mapping[str, float],
+    path_rank: int,
+) -> list[pd.Series]:
+    annotated: list[pd.Series] = []
+    for row in rows:
+        out = row.copy()
+        out["association_viterbi_path_rank"] = int(path_rank)
+        out["association_viterbi_replay_objective"] = float(terms["objective"])
+        out["association_viterbi_replay_nis_sum"] = float(terms["replay_nis_sum"])
+        out["association_viterbi_replay_rejected_rows"] = float(terms["replay_rejected_rows"])
+        out["association_viterbi_replay_roughness"] = float(terms["replay_roughness"])
+        annotated.append(out)
+    return annotated
+
+
+def _sum_replay_nis(rows: Iterable[pd.Series]) -> float:
+    values = [_optional_float(row.get("association_replay_nis")) for row in rows]
+    finite = [value for value in values if value is not None]
+    return float(np.sum(finite)) if finite else 0.0
+
+
+def _count_replay_rejections(rows: Iterable[pd.Series]) -> int:
+    rejected = 0
+    for row in rows:
+        value = row.get("association_replay_accepted")
+        if value is not None and not bool(value):
+            rejected += 1
+    return rejected
+
+
+def _trajectory_roughness_cost(records: list[dict[str, object]]) -> float:
+    states: list[np.ndarray] = []
+    times: list[float] = []
+    for record in records:
+        time_s = _optional_float(record.get("time_s"))
+        state = record.get("state")
+        if time_s is None or state is None:
+            continue
+        state_array = np.asarray(state, dtype=float).reshape(-1)
+        if state_array.size < 6 or not np.isfinite(state_array[:6]).all():
+            continue
+        times.append(float(time_s))
+        states.append(state_array[:6])
+    if len(states) < 3:
+        return 0.0
+    order = np.argsort(np.asarray(times, dtype=float))
+    ordered_times = np.asarray(times, dtype=float)[order]
+    ordered_states = np.vstack(states)[order]
+    dt = np.diff(ordered_times)
+    valid = dt > 1.0e-6
+    if not np.any(valid):
+        return 0.0
+    velocity = ordered_states[:, 3:6]
+    acceleration = (velocity[1:] - velocity[:-1])[valid] / dt[valid, None]
+    if acceleration.size == 0:
+        return 0.0
+    return float(np.mean(np.sum(acceleration**2, axis=1)))
+
+
 def _replay_selected_tracklet_path_with_replay(
     *,
     events: list[dict[str, object]],
@@ -246,6 +449,7 @@ def _replay_selected_tracklet_path_with_replay(
     robust_update_by_source: Mapping[str, str | None] | None,
     inflation_alpha_by_source: Mapping[str, float] | None,
     max_residual_norms_by_source: Mapping[str, float | None] | None,
+    tracker_factory: Callable[..., Any] | None = None,
 ) -> tuple[list[dict[str, object]], list[pd.Series], list[pd.Series]]:
     from raft_uav.baselines.radar_association import (
         _gate_threshold_for_measurement,
@@ -257,7 +461,8 @@ def _replay_selected_tracklet_path_with_replay(
     )
 
     selected_by_key = {_selected_row_event_key(row): row for row in selected_rows}
-    tracker = AsyncConstantVelocityKalmanTracker(
+    tracker = _make_tracker(
+        tracker_factory,
         initial_position=initial_measurement.vector,
         initial_time_s=initial_measurement.time_s,
         acceleration_std_mps2=acceleration_std_mps2,
@@ -369,6 +574,23 @@ def _empty_replayed_rows(frame: pd.DataFrame) -> pd.DataFrame:
     return replayed
 
 
+def _make_tracker(
+    tracker_factory: Callable[..., Any] | None,
+    *,
+    initial_position: np.ndarray,
+    initial_time_s: float,
+    acceleration_std_mps2: float,
+) -> Any:
+    from raft_uav.baselines.radar_association import _make_tracker as make_tracker
+
+    return make_tracker(
+        tracker_factory,
+        initial_position=initial_position,
+        initial_time_s=initial_time_s,
+        acceleration_std_mps2=acceleration_std_mps2,
+    )
+
+
 def _empty_candidate_ledger(frame: pd.DataFrame) -> pd.DataFrame:
     ledger = frame.iloc[0:0].copy()
     for column in (
@@ -391,6 +613,9 @@ def _empty_candidate_ledger(frame: pd.DataFrame) -> pd.DataFrame:
         "association_reranker_probability",
         "association_reranker_logit",
         "association_viterbi_path_cost",
+        "association_viterbi_path_rank",
+        "association_viterbi_replay_objective",
+        "association_viterbi_replay_rejected_rows",
     ):
         if column not in ledger.columns:
             ledger[column] = []

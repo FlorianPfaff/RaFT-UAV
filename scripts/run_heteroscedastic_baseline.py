@@ -16,6 +16,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
 from raft_uav.baselines.kalman import TrackingMeasurement, run_async_cv_baseline  # noqa: E402
+from raft_uav.baselines.radar_association import (  # noqa: E402
+    RADAR_ASSOCIATION_MODES,
+    run_async_cv_baseline_with_radar_association,
+)
 from raft_uav.baselines.smoothing import SMOOTHER_MODES, smooth_tracking_records  # noqa: E402
 from raft_uav.evaluation.metrics import position_errors_m, summarize_errors  # noqa: E402
 from raft_uav.io.aerpaw import (  # noqa: E402
@@ -39,9 +43,19 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, default=Path("outputs/heteroscedastic_baseline"))
     parser.add_argument("--acceleration-std", type=float, default=4.0)
     parser.add_argument(
+        "--radar-association",
+        choices=["catprob", *RADAR_ASSOCIATION_MODES],
+        default="catprob",
+        help=(
+            "radar association mode; learned cov_* columns are preserved "
+            "for association updates"
+        ),
+    )
+    parser.add_argument(
         "--radar-selection",
         choices=["catprob", "truth-gated", "all", "none"],
-        default="catprob",
+        default=None,
+        help="legacy radar row selection; overrides --radar-association when provided",
     )
     parser.add_argument("--radar-catprob-threshold", type=float, default=0.5)
     parser.add_argument("--truth-gate-m", type=float, default=150.0)
@@ -62,13 +76,17 @@ def main() -> int:
     radar = pd.DataFrame()
     selected_radar = pd.DataFrame()
     measurements: list[TrackingMeasurement] = []
+    rf_measurements: list[TrackingMeasurement] = []
+    records: list[dict[str, object]] = []
+    radar_mode = args.radar_selection or args.radar_association
 
     if flight.rf_csv is not None:
         rf = _inside_truth_window(
             normalize_rf(read_rf_csv(flight.rf_csv), projector, truth_origin_time), truth
         )
         rf = model.apply_rf(rf)
-        measurements.extend(_rf_measurements_to_enu(rf))
+        rf_measurements = _rf_measurements_to_enu(rf)
+        measurements.extend(rf_measurements)
 
     if flight.radar_json is not None:
         radar = _inside_truth_window(
@@ -76,17 +94,34 @@ def main() -> int:
             truth,
         )
         radar = model.apply_radar(radar)
-        selected_radar = select_radar_measurement_rows(
-            radar,
-            selection=args.radar_selection,
+
+    if radar_mode in RADAR_ASSOCIATION_MODES:
+        records, selected_radar = run_async_cv_baseline_with_radar_association(
+            rf_measurements=rf_measurements,
+            radar=radar,
+            association=radar_mode,
             truth=truth,
-            catprob_threshold=args.radar_catprob_threshold,
+            acceleration_std_mps2=args.acceleration_std,
+            candidate_catprob_threshold=args.radar_catprob_threshold,
             truth_gate_m=args.truth_gate_m,
             truth_time_gate_s=args.truth_time_gate_s,
         )
-        measurements.extend(_radar_measurements_to_enu(selected_radar))
-
-    records = run_async_cv_baseline(measurements, acceleration_std_mps2=args.acceleration_std)
+        measurements = [*rf_measurements, *_radar_measurements_to_enu(selected_radar)]
+    else:
+        if not radar.empty:
+            selected_radar = select_radar_measurement_rows(
+                radar,
+                selection=radar_mode,
+                truth=truth,
+                catprob_threshold=args.radar_catprob_threshold,
+                truth_gate_m=args.truth_gate_m,
+                truth_time_gate_s=args.truth_time_gate_s,
+            )
+            measurements.extend(_radar_measurements_to_enu(selected_radar))
+        records = run_async_cv_baseline(
+            measurements,
+            acceleration_std_mps2=args.acceleration_std,
+        )
     if not records:
         raise RuntimeError(f"{flight.name} produced no heteroscedastic baseline records")
     records = smooth_tracking_records(
@@ -105,6 +140,7 @@ def main() -> int:
         selected_radar=selected_radar,
         estimate_frame=estimate_frame,
         uncertainty_model=args.uncertainty_model,
+        radar_association=radar_mode,
         max_eval_time_delta_s=args.max_eval_time_delta_s,
         acceleration_std=args.acceleration_std,
         smoother=args.smoother,
@@ -123,6 +159,7 @@ def main() -> int:
     print(f"posterior_records={len(records)}")
     print(f"rf_rows={len(rf)}")
     print(f"radar_rows={len(radar)}")
+    print(f"radar_association={radar_mode}")
     print(f"selected_radar_rows={len(selected_radar)}")
     print(f"metrics_json={output_dir / 'metrics.json'}")
     print(f"rmse_2d_m={metrics['position_error_2d']['rmse_m']:.3f}")
@@ -173,6 +210,11 @@ def _records_to_frame(records: list[dict[str, object]]) -> pd.DataFrame:
             {
                 "time_s": float(record["time_s"]),
                 "source": str(record["source"]),
+                "track_id": _optional_int(record.get("track_id")),
+                "association_mode": _optional_str(record.get("association_mode")),
+                "association_nis": _optional_float(record.get("association_nis")),
+                "association_score": _optional_float(record.get("association_score")),
+                "hypothesis_count": _optional_int(record.get("hypothesis_count")),
                 "east_m": state[0],
                 "north_m": state[1],
                 "up_m": state[2],
@@ -198,6 +240,7 @@ def _metrics(
     selected_radar: pd.DataFrame,
     estimate_frame: pd.DataFrame,
     uncertainty_model: Path,
+    radar_association: str,
     max_eval_time_delta_s: float,
     acceleration_std: float,
     smoother: str,
@@ -213,6 +256,7 @@ def _metrics(
         "uncertainty_model": str(uncertainty_model),
         "state": ["east", "north", "up", "v_east", "v_north", "v_up"],
         "acceleration_std_mps2": float(acceleration_std),
+        "radar_association": str(radar_association),
         "rf_covariance": "heteroscedastic learned cov_* columns",
         "radar_covariance": "heteroscedastic learned cov_* columns",
         "smoother": {
@@ -263,6 +307,22 @@ def _positive_float(value: object) -> float | None:
     except (TypeError, ValueError):
         return None
     return number if np.isfinite(number) and number > 0.0 else None
+
+
+def _optional_int(value: object) -> int | None:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return int(number) if np.isfinite(number) else None
+
+
+def _optional_str(value: object) -> str | None:
+    if value is None:
+        return None
+    return str(value)
 
 
 def _optional_float(value: object) -> float | None:

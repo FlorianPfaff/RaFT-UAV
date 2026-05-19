@@ -53,5 +53,20 @@ def test_async_cv_baseline_returns_one_record_per_measurement():
     records = run_async_cv_baseline(measurements)
 
     assert len(records) == 2
+    assert records[0]["update_action"] == "bootstrap"
     assert records[-1]["source"] == "radar"
     assert np.asarray(records[-1]["state"]).shape == (6,)
+
+
+def test_async_cv_baseline_does_not_update_bootstrap_measurement():
+    covariance = np.diag([10.0, 10.0, 10.0])
+    measurement = TrackingMeasurement(0.0, np.array([0.0, 0.0, 0.0]), covariance, "radar")
+
+    records = run_async_cv_baseline([measurement])
+
+    assert len(records) == 1
+    assert records[0]["update_action"] == "bootstrap"
+    np.testing.assert_allclose(
+        np.diag(np.asarray(records[0]["covariance"], dtype=float))[:3],
+        np.full(3, 50.0**2),
+    )

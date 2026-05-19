@@ -27,6 +27,7 @@ from raft_uav.baselines.update_logic import (
 __all__ = [
     "AsyncConstantVelocityKalmanTracker",
     "RadarPolarMeasurement",
+    "bootstrap_tracking_diagnostics",
     "TrackingMeasurement",
     "TrackingUpdateDiagnostics",
     "constant_velocity_matrix",
@@ -130,6 +131,31 @@ class TrackingUpdateDiagnostics:
         """Return a JSON/CSV-friendly representation."""
 
         return asdict(self)
+
+
+def bootstrap_tracking_diagnostics(measurement: TrackingMeasurement) -> TrackingUpdateDiagnostics:
+    """Return diagnostics for a measurement used only as the initial prior.
+
+    Baseline runners initialize the tracker state from the first available
+    measurement.  That bootstrap measurement must not also be replayed as a
+    Kalman update at the same timestamp, otherwise the first observation is
+    counted twice and the initial posterior covariance is spuriously tightened.
+    """
+
+    return TrackingUpdateDiagnostics(
+        time_s=float(measurement.time_s),
+        source=measurement.source,
+        measurement_dim=measurement.vector.size,
+        accepted=True,
+        update_action="bootstrap",
+        nis=float("nan"),
+        gate_threshold=None,
+        safety_gate_threshold=None,
+        residual_gate_threshold_m=None,
+        covariance_scale=1.0,
+        inflation_alpha=None,
+        residual_norm_m=float("nan"),
+    )
 
 
 def constant_velocity_matrix(dt_s: float) -> np.ndarray:
@@ -549,8 +575,18 @@ def run_async_cv_baseline(
         acceleration_std_mps2=acceleration_std_mps2,
     )
 
-    records: list[dict[str, object]] = []
-    for measurement in ordered:
+    first = ordered[0]
+    bootstrap_diagnostics = bootstrap_tracking_diagnostics(first)
+    records: list[dict[str, object]] = [
+        {
+            "time_s": first.time_s,
+            "source": first.source,
+            "state": tracker.state.copy(),
+            "covariance": tracker.covariance_matrix.copy(),
+            **bootstrap_diagnostics.to_record(),
+        }
+    ]
+    for measurement in ordered[1:]:
         diagnostics = tracker.update(
             measurement,
             gate_threshold=gate_threshold_for_measurement(

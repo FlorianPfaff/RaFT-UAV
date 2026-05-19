@@ -25,6 +25,14 @@ RADAR_COVARIANCE_COLUMNS = (
     "association_cov_eu",
     "association_cov_nu",
 )
+RAW_RADAR_COVARIANCE_COLUMNS = (
+    "cov_ee",
+    "cov_nn",
+    "cov_uu",
+    "cov_en",
+    "cov_eu",
+    "cov_nu",
+)
 BIAS_RESIDUAL_COVARIANCE_COLUMNS = (
     f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}east_m",
     f"{BIAS_RESIDUAL_STD_COLUMN_PREFIX}north_m",
@@ -244,7 +252,8 @@ def row_radar_covariance(
     """
 
     fallback = None if fallback_covariance is None else np.asarray(fallback_covariance, dtype=float)
-    if not all(column in row for column in RADAR_COVARIANCE_COLUMNS):
+    columns = _available_covariance_columns(row)
+    if columns is None:
         if fallback is None:
             return fallback
         covariance, _ = _add_bias_residual_uncertainty(
@@ -255,7 +264,7 @@ def row_radar_covariance(
         )
         return covariance
     try:
-        ee, nn, uu, en, eu, nu = [float(row[column]) for column in RADAR_COVARIANCE_COLUMNS]
+        ee, nn, uu, en, eu, nu = [float(row[column]) for column in columns]
     except (TypeError, ValueError):
         if fallback is None:
             return fallback
@@ -288,6 +297,13 @@ def row_radar_covariance(
         max_std_m=1.0e9,
     )
     return covariance
+
+
+def _available_covariance_columns(row: pd.Series) -> tuple[str, ...] | None:
+    for columns in (RADAR_COVARIANCE_COLUMNS, RAW_RADAR_COVARIANCE_COLUMNS):
+        if all(column in row.index for column in columns):
+            return columns
+    return None
 
 
 def candidate_radar_covariances(
