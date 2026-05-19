@@ -290,6 +290,7 @@ def main(argv: list[str] | None = None) -> int:
         stable_segment_range_gate_m=800.0,
         stable_segment_interpolation_max_gap_s=5.0,
         stable_segment_interpolation_max_speed_mps=65.0,
+        stable_segment_interpolation_std_scale=2.0,
         smoother=args.smoother,
         smoother_lag_s=args.smoother_lag_s,
         max_eval_time_delta_s=args.max_eval_time_delta_s,

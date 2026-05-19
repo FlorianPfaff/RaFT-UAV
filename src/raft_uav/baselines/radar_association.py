@@ -93,6 +93,7 @@ def run_async_cv_baseline_with_radar_association(
     stable_segment_range_gate_m: float | None = 800.0,
     stable_segment_interpolation_max_gap_s: float | None = 5.0,
     stable_segment_interpolation_max_speed_mps: float | None = 65.0,
+    stable_segment_interpolation_std_scale: float = 2.0,
     truth_gate_m: float = 150.0,
     truth_time_gate_s: float = 1.0,
 ) -> tuple[list[dict[str, object]], pd.DataFrame]:
@@ -164,6 +165,8 @@ def run_async_cv_baseline_with_radar_association(
         and stable_segment_interpolation_max_speed_mps <= 0.0
     ):
         raise ValueError("stable_segment_interpolation_max_speed_mps must be positive or None")
+    if stable_segment_interpolation_std_scale <= 0.0:
+        raise ValueError("stable_segment_interpolation_std_scale must be positive")
 
     covariance = np.diag([float(radar_xy_std_m) ** 2, float(radar_xy_std_m) ** 2, float(radar_z_std_m) ** 2])
     if association == "track-bank":
@@ -207,8 +210,10 @@ def run_async_cv_baseline_with_radar_association(
                 radar,
                 stable_anchors,
                 association_mode=association,
+                base_covariance=covariance,
                 max_gap_s=stable_segment_interpolation_max_gap_s,
                 max_speed_mps=stable_segment_interpolation_max_speed_mps,
+                interpolated_std_scale=stable_segment_interpolation_std_scale,
             )
         stable_anchor_by_key = {
             _radar_row_key(row): row for _, row in stable_anchors.iterrows()
@@ -856,8 +861,10 @@ def _interpolate_stable_radar_segments_to_frame_times(
     anchors: pd.DataFrame,
     *,
     association_mode: str,
+    base_covariance: np.ndarray,
     max_gap_s: float | None,
     max_speed_mps: float | None,
+    interpolated_std_scale: float,
 ) -> pd.DataFrame:
     """Interpolate clean stable-segment anchors onto radar frame timestamps."""
 
@@ -922,6 +929,10 @@ def _interpolate_stable_radar_segments_to_frame_times(
         metadata["association_interpolation_max_gap_s"] = float(max_gap_s)
     if max_speed_mps is not None:
         metadata["association_interpolation_max_speed_mps"] = float(max_speed_mps)
+    interpolated_covariance = _scaled_covariance_columns(
+        base_covariance,
+        std_scale=interpolated_std_scale,
+    )
 
     interpolated_rows: list[pd.Series] = []
     modal_track_id = _modal_track_id(ordered_anchors)
@@ -937,6 +948,9 @@ def _interpolate_stable_radar_segments_to_frame_times(
             )
             row["association_interpolated"] = True
             row["association_action"] = "stable_segment_interpolated_anchor"
+            row["association_interpolation_std_scale"] = float(interpolated_std_scale)
+            for name, value in interpolated_covariance.items():
+                row[name] = value
         else:
             row = anchor.copy()
             row["association_interpolated"] = False
@@ -987,6 +1001,24 @@ def _interpolated_radar_row(
     if modal_track_id is not None:
         row["track_id"] = modal_track_id
     return row
+
+
+def _scaled_covariance_columns(
+    covariance: np.ndarray,
+    *,
+    std_scale: float,
+) -> dict[str, float]:
+    scaled = np.asarray(covariance, dtype=float).reshape(3, 3) * float(std_scale) ** 2
+    return {
+        "association_cov_ee": float(scaled[0, 0]),
+        "association_cov_nn": float(scaled[1, 1]),
+        "association_cov_uu": float(scaled[2, 2]),
+        "association_cov_en": float(scaled[0, 1]),
+        "association_cov_eu": float(scaled[0, 2]),
+        "association_cov_nu": float(scaled[1, 2]),
+        "association_covariance_mode": "stable-segment-interpolation",
+        "association_cov_trace_m2": float(np.trace(scaled)),
+    }
 
 
 def _modal_track_id(anchors: pd.DataFrame) -> int | None:
@@ -1717,6 +1749,15 @@ def _empty_selected_radar(radar: pd.DataFrame) -> pd.DataFrame:
         "association_interpolated",
         "association_anchor_count",
         "association_interpolation_dropped_frame_count",
+        "association_interpolation_std_scale",
+        "association_cov_ee",
+        "association_cov_nn",
+        "association_cov_uu",
+        "association_cov_en",
+        "association_cov_eu",
+        "association_cov_nu",
+        "association_covariance_mode",
+        "association_cov_trace_m2",
     ):
         selected[column] = []
     return selected
