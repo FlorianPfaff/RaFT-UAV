@@ -20,6 +20,8 @@ from raft_uav.baselines.smoothing import SMOOTHER_MODES, smooth_tracking_records
 from raft_uav.evaluation.diagnostics import build_diagnostic_summary
 from raft_uav.evaluation.metrics import position_errors_m, summarize_errors
 from raft_uav.io.aerpaw import (
+    DEFAULT_RADAR_CLOCK_OFFSET_S,
+    DEFAULT_RF_CLOCK_OFFSET_S,
     discover_flights,
     normalize_radar,
     normalize_rf,
@@ -35,6 +37,29 @@ from raft_uav.io.aerpaw import (
 )
 
 
+def _add_clock_offset_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add explicit sensor-clock controls to commands that normalize AERPAW data."""
+
+    parser.add_argument(
+        "--rf-clock-offset-s",
+        type=float,
+        default=DEFAULT_RF_CLOCK_OFFSET_S,
+        help=(
+            "seconds added to RF sensor timestamps before truth-relative normalization "
+            f"(default: {DEFAULT_RF_CLOCK_OFFSET_S:g})"
+        ),
+    )
+    parser.add_argument(
+        "--radar-clock-offset-s",
+        type=float,
+        default=DEFAULT_RADAR_CLOCK_OFFSET_S,
+        help=(
+            "seconds added to Fortem radar globalTime before truth-relative normalization "
+            f"(default: {DEFAULT_RADAR_CLOCK_OFFSET_S:g})"
+        ),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="raft-uav")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -46,6 +71,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         help="inspect only this flight; can be passed multiple times",
     )
+    _add_clock_offset_arguments(inspect_parser)
 
     baseline_parser = subparsers.add_parser(
         "run-baseline", help="run the initial CV fusion baseline"
@@ -54,6 +80,7 @@ def main(argv: list[str] | None = None) -> int:
     baseline_parser.add_argument("--flight", required=True)
     baseline_parser.add_argument("--output-dir", type=Path, default=Path("outputs/baseline"))
     baseline_parser.add_argument("--acceleration-std", type=float, default=4.0)
+    _add_clock_offset_arguments(baseline_parser)
     baseline_parser.add_argument(
         "--radar-association",
         choices=["catprob", *RADAR_ASSOCIATION_MODES],
@@ -204,13 +231,20 @@ def main(argv: list[str] | None = None) -> int:
 
     args = parser.parse_args(argv)
     if args.command == "inspect":
-        return _inspect(args.dataset_root, args.flight)
+        return _inspect(
+            args.dataset_root,
+            args.flight,
+            args.rf_clock_offset_s,
+            args.radar_clock_offset_s,
+        )
     if args.command == "run-baseline":
         return _run_baseline(
             args.dataset_root,
             args.flight,
             args.output_dir,
             args.acceleration_std,
+            args.rf_clock_offset_s,
+            args.radar_clock_offset_s,
             args.radar_association,
             args.radar_selection,
             args.radar_catprob_threshold,
@@ -248,7 +282,12 @@ def main(argv: list[str] | None = None) -> int:
     raise ValueError(args.command)
 
 
-def _inspect(dataset_root: Path, requested_flights: list[str] | None) -> int:
+def _inspect(
+    dataset_root: Path,
+    requested_flights: list[str] | None,
+    rf_clock_offset_s: float,
+    radar_clock_offset_s: float,
+) -> int:
     if requested_flights:
         flights = [select_flight(dataset_root, name) for name in requested_flights]
         discovered_count = len(discover_flights(dataset_root))
@@ -258,7 +297,11 @@ def _inspect(dataset_root: Path, requested_flights: list[str] | None) -> int:
 
     print(f"discovered_flights={discovered_count}")
     for flight in flights:
-        summary = summarize_flight_schema(flight)
+        summary = summarize_flight_schema(
+            flight,
+            rf_clock_offset_s=rf_clock_offset_s,
+            radar_clock_offset_s=radar_clock_offset_s,
+        )
         print(f"\nflight={summary['flight']}")
         for modality in ("truth", "rf", "radar"):
             _print_modality_summary(modality, summary.get(modality))
@@ -270,6 +313,8 @@ def _run_baseline(
     flight_name: str,
     output_dir: Path,
     acceleration_std: float,
+    rf_clock_offset_s: float,
+    radar_clock_offset_s: float,
     radar_association: str,
     legacy_radar_selection: str | None,
     radar_catprob_threshold: float,
@@ -337,14 +382,23 @@ def _run_baseline(
     rf_measurements = []
     if flight.rf_csv is not None:
         rf = _inside_truth_window(
-            normalize_rf(read_rf_csv(flight.rf_csv), projector, truth_origin_time), truth
+            normalize_rf(
+                read_rf_csv(flight.rf_csv),
+                projector,
+                truth_origin_time,
+                clock_offset_s=rf_clock_offset_s,
+            ),
+            truth,
         )
         rf_measurements = rf_measurements_to_enu(rf)
         measurements.extend(rf_measurements)
     if flight.radar_json is not None:
         radar = _inside_truth_window(
             normalize_radar(
-                read_radar_tracks_json(flight.radar_json), projector, truth_origin_time
+                read_radar_tracks_json(flight.radar_json),
+                projector,
+                truth_origin_time,
+                clock_offset_s=radar_clock_offset_s,
             ),
             truth,
         )
@@ -469,6 +523,8 @@ def _run_baseline(
         selected_radar=selected_radar,
         estimate_frame=estimate_frame,
         acceleration_std=acceleration_std,
+        rf_clock_offset_s=rf_clock_offset_s,
+        radar_clock_offset_s=radar_clock_offset_s,
         radar_association=radar_mode,
         radar_catprob_threshold=radar_catprob_threshold,
         truth_gate_m=truth_gate_m,
@@ -524,6 +580,8 @@ def _run_baseline(
     print(f"rf_rows={len(rf)}")
     print(f"radar_rows={len(radar)}")
     print(f"radar_association={radar_mode}")
+    print(f"rf_clock_offset_s={rf_clock_offset_s:g}")
+    print(f"radar_clock_offset_s={radar_clock_offset_s:g}")
     print(f"selected_radar_rows={len(selected_radar)}")
     print(f"selected_radar_track_ids={metrics['selected_radar_track_ids']}")
     print(f"smoother={smoother}")
@@ -616,6 +674,8 @@ def _baseline_metrics(
     selected_radar: pd.DataFrame,
     estimate_frame: pd.DataFrame,
     acceleration_std: float,
+    rf_clock_offset_s: float,
+    radar_clock_offset_s: float,
     radar_association: str,
     radar_catprob_threshold: float,
     truth_gate_m: float,
@@ -699,6 +759,10 @@ def _baseline_metrics(
             "radar": flight.radar_json.name if flight.radar_json else None,
         },
         "state": ["east", "north", "up", "v_east", "v_north", "v_up"],
+        "sensor_clock_offsets_s": {
+            "rf": float(rf_clock_offset_s),
+            "radar": float(radar_clock_offset_s),
+        },
         "acceleration_std_mps2": float(acceleration_std),
         "rf_covariance": "diag(CEP^2, CEP^2), default std 75 m",
         "radar_covariance": "diag(25^2, 25^2, 35^2) m^2",
