@@ -3,11 +3,90 @@
 from __future__ import annotations
 
 import argparse
+from collections.abc import Iterable
 import os
 from typing import Any
 
 RADAR_COVARIANCE_MODES = ("fixed", "range-angle")
 TRACKLET_CATPROB_RETENTION_MODES = ("hard", "soft")
+
+
+_RUNTIME_FLAG_ENV_NAMES: dict[str, tuple[str, ...]] = {
+    "--radar-covariance-mode": ("RAFT_UAV_RADAR_COVARIANCE_MODE",),
+    "--radar-xy-std-m": ("RAFT_UAV_RADAR_XY_STD_M",),
+    "--radar-z-std-m": ("RAFT_UAV_RADAR_Z_STD_M",),
+    "--radar-range-std-m": ("RAFT_UAV_RADAR_RANGE_STD_M",),
+    "--radar-azimuth-std-deg": ("RAFT_UAV_RADAR_AZIMUTH_STD_DEG",),
+    "--radar-elevation-std-deg": ("RAFT_UAV_RADAR_ELEVATION_STD_DEG",),
+    "--radar-covariance-min-std-m": ("RAFT_UAV_RADAR_COVARIANCE_MIN_STD_M",),
+    "--radar-covariance-max-std-m": ("RAFT_UAV_RADAR_COVARIANCE_MAX_STD_M",),
+    "--radar-origin-east-m": ("RAFT_UAV_RADAR_ORIGIN_EAST_M",),
+    "--radar-origin-north-m": ("RAFT_UAV_RADAR_ORIGIN_NORTH_M",),
+    "--radar-origin-up-m": ("RAFT_UAV_RADAR_ORIGIN_UP_M",),
+    "--tracklet-max-candidates": (
+        "RAFT_UAV_TRACKLET_MAX_CANDIDATES",
+        "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_FRAME",
+    ),
+    "--tracklet-missed-detection-cost": (
+        "RAFT_UAV_TRACKLET_MISSED_DETECTION_COST",
+    ),
+    "--tracklet-consecutive-miss-cost": (
+        "RAFT_UAV_TRACKLET_CONSECUTIVE_MISS_COST",
+    ),
+    "--tracklet-track-switch-cost": ("RAFT_UAV_TRACKLET_TRACK_SWITCH_COST",),
+    "--tracklet-missing-track-id-cost": (
+        "RAFT_UAV_TRACKLET_MISSING_TRACK_ID_COST",
+    ),
+    "--tracklet-catprob-weight": ("RAFT_UAV_TRACKLET_CATPROB_WEIGHT",),
+    "--tracklet-anchor-nis-weight": ("RAFT_UAV_TRACKLET_ANCHOR_NIS_WEIGHT",),
+    "--tracklet-transition-nis-weight": (
+        "RAFT_UAV_TRACKLET_TRANSITION_NIS_WEIGHT",
+    ),
+    "--tracklet-velocity-nis-weight": ("RAFT_UAV_TRACKLET_VELOCITY_NIS_WEIGHT",),
+    "--tracklet-transition-position-std-m": (
+        "RAFT_UAV_TRACKLET_TRANSITION_POSITION_STD_M",
+    ),
+    "--tracklet-transition-speed-std-mps": (
+        "RAFT_UAV_TRACKLET_TRANSITION_SPEED_STD_MPS",
+    ),
+    "--tracklet-velocity-std-mps": ("RAFT_UAV_TRACKLET_VELOCITY_STD_MPS",),
+    "--tracklet-max-speed-mps": ("RAFT_UAV_TRACKLET_MAX_SPEED_MPS",),
+    "--tracklet-max-speed-penalty": ("RAFT_UAV_TRACKLET_MAX_SPEED_PENALTY",),
+    "--tracklet-range-gate-m": ("RAFT_UAV_TRACKLET_RANGE_GATE_M",),
+    "--tracklet-range-gate-slack-m": ("RAFT_UAV_TRACKLET_RANGE_GATE_SLACK_M",),
+    "--tracklet-range-penalty": ("RAFT_UAV_TRACKLET_RANGE_PENALTY",),
+    "--disable-tracklet-rf-anchor": ("RAFT_UAV_TRACKLET_USE_RF_ANCHOR",),
+    "--tracklet-catprob-retention-mode": (
+        "RAFT_UAV_TRACKLET_CATPROB_RETENTION_MODE",
+    ),
+    "--tracklet-below-catprob-threshold-penalty": (
+        "RAFT_UAV_TRACKLET_BELOW_CATPROB_THRESHOLD_PENALTY",
+    ),
+    "--tracklet-track-support-weight": ("RAFT_UAV_TRACKLET_SUPPORT_WEIGHT",),
+    "--tracklet-max-track-support-reward": (
+        "RAFT_UAV_TRACKLET_MAX_SUPPORT_REWARD",
+    ),
+    "--tracklet-max-candidate-pool-per-frame": (
+        "RAFT_UAV_TRACKLET_MAX_CANDIDATE_POOL_PER_FRAME",
+    ),
+    "--tracklet-max-candidates-per-track-id": (
+        "RAFT_UAV_TRACKLET_MAX_CANDIDATES_PER_TRACK_ID",
+    ),
+}
+
+
+def runtime_environment_names_from_argv(argv: Iterable[str]) -> set[str]:
+    """Return runtime env vars explicitly controlled by *argv* flags."""
+
+    names: set[str] = set()
+    for token in argv:
+        if token == "--":
+            break
+        if not token.startswith("--"):
+            continue
+        option = token.split("=", 1)[0]
+        names.update(_RUNTIME_FLAG_ENV_NAMES.get(option, ()))
+    return names
 
 
 def add_runtime_configuration_arguments(parser: argparse.ArgumentParser) -> None:
@@ -217,8 +296,17 @@ def runtime_config_from_args(args: argparse.Namespace) -> dict[str, Any]:
     return {"radar_covariance": radar, "tracklet_viterbi": tracklet}
 
 
-def apply_runtime_environment(runtime_config: dict[str, Any]) -> None:
-    """Apply CLI runtime config to the existing RAFT_UAV_* runtime layer."""
+def apply_runtime_environment(
+    runtime_config: dict[str, Any],
+    *,
+    overwrite_existing_env_names: Iterable[str] | None = None,
+) -> None:
+    """Apply CLI runtime config to the existing RAFT_UAV_* runtime layer.
+
+    When ``overwrite_existing_env_names`` is provided, existing environment
+    values are preserved unless their flag was explicitly present in the CLI
+    argv. Missing environment variables are always populated from defaults.
+    """
 
     radar = runtime_config["radar_covariance"]
     tracklet = runtime_config["tracklet_viterbi"]
@@ -270,8 +358,11 @@ def apply_runtime_environment(runtime_config: dict[str, Any]) -> None:
             "max_candidates_per_track_id"
         ],
     }
+    overwrite_all = overwrite_existing_env_names is None
+    overwrite_names = set(overwrite_existing_env_names or ())
     for name, value in mapping.items():
-        os.environ[name] = str(value)
+        if overwrite_all or name in overwrite_names or name not in os.environ:
+            os.environ[name] = str(value)
 
 
 def _range_gate_env_value(tracklet: dict[str, Any]) -> float:

@@ -626,6 +626,75 @@ def test_track_bank_uses_pyrecest_mht_and_records_hypotheses():
     assert selected["track_id"].tolist() == [1]
 
 
+def test_track_bank_bootstrap_respects_catprob_threshold():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 0,
+                "track_id": 1,
+                "time_s": 0.0,
+                "east_m": 0.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.2,
+            },
+            {
+                "frame_index": 0,
+                "track_id": 2,
+                "time_s": 0.0,
+                "east_m": 10.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.3,
+            },
+        ]
+    )
+
+    measurement = _initial_measurement(
+        {"kind": "radar", "time_s": 0.0, "candidates": radar},
+        association="track-bank",
+        covariance=np.diag([25.0**2, 25.0**2, 35.0**2]),
+        candidate_catprob_threshold=0.4,
+        stable_anchor_by_key=None,
+        truth=None,
+        truth_gate_m=150.0,
+        truth_time_gate_s=1.0,
+    )
+
+    assert measurement is None
+
+
+def test_track_bank_does_not_reassimilate_bootstrap_radar_frame():
+    radar = pd.DataFrame(
+        [
+            {
+                "frame_index": 0,
+                "track_id": 7,
+                "time_s": 0.0,
+                "east_m": 10.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+                "cat_prob_uav": 0.9,
+            },
+        ]
+    )
+
+    records, selected = run_async_cv_baseline_with_radar_association(
+        rf_measurements=[],
+        radar=radar,
+        association="track-bank",
+        track_bank_max_hypotheses=4,
+        track_bank_gate_probability=0.999999,
+    )
+
+    assert len(records) == 1
+    assert records[0]["source"] == "radar"
+    assert records[0]["association_mode"] == "track-bank"
+    assert records[0]["update_action"] == "initialized"
+    assert records[0]["nis"] == 0.0
+    assert selected["track_id"].tolist() == [7]
+
+
 def test_stable_segments_updates_only_on_stitched_high_confidence_segments():
     radar = pd.DataFrame(
         [

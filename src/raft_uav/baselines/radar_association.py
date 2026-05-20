@@ -515,8 +515,9 @@ def _run_mht_track_bank(
     if not events:
         return [], _empty_selected_radar(radar)
 
+    initial_event = events[0]
     initial_measurement = _initial_measurement(
-        events[0],
+        initial_event,
         association="track-bank",
         covariance=covariance,
         stable_anchor_by_key=None,
@@ -849,6 +850,31 @@ def _mht_radar_diagnostics(
         covariance_scale=1.0,
         inflation_alpha=None,
         residual_norm_m=float("nan"),
+    )
+
+
+def _mht_bootstrap_diagnostics(
+    measurement: TrackingMeasurement,
+    *,
+    gate_threshold: float | None,
+    safety_gate_threshold: float | None,
+    max_residual_norm: float | None,
+) -> TrackingUpdateDiagnostics:
+    """Return diagnostics for the sample that initialized the MHT track bank."""
+
+    return TrackingUpdateDiagnostics(
+        time_s=float(measurement.time_s),
+        source=measurement.source,
+        measurement_dim=measurement.vector.size,
+        accepted=True,
+        update_action="initialized",
+        nis=0.0,
+        gate_threshold=gate_threshold,
+        safety_gate_threshold=safety_gate_threshold,
+        residual_gate_threshold_m=max_residual_norm,
+        covariance_scale=1.0,
+        inflation_alpha=None,
+        residual_norm_m=0.0,
     )
 
 
@@ -1564,6 +1590,8 @@ def _initial_measurement(
         )
     else:
         candidates = _catprob_candidate_pool(candidates, candidate_catprob_threshold)
+        if candidates.empty:
+            return None
         selected = _highest_catprob(candidates)
     if selected is None:
         return None

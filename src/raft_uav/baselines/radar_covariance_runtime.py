@@ -146,6 +146,7 @@ def _radar_measurements_to_enu_with_candidate_covariance(
     default_z_std_m: float = 35.0,
     default_velocity_std_mps: float = 12.0,
     include_velocity: bool = False,
+    clock_offset_s: float = -4.0 * 60.0 * 60.0,
 ) -> list[Any]:
     from raft_uav.baselines.kalman import TrackingMeasurement
     from raft_uav.io import aerpaw
@@ -154,7 +155,12 @@ def _radar_measurements_to_enu_with_candidate_covariance(
     if "east_m" not in frame.columns:
         if projector is None or truth_origin_time is None:
             raise ValueError("raw radar rows require projector and truth_origin_time")
-        frame = aerpaw.normalize_radar(frame, projector, truth_origin_time)
+        frame = aerpaw.normalize_radar(
+            frame,
+            projector,
+            truth_origin_time,
+            clock_offset_s=clock_offset_s,
+        )
 
     fallback_position_covariance = fixed_radar_covariance(default_xy_std_m, default_z_std_m)
     measurements: list[TrackingMeasurement] = []

@@ -13,7 +13,11 @@ import json
 from pathlib import Path
 from typing import Any
 
-from raft_uav.runtime_cli_config import apply_runtime_environment, parse_runtime_config
+from raft_uav.runtime_cli_config import (
+    apply_runtime_environment,
+    parse_runtime_config,
+    runtime_environment_names_from_argv,
+)
 
 _INSTALLED = False
 _ORIGINAL_MAIN: Any = None
@@ -48,7 +52,11 @@ def _main_with_runtime_config(argv: list[str] | None = None) -> int:
         return _ORIGINAL_MAIN(argv)
 
     runtime_config, remaining = parse_runtime_config(original_argv)
-    apply_runtime_environment(runtime_config)
+    explicit_env_names = runtime_environment_names_from_argv(original_argv)
+    apply_runtime_environment(
+        runtime_config,
+        overwrite_existing_env_names=explicit_env_names,
+    )
     _CURRENT_RUNTIME_CONFIG = runtime_config
     try:
         return _ORIGINAL_MAIN(remaining if argv is not None else remaining)

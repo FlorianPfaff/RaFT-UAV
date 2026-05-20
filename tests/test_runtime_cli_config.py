@@ -9,6 +9,7 @@ from raft_uav.runtime_cli_config import (
     add_runtime_configuration_arguments,
     apply_runtime_environment,
     parse_runtime_config,
+    runtime_environment_names_from_argv,
     runtime_config_from_args,
 )
 
@@ -101,6 +102,20 @@ def test_parse_runtime_config_preserves_standard_cli_arguments():
     assert config["radar_covariance"]["mode"] == "fixed"
 
 
+def test_parse_runtime_config_accepts_zero_per_track_candidate_limit():
+    config, remaining = parse_runtime_config(
+        [
+            "run-baseline",
+            "/data/aerpaw",
+            "--tracklet-max-candidates-per-track-id",
+            "0",
+        ]
+    )
+
+    assert remaining == ["run-baseline", "/data/aerpaw"]
+    assert config["tracklet_viterbi"]["max_candidates_per_track_id"] == 0
+
+
 def test_tracklet_wrapper_leaves_runtime_owned_tracklet_arguments_for_runtime_parser():
     raw_argv = [
         "run-baseline",
@@ -138,6 +153,40 @@ def test_tracklet_wrapper_leaves_runtime_owned_tracklet_arguments_for_runtime_pa
     assert config["tracklet_viterbi"]["track_support_weight"] == 0.9
     assert config["tracklet_viterbi"]["max_candidates"] == 11
     assert config["tracklet_viterbi"]["max_candidate_pool_per_frame"] == 32
+
+
+def test_apply_runtime_environment_preserves_stripped_wrapper_env(monkeypatch):
+    monkeypatch.setenv("RAFT_UAV_TRACKLET_CATPROB_RETENTION_MODE", "hard")
+    monkeypatch.setenv("RAFT_UAV_TRACKLET_SUPPORT_WEIGHT", "0.9")
+    argv = ["run-baseline", "/data/aerpaw"]
+    config, _ = parse_runtime_config(argv)
+
+    apply_runtime_environment(
+        config,
+        overwrite_existing_env_names=runtime_environment_names_from_argv(argv),
+    )
+
+    assert os.environ["RAFT_UAV_TRACKLET_CATPROB_RETENTION_MODE"] == "hard"
+    assert os.environ["RAFT_UAV_TRACKLET_SUPPORT_WEIGHT"] == "0.9"
+    assert os.environ["RAFT_UAV_TRACKLET_BELOW_CATPROB_THRESHOLD_PENALTY"] == "3.0"
+
+
+def test_apply_runtime_environment_overwrites_explicit_runtime_flags(monkeypatch):
+    monkeypatch.setenv("RAFT_UAV_TRACKLET_CATPROB_RETENTION_MODE", "hard")
+    argv = [
+        "run-baseline",
+        "/data/aerpaw",
+        "--tracklet-catprob-retention-mode",
+        "soft",
+    ]
+    config, _ = parse_runtime_config(argv)
+
+    apply_runtime_environment(
+        config,
+        overwrite_existing_env_names=runtime_environment_names_from_argv(argv),
+    )
+
+    assert os.environ["RAFT_UAV_TRACKLET_CATPROB_RETENTION_MODE"] == "soft"
 
 
 def test_apply_runtime_environment_sets_expected_variables(monkeypatch):

@@ -1,7 +1,6 @@
 import json
 
 import numpy as np
-import pytest
 
 from raft_uav.coordinates import LocalENUProjector
 from raft_uav.io.aerpaw import (
@@ -114,7 +113,7 @@ def test_rf_and_radar_clock_offsets_are_independent(tmp_path):
     )
 
 
-def test_radar_jsonl_reader_rejects_non_object_frames(tmp_path):
+def test_radar_jsonl_reader_skips_non_object_frames(tmp_path):
     radar_path = tmp_path / "radar.json"
     radar_path.write_text(
         "\n".join(
@@ -126,16 +125,14 @@ def test_radar_jsonl_reader_rejects_non_object_frames(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="expected radar JSON object on line 2"):
-        read_radar_tracks_json(radar_path)
+    assert read_radar_tracks_json(radar_path).empty
 
 
-def test_radar_jsonl_reader_rejects_non_object_payload(tmp_path):
+def test_radar_jsonl_reader_skips_non_object_payload(tmp_path):
     radar_path = tmp_path / "radar.json"
     radar_path.write_text(json.dumps([]), encoding="utf-8")
 
-    with pytest.raises(ValueError, match="expected radar JSON object on line 1"):
-        read_radar_tracks_json(radar_path)
+    assert read_radar_tracks_json(radar_path).empty
 
 
 def test_radar_jsonl_reader_and_catprob_selection(tmp_path):
@@ -186,3 +183,35 @@ def test_radar_jsonl_reader_and_catprob_selection(tmp_path):
     assert selected["track_id"].tolist() == [1]
     assert selected_all["track_id"].tolist() == [1, 3]
     assert len(truth) == 1
+
+
+def test_radar_jsonl_reader_skips_malformed_records(tmp_path):
+    radar_path = tmp_path / "radar.json"
+    frames = [
+        [],
+        {"params": ["not", "a", "mapping"], "trackData": "not-a-list"},
+        {
+            "params": {"globalTime": 123.0},
+            "trackData": [
+                None,
+                "not-a-track",
+                {
+                    "id": 7,
+                    "lla": [35.72749, -78.69621, 30.0],
+                    "catProb": [0.9, 0.1],
+                },
+            ],
+        },
+    ]
+    radar_path.write_text(
+        "\n".join(json.dumps(frame) for frame in frames),
+        encoding="utf-8",
+    )
+
+    radar = read_radar_tracks_json(radar_path)
+
+    assert len(radar) == 1
+    row = radar.iloc[0]
+    assert row["track_id"] == 7
+    assert row["global_time_raw_s"] == 123.0
+    assert row["cat_prob_uav"] == 0.9
