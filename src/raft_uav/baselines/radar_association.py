@@ -994,7 +994,11 @@ def _select_stable_radar_segments(
     """Select stitched high-confidence Fortem track segments for sparse updates."""
 
     pool = _range_candidate_pool(radar, range_gate_m)
-    pool = _catprob_candidate_pool(pool, catprob_threshold)
+    pool = _catprob_candidate_pool(
+        pool,
+        catprob_threshold,
+        fallback_to_unfiltered=False,
+    )
     if pool.empty or "track_id" not in pool.columns:
         return _empty_selected_radar(radar)
 
@@ -1724,11 +1728,15 @@ def _select_radar_candidate(
     if association != "track-continuity":
         raise ValueError(f"unknown radar association mode {association!r}")
 
-    current = scored.loc[scored["track_id"] == current_track_id]
+    if "track_id" not in scored.columns:
+        return best
+    current = scored.loc[
+        scored["track_id"].map(lambda value: _track_id_equals(value, current_track_id))
+    ]
     if current.empty:
         return best
     current_best = current.loc[current["association_nis"].idxmin()].copy()
-    if int(best["track_id"]) == current_track_id:
+    if _optional_track_id(best) == current_track_id:
         return best
     if float(best["association_nis"]) < float(current_best["association_nis"]) * float(
         track_switch_nis_ratio
@@ -1770,15 +1778,28 @@ def _oracle_nearest_truth(
 def _catprob_candidate_pool(
     candidates: pd.DataFrame,
     candidate_catprob_threshold: float | None,
+    *,
+    fallback_to_unfiltered: bool = True,
 ) -> pd.DataFrame:
     if candidate_catprob_threshold is None or "cat_prob_uav" not in candidates.columns:
         return candidates
     catprob = pd.to_numeric(candidates["cat_prob_uav"], errors="coerce")
     threshold = float(candidate_catprob_threshold)
     keep = catprob >= threshold
-    pool = candidates.loc[keep].copy()
+    fallback = bool(fallback_to_unfiltered and not candidates.empty and not bool(keep.any()))
+    if fallback:
+        # A hard class-probability cut must not turn the whole radar frame into
+        # a missed detection. When no candidate reaches the threshold, retain
+        # the unfiltered frame and let downstream geometry/temporal scoring
+        # decide, while recording that the catProb gate was bypassed.
+        pool = candidates.copy()
+    else:
+        pool = candidates.loc[keep].copy()
     pool["association_catprob_threshold"] = threshold
-    pool["association_catprob_fallback"] = False
+    pool["association_catprob_fallback"] = fallback
+    pool["association_catprob_candidate_rows"] = int(len(candidates))
+    if fallback:
+        pool["association_catprob_fallback_reason"] = "all_candidates_below_threshold"
     return pool
 
 
@@ -2395,11 +2416,27 @@ def _empty_selected_radar(radar: pd.DataFrame) -> pd.DataFrame:
     return selected
 
 
+def _track_id_equals(value: object, track_id: int) -> bool:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return False
+    if not np.isfinite(numeric):
+        return False
+    return int(numeric) == int(track_id)
+
+
 def _optional_track_id(row: pd.Series) -> int | None:
     value = row.get("track_id")
-    if value is None or not np.isfinite(float(value)):
+    if value is None:
         return None
-    return int(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not np.isfinite(numeric):
+        return None
+    return int(numeric)
 
 
 def _optional_float(value: object) -> float | None:

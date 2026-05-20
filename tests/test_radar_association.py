@@ -138,7 +138,7 @@ def test_catprob_candidate_pool_filters_when_possible():
     assert pool["association_catprob_fallback"].tolist() == [False]
 
 
-def test_catprob_candidate_pool_returns_empty_when_threshold_empty():
+def test_catprob_candidate_pool_falls_back_to_unfiltered_candidates_when_threshold_empty():
     candidates = pd.DataFrame(
         {
             "track_id": [1, 2],
@@ -151,9 +151,14 @@ def test_catprob_candidate_pool_returns_empty_when_threshold_empty():
 
     pool = _catprob_candidate_pool(candidates, 0.4)
 
-    assert pool.empty
-    assert "association_catprob_threshold" in pool.columns
-    assert "association_catprob_fallback" in pool.columns
+    assert pool["track_id"].tolist() == [1, 2]
+    assert pool["association_catprob_threshold"].tolist() == [0.4, 0.4]
+    assert pool["association_catprob_fallback"].tolist() == [True, True]
+    assert pool["association_catprob_candidate_rows"].tolist() == [2, 2]
+    assert pool["association_catprob_fallback_reason"].tolist() == [
+        "all_candidates_below_threshold",
+        "all_candidates_below_threshold",
+    ]
 
 
 def test_initial_radar_measurement_respects_catprob_threshold():
@@ -193,7 +198,7 @@ def test_initial_radar_measurement_respects_catprob_threshold():
     assert measurement is None
 
 
-def test_prediction_nis_treats_empty_catprob_pool_as_no_radar_selection():
+def test_prediction_nis_uses_geometry_when_all_catprob_candidates_are_below_threshold():
     radar = pd.DataFrame(
         [
             {
@@ -209,7 +214,7 @@ def test_prediction_nis_treats_empty_catprob_pool_as_no_radar_selection():
                 "frame_index": 0,
                 "track_id": 2,
                 "time_s": 2.0,
-                "east_m": 3.0,
+                "east_m": 100.0,
                 "north_m": 0.0,
                 "up_m": 0.0,
                 "cat_prob_uav": 0.3,
@@ -224,8 +229,12 @@ def test_prediction_nis_treats_empty_catprob_pool_as_no_radar_selection():
         candidate_catprob_threshold=0.4,
     )
 
-    assert [record["source"] for record in records] == ["rf", "rf"]
-    assert selected.empty
+    assert [record["source"] for record in records] == ["rf", "rf", "radar"]
+    assert selected["track_id"].tolist() == [1]
+    assert selected["association_catprob_fallback"].tolist() == [True]
+    assert selected["association_catprob_fallback_reason"].tolist() == [
+        "all_candidates_below_threshold"
+    ]
 
 
 def test_initial_radar_measurement_respects_catprob_threshold():
@@ -284,6 +293,98 @@ def test_track_continuity_keeps_current_track_for_small_nis_gain():
                 "track_id": 2,
                 "time_s": 0.0,
                 "east_m": 1.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+            },
+        ]
+    )
+
+    selected = _select_radar_candidate(
+        candidates,
+        association="track-continuity",
+        tracker=tracker,
+        covariance=np.diag([25.0**2, 25.0**2, 35.0**2]),
+        truth=None,
+        current_track_id=1,
+        track_switch_nis_ratio=0.5,
+        candidate_catprob_threshold=None,
+        geometry_velocity_std_mps=12.0,
+        geometry_velocity_weight=0.25,
+        geometry_switch_penalty=4.0,
+        geometry_catprob_weight=2.0,
+        pda_nis_temperature=1.0,
+        pda_catprob_exponent=1.0,
+        truth_gate_m=150.0,
+        truth_time_gate_s=1.0,
+    )
+
+    assert selected is not None
+    assert int(selected["track_id"]) == 1
+
+
+def test_track_continuity_without_track_id_falls_back_to_prediction_nis():
+    tracker = AsyncConstantVelocityKalmanTracker(
+        initial_position=np.zeros(3),
+        initial_time_s=0.0,
+    )
+    candidates = pd.DataFrame(
+        [
+            {
+                "time_s": 0.0,
+                "east_m": 1.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+            },
+            {
+                "time_s": 0.0,
+                "east_m": 10.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+            },
+        ]
+    )
+
+    selected = _select_radar_candidate(
+        candidates,
+        association="track-continuity",
+        tracker=tracker,
+        covariance=np.diag([25.0**2, 25.0**2, 35.0**2]),
+        truth=None,
+        current_track_id=1,
+        track_switch_nis_ratio=0.5,
+        candidate_catprob_threshold=None,
+        geometry_velocity_std_mps=12.0,
+        geometry_velocity_weight=0.25,
+        geometry_switch_penalty=4.0,
+        geometry_catprob_weight=2.0,
+        pda_nis_temperature=1.0,
+        pda_catprob_exponent=1.0,
+        truth_gate_m=150.0,
+        truth_time_gate_s=1.0,
+    )
+
+    assert selected is not None
+    assert selected["east_m"] == 1.0
+
+
+def test_track_continuity_ignores_malformed_track_ids_when_matching_current_track():
+    tracker = AsyncConstantVelocityKalmanTracker(
+        initial_position=np.zeros(3),
+        initial_time_s=0.0,
+    )
+    candidates = pd.DataFrame(
+        [
+            {
+                "track_id": "not-a-number",
+                "time_s": 0.0,
+                "east_m": 1.0,
+                "north_m": 0.0,
+                "up_m": 0.0,
+            },
+            {
+                "track_id": 1,
+                "time_s": 0.0,
+                "east_m": 1.1,
                 "north_m": 0.0,
                 "up_m": 0.0,
             },
