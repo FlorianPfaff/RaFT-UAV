@@ -89,3 +89,29 @@ these to leaderboards so RMSE cannot hide unstable identity behavior.
 hypotheses and candidate-position fusion with spread covariance.  It is a
 building block for preserving top-K ambiguity rather than forcing a single hard
 association whenever candidates are nearly tied.
+
+## Integrated result-improvement suite
+
+Use `raft-uav-result-improvement-suite` when building result-oriented runs.  It
+connects the leakage-safe pieces above into one auditable workflow:
+
+1. LOFO RF/radar time-offset calibration.
+2. LOFO range-angle radar covariance tuning.
+3. Nested LOFO tuning for hand-set association/tracker constants.
+4. Leave-flight-out SOTA evaluation with the current tracklet/IMM,
+   learned-tracklet, heteroscedastic, and calibrated CV rows.
+5. Oracle-gap and confidence diagnostics for every held-out method/flight.
+6. Conservative constrained ranking that can require coverage and identity
+   stability before a method is considered recommendation-eligible.
+
+Example:
+
+```bash
+raft-uav-result-improvement-suite data/raw/AADM2025Dryad \
+  --flights Opt1 Opt2 Opt3 \
+  --skip-existing
+```
+
+The command writes `result_improvement_suite_manifest.json` with the exact
+subcommands and runtime environment so paper-result bundles can reproduce the
+same workflow.

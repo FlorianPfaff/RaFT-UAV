@@ -25,7 +25,6 @@ from raft_uav.baselines.learned_radar_likelihood import (
     radar_association_feature_frame,
 )
 from raft_uav.baselines.radar_association import (
-    _catprob_candidate_pool,
     _empty_selected_radar,
     _events,
     _initial_measurement,
@@ -47,6 +46,14 @@ from raft_uav.baselines.tracklet_viterbi import (
     _row_velocity,
     _selected_rows_from_viterbi_path,
     _transition_cost,
+)
+from raft_uav.baselines.tracklet_viterbi_retention import (
+    _candidate_pool_for_retention,
+    _catprob_threshold_penalty,
+    _retain_top_and_track_representatives,
+    _track_support_by_event_prefix,
+    _track_support_cost,
+    _write_track_support_diagnostics,
 )
 
 
@@ -131,6 +138,7 @@ def run_async_cv_baseline_with_learned_tracklet_viterbi_association(
         config=cfg,
         model=learned_model,
         learned_unary_weight=learned_unary_weight,
+        track_support_by_event=_track_support_by_event_prefix(events),
         hand_unary_weight=hand_unary_weight,
         radar_covariance_fn=radar_covariance_fn,
     )
@@ -162,6 +170,7 @@ def _select_learned_tracklet_viterbi_path(
     model: LearnedRadarAssociationModel,
     learned_unary_weight: float,
     hand_unary_weight: float,
+    track_support_by_event: Mapping[int, Mapping[int, Mapping[str, float]]] | None = None,
     radar_covariance_fn: RadarCovarianceFn | None = None,
 ) -> list[pd.Series]:
     frames = [
@@ -174,6 +183,7 @@ def _select_learned_tracklet_viterbi_path(
             config=config,
             model=model,
             learned_unary_weight=learned_unary_weight,
+            track_support_by_id=(track_support_by_event or {}).get(i, {}),
             hand_unary_weight=hand_unary_weight,
             radar_covariance_fn=radar_covariance_fn,
         )
@@ -235,11 +245,12 @@ def _learned_nodes_for_radar_frame(
     model: LearnedRadarAssociationModel,
     learned_unary_weight: float,
     hand_unary_weight: float,
+    track_support_by_id: Mapping[int, Mapping[str, float]] | None = None,
     radar_covariance_fn: RadarCovarianceFn | None = None,
 ) -> list[_ViterbiNode]:
     time_s = float(candidates["time_s"].median()) if "time_s" in candidates else float("nan")
     event_key = _radar_event_key(candidates)
-    pool = _catprob_candidate_pool(candidates, candidate_catprob_threshold)
+    pool = _candidate_pool_for_retention(candidates, candidate_catprob_threshold, config)
     if pool.empty:
         return [_miss_node(event_index, event_key, time_s)]
 
@@ -261,10 +272,28 @@ def _learned_nodes_for_radar_frame(
             covariance=row_covariance,
             config=config,
         )
-        hand_cost = float(config.anchor_nis_weight) * anchor_nis + catprob_cost + range_cost
+        soft_threshold_cost = _catprob_threshold_penalty(
+            row,
+            candidate_catprob_threshold=candidate_catprob_threshold,
+            config=config,
+        )
+        track_support_cost, track_support = _track_support_cost(
+            row,
+            track_support_by_id=track_support_by_id or {},
+            config=config,
+        )
+        hand_cost = (
+            float(config.anchor_nis_weight) * anchor_nis
+            + catprob_cost
+            + range_cost
+            + soft_threshold_cost
+            + track_support_cost
+        )
         enriched = row.copy()
         enriched["association_nis"] = float(anchor_nis)
         enriched["association_hand_unary_cost"] = float(hand_cost)
+        enriched["association_catprob_soft_penalty"] = float(soft_threshold_cost)
+        _write_track_support_diagnostics(enriched, track_support_cost, track_support)
         scored_rows.append(enriched)
         candidate_terms.append((position, _row_velocity(row), anchor_nis, catprob_cost, range_cost, hand_cost))
 
@@ -281,7 +310,7 @@ def _learned_nodes_for_radar_frame(
     probabilities = np.clip(model.predict_proba_features(features), 1.0e-12, 1.0)
     learned_costs = -np.log(probabilities)
 
-    nodes: list[_ViterbiNode] = []
+    scored_nodes: list[tuple[float, int, _ViterbiNode]] = []
     for row_index, row in scored.iterrows():
         position, velocity, anchor_nis, catprob_cost, range_cost, hand_cost = candidate_terms[row_index]
         learned_cost = float(learned_costs[row_index])
@@ -294,7 +323,7 @@ def _learned_nodes_for_radar_frame(
         selected["association_score"] = unary_cost
         selected["association_learned_unary_weight"] = float(learned_unary_weight)
         selected["association_hand_unary_weight"] = float(hand_unary_weight)
-        nodes.append(
+        node = (
             _ViterbiNode(
                 event_index=event_index,
                 event_key=event_key,
@@ -310,8 +339,9 @@ def _learned_nodes_for_radar_frame(
                 has_anchor=bool(config.use_rf_anchor and anchor is not None),
             )
         )
-    nodes.sort(key=lambda node: node.unary_cost)
-    return nodes[: int(config.max_candidates_per_frame)] + [_miss_node(event_index, event_key, time_s)]
+        scored_nodes.append((float(unary_cost), int(row_index), node))
+    nodes = _retain_top_and_track_representatives(scored_nodes, config)
+    return nodes + [_miss_node(event_index, event_key, time_s)]
 
 
 class _ConfigOverlay:

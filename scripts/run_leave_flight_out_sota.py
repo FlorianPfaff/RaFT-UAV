@@ -24,6 +24,9 @@ from raft_uav.calibration.nis_covariance import (  # noqa: E402
     fit_nis_covariance_calibration_from_paths,
     write_nis_covariance_calibration,
 )
+from raft_uav.evaluation.oracle_gap_decomposition import (  # noqa: E402
+    selected_track_stability_metrics,
+)
 from raft_uav.evaluation.metrics import nearest_time_indices, position_errors_m  # noqa: E402
 from raft_uav.io.aerpaw import discover_flights, normalize_truth, read_truth, select_flight  # noqa: E402
 
@@ -333,6 +336,7 @@ def evaluate_run(
 
     metrics = common.load_metrics(metrics_path)
     estimates = pd.read_csv(metrics_path.parent / "estimates.csv")
+    selected_radar = _read_optional_csv(metrics_path.parent / "selected_radar.csv")
     truth = _load_truth(dataset_root, flight)
     truth_times = truth["time_s"].to_numpy(dtype=float)
     truth_positions = truth[["east_m", "north_m", "up_m"]].to_numpy(dtype=float)
@@ -379,6 +383,10 @@ def evaluate_run(
     row.update(_prefixed_summary("error_3d", summarize_scalar_errors(errors_3d)))
     row.update(coverage)
     row.update(_nis_summary(estimates))
+    stability = selected_track_stability_metrics(selected_radar)
+    if selected_radar is None:
+        stability.pop("selected_radar_rows", None)
+    row.update(stability)
     return RunEvaluation(
         row=row,
         errors_2d_m=errors_2d,
@@ -451,6 +459,8 @@ def _aggregate_method_rows(
         errors_3d = _concat([run.errors_3d_m for run in runs])
         truth_rows = int(sum(run.truth_rows for run in runs))
         covered = int(sum(run.covered_truth_rows for run in runs))
+        track_switch_count = int(sum(int(run.row.get("track_switch_count", 0)) for run in runs))
+        finite_track_id_rows = int(sum(int(run.row.get("finite_track_id_rows", 0)) for run in runs))
         row: dict[str, object] = {
             "method": method.name,
             "label": method.label,
@@ -459,9 +469,23 @@ def _aggregate_method_rows(
             "folds": len(runs),
             "posterior_records": int(sum(int(run.row.get("posterior_records", 0)) for run in runs)),
             "selected_radar_rows": int(sum(int(run.row.get("selected_radar_rows", 0)) for run in runs)),
+            "finite_track_id_rows": finite_track_id_rows,
+            "unique_selected_track_ids_fold_sum": int(
+                sum(int(run.row.get("unique_selected_track_ids", 0)) for run in runs)
+            ),
+            "track_switch_count": track_switch_count,
+            "track_switch_rate": float(
+                track_switch_count / max(finite_track_id_rows - len(runs), 1)
+            ),
             "truth_rows": truth_rows,
             "covered_truth_rows": covered,
             "truth_coverage_rate": float(covered / truth_rows) if truth_rows else float("nan"),
+            "dominant_track_fraction_mean": _mean_finite(
+                [run.row.get("dominant_track_fraction") for run in runs]
+            ),
+            "selected_track_entropy_mean": _mean_finite(
+                [run.row.get("selected_track_entropy") for run in runs]
+            ),
         }
         row.update(_prefixed_summary("error_2d", summarize_scalar_errors(errors_2d)))
         row.update(_prefixed_summary("error_3d", summarize_scalar_errors(errors_3d)))
@@ -835,6 +859,22 @@ def _load_truth(dataset_root: Path, flight_name: str) -> pd.DataFrame:
         raise FileNotFoundError(f"{flight.name} has no truth telemetry file")
     truth, _, _ = normalize_truth(read_truth(flight.truth_txt))
     return truth
+
+
+def _read_optional_csv(path: Path) -> pd.DataFrame | None:
+    return pd.read_csv(path) if path.exists() else None
+
+
+def _mean_finite(values: Sequence[object]) -> float:
+    parsed: list[float] = []
+    for value in values:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            continue
+        if np.isfinite(number):
+            parsed.append(number)
+    return float(np.mean(parsed)) if parsed else float("nan")
 
 
 def _robust_name(value: object) -> object:

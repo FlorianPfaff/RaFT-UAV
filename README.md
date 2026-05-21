@@ -186,6 +186,21 @@ Run the current best non-oracle preset on one flight:
 raft-uav-best-non-oracle data/raw/AADM2025Dryad --flight Opt2
 ```
 
+Run the integrated result-improvement suite.  This executes the leakage-safe
+calibration/tuning/evaluation workflow used for result-oriented development:
+LOFO time-offset calibration, LOFO radar covariance tuning, nested LOFO tuning,
+leave-flight-out SOTA evaluation, oracle-gap diagnostics, and constrained
+leaderboard ranking.
+
+```bash
+raft-uav-result-improvement-suite data/raw/AADM2025Dryad \
+  --flights Opt1 Opt2 Opt3 \
+  --skip-existing
+```
+
+Use `--dry-run` to write the manifest and print the exact commands without
+executing them.
+
 The preset expands to range-covariance tracklet-Viterbi association, IMM replay,
 Student-t robust updates, and 20-second fixed-lag RTS smoothing. It deliberately
 does not use truth-gated or nearest-truth radar association; truth is used only

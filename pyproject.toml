@@ -43,6 +43,7 @@ raft-uav-calibrate-nis-covariance = "raft_uav.calibration.nis_covariance_cli:mai
 raft-uav-diagnose-paper-table = "raft_uav.diagnostics.paper_table:main"
 raft-uav-sweep-tracklet-viterbi = "raft_uav.sweep_tracklet_viterbi_cli:main"
 raft-uav-oracle-coverage = "raft_uav.oracle_coverage_cli:main"
+raft-uav-result-improvement-suite = "raft_uav.research.result_improvement_suite:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
